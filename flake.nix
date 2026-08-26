@@ -41,7 +41,7 @@
 
             outputHashAlgo = "sha256";
             outputHashMode = "recursive";
-            outputHash = "sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+            outputHash = "sha256-qnUoEuhFVZk3BlEe3Jl85UDvvrNbUevifTVMyq7mnPU=";
 
             buildCommand = ''
               cp -r $src work
