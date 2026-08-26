@@ -42,7 +42,17 @@
 
             outputHashAlgo = "sha256";
             outputHashMode = "recursive";
-            outputHash = "sha256-Jz5I/bnV7P2OuL8nPhuMd8HnMUZkWXwGCOWLGScEp/Q=";
+            # The fetched tree differs by kernel: Darwin and Linux
+            # each reproduce their own hash exactly (verified on two
+            # independent Darwin machines and on CI's Linux runner),
+            # but not each other's — the working hypothesis is
+            # case-insensitive filesystems merging case-colliding
+            # paths.  Until that is normalized away, the hash is
+            # declared per kernel; refresh both after an upgrade.
+            outputHash =
+              if pkgs.stdenv.hostPlatform.isDarwin
+              then "sha256-Jz5I/bnV7P2OuL8nPhuMd8HnMUZkWXwGCOWLGScEp/Q="
+              else "sha256-8aL7Va476K1tT7s2zb2eopE5LQZxcXA1Hq7g6W8NLbU=";
 
             buildCommand = ''
               cp -r $src work
