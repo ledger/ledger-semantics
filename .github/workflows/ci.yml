@@ -1,0 +1,62 @@
+name: CI
+
+on:
+  push:
+    branches: main
+  pull_request:
+  merge_group:
+    branches: main
+
+jobs:
+  proofs:
+    name: Build oracle and check proofs
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+
+    steps:
+      - uses: cachix/install-nix-action@v31
+
+      - uses: actions/checkout@v7
+
+      # Cache the Nix store between runs.  The oracle depends on the
+      # Mathlib artifact tree (the flake's `deps` fixed-output
+      # derivation, several gigabytes), which would otherwise be
+      # fetched on every run.  The key follows the toolchain pins, so
+      # an upgrade rebuilds the cache exactly once.
+      - uses: nix-community/cache-nix-action@v6
+        with:
+          primary-key: nix-${{ runner.os }}-${{ hashFiles('flake.lock', 'lake-manifest.json', 'lean-toolchain') }}
+          restore-prefixes-first-match: nix-${{ runner.os }}-
+          gc-max-store-size-linux: 10G
+          gc-max-store-size-macos: 10G
+          purge: true
+          purge-prefixes: nix-${{ runner.os }}-
+          purge-created: 0
+          purge-primary-key: never
+
+      # `nix build` compiles every module.  The lakefile turns warnings
+      # into errors, so an unproved theorem (`sorry`) fails this step:
+      # a green build is a checked proof of every stated theorem.
+      - name: Build the oracle (checks all proofs)
+        run: nix build .#oracle -L
+
+      # A smoke test of the executable layer: the oracle must evaluate
+      # a minimal journal and print the documented row format.  The
+      # test runs inside the built store path; the oracle tree is
+      # read-only by design.
+      - name: Oracle smoke test
+        run: |
+          cat > /tmp/smoke.dat <<'EOF'
+          2026/01/01 Opening
+              Assets:Cash        $100.00
+              Equity:Opening
+          EOF
+          oracle=$(nix build .#oracle --print-out-paths)
+          nix develop --command bash -c \
+            "cd $oracle && lake env lean --run Ledger/Driver.lean /tmp/smoke.dat" \
+            | tee /tmp/smoke.out
+          grep -q '^\$|100|Assets:Cash$' /tmp/smoke.out
+          grep -q '^\$|-100|Equity:Opening$' /tmp/smoke.out

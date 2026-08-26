@@ -12,9 +12,9 @@ groupoid enriched over commutative monoids:
   commutativity, and unit hold as object equalities.
 - **Morphisms**: an abstract family `Hom : Object → Object → Type`,
   closed under composition, inverse, tensor, and hom-set addition.
-  No computational representation is given; Phase 5+ supplies
-  representations (free construction, Pacioli skeleton) that satisfy
-  these axioms.
+  No computational representation is given here; `Ledger.Free` and
+  `Ledger.Pacioli` supply representations (free construction, Pacioli
+  skeleton) that satisfy these axioms.
 
 ## What is structure and what is derived
 

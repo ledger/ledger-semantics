@@ -42,29 +42,34 @@ composition, tensor, and addition. The reporting function `netFlow`,
 which every balance report computes, is then an additive homomorphism
 out of the free model. The Pacioli invariant, that debits equal
 credits, is not an axiom of the theory. It is the statement that every
-morphism has equal measure on its two ends, and it is proved once, in
-`Ledger/Groupoid.lean`, and inherited by every representation below.
+morphism has equal measure on its two ends. `pacioli_equation` in
+`Ledger/Theorems.lean` proves it once for the abstract category, and
+`free_flow_balanced` in `Ledger/Pacioli.lean` carries it down to the
+computed flows.
 
-One negative result deserves notice. The valuation algebra cannot carry
-the two laws that folklore expects of it. If valuations are required to
-be bilinear and absorptive at the same time, the only valuation is
-zero; the proof is a short degeneracy argument recorded with the
-theory. The minimal consistent basis is the three laws named above.
+One negative result deserves notice. The valuation algebra cannot
+carry the laws that folklore expects of it. The absorption law alone
+forces every valuation to zero; `zero_absorption_degenerates` in
+`Ledger/Pacioli.lean` is the short degeneracy argument, and the same
+argument refutes the bilinearity law separately. The minimal
+consistent basis is the three laws named above.
 This explains a fact about every mature accounting program: pricing is
 a report-time lookup, not a compositional algebra, because a
 compositional pricing algebra with the expected laws does not exist.
 
 The representation tower descends from this meaning in proved steps.
-The abstract category maps to the Pacioli group of finitely supported
-functions from account and commodity to quantity. That group maps to a
-free model built as a quotient of formal morphisms. That model maps to
-exact rational flows. Each step is a homomorphism, and each commuting
-square is checked by Lean. The proofs close with no axioms beyond
-propositional extensionality, choice, and quotient soundness.
+The abstract category maps to a free model built as a quotient of
+formal morphisms. The free model maps to the Pacioli group of
+finitely supported functions from accounts to rational quantities,
+which is the level the oracle computes. Each step is a homomorphism,
+and each commuting square is checked by Lean. The proofs close with
+no axioms beyond propositional extensionality, choice, and quotient
+soundness.
 
-The modules divide as follows. `Groupoid`, `Accounts`, `Labels`,
-`Hierarchy`, and `Valuation` define the objects and the meaning.
-`Free`, `Pacioli`, and `Derivation` build the representation tower.
+The modules divide as follows. `Basic`, `Accounts`, `Groupoid`,
+`Labels`, `Hierarchy`, and `Valuation` define the objects and the
+meaning. `Free` and `Pacioli` build the representation tower.
+`Derivation` is the separate rewrite layer for derived transactions.
 `Theorems`, `Derived`, and `Trivial` state and prove the laws.
 `Prices` and `TimedPrices` treat valuation over time. `Parse`,
 `Journal`, `Oracle`, `Register`, and `Driver` form the executable
@@ -78,12 +83,14 @@ The theory fixes what any such implementation must preserve.
 
 Value is conserved. A transaction either balances exactly, per
 commodity, or names the one posting that absorbs the remainder.
-Arithmetic is exact. Quantities are rational numbers, and rounding is a
-property of display, never of the stored value. Approximation happens
-once, at the end, after all composition. Account order within a
+Arithmetic is exact. Quantities are rational numbers, and the theory
+rounds only at display, after all composition. Account order within a
 transaction has no meaning. Reports are functions of the journal's
 denotation, so two journals with the same denotation report the same
-balances.
+balances. The recorded C++ conventions break the rounding rule in a
+few witnessed places, for example the rounded gain that a lot with a
+cost books into its effective cost; the code marks each such place
+with the test that pins it.
 
 The executable layer of this repository also records, rule by rule, the
 observed semantics of the C++ implementation: its number parsing, its
@@ -143,8 +150,10 @@ decimal-comma styles.
 Third, make every non-comparison visible. A file the oracle cannot yet
 read is a named skip, never a pass. The C++ harness exits with code 77
 for a skipped run so the test runner reports SKIPPED. The goal state
-is zero skips outside the inherently non-comparable bins, and the C++
-suite reached it: 3792 files compared, zero divergence, zero skips.
+is zero skips outside the inherently non-comparable bins, and the
+C++ suite reached it: 3792 files compared with zero divergence, and
+the only skipped files are the 485 negative tests and the 52 files
+with no journal content.
 
 Fourth, prove the comparator can fail. Every run replays a fixture in
 which one side is perturbed by a known defect. If the detector does
@@ -167,8 +176,9 @@ second kind belongs upstream here as a witnessed rule.
 
 The repository builds in two ways.
 
-With Nix, `nix build` produces the compiled oracle and checks every
-proof on the way; the flake pins the Lean toolchain (4.30.0) and holds
+With Nix, `nix build` produces the checked oracle tree, ready for
+`lake env lean --run`, and verifies every proof on the way; the flake
+pins the Lean toolchain (4.30.0) and holds
 the entire Mathlib dependency tree as a fixed-output derivation, so no
 machine ever compiles Mathlib. `nix develop` opens a shell with the
 same toolchain.
@@ -183,11 +193,12 @@ download takes a few minutes.
 ## Provenance and status
 
 This work was extracted from the C++ Ledger repository, where it was
-developed together with the bisimulation harness that consumes it. The
-C++ project references this repository as a submodule and runs the
-comparison in its continuous integration and in development builds.
-Release builds of the C++ program do not require Lean; the test skips
-visibly when the oracle is absent.
+developed together with the bisimulation harness that consumes it.
+The development branch of the C++ project references this repository
+as a submodule and runs the comparison in its continuous integration
+and in development builds. Release builds of the C++ program do not
+require Lean; without the submodule the test is not registered, and a
+registered test without a toolchain skips visibly.
 
 The balance semantics is complete against the C++ suite as of August
 2026. Register rows and time-indexed valuation are specified in the

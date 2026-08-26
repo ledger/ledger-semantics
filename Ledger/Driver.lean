@@ -18,11 +18,13 @@ fitting unit (h/m/s) rounded to two decimals, as the C++ ledger does.
 
 Run through the **interpreter** (never a `lean_exe`):
 
-    lake env lean --run Ledger/Driver.lean [--decimal-comma] FILE ...
+    lake env lean --run Ledger/Driver.lean [FLAGS] FILE ...
 
-`--decimal-comma` applies to the next file only (mirroring a test's
-own flags). Each file's block starts with `== PATH`; a rejection
-prints `!! ERROR ...` for that file (fail-closed, never silent).
+Flags apply to the next file only (mirroring a test's own flags) and
+reset after it: `--decimal-comma`, `--recursive-aliases`,
+`--now DATE`, `--input-date-format FORMAT`. Each file's block starts
+with `== PATH`; a rejection prints `!! ERROR ...` for that file
+(fail-closed, never silent).
 -/
 
 namespace Ledger

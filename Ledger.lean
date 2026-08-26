@@ -32,13 +32,17 @@ principle (`𝕋.Generated`). Auto-xacts, assertions, and periodic
 transactions form a separate derivation system that operates *on* the
 groupoid without constraining its equality.
 
-## What this version is NOT
+## The two layers
 
-A **purely mathematical, propositional development**. The groupoid
-morphisms (`Hom`) are an abstract, axiomatized family of types. No
-computational representation is provided, and none should be inferred.
-The development exists to specify correctness, not to run. The
-computational oracle for C++ bisimulation is a later phase (Phase 5+).
+The specification layer is a purely mathematical, propositional
+development: the groupoid morphisms (`Hom`) are an abstract,
+axiomatized family of types, and the theorems constrain every model
+of them. The executable layer supplies the models and the oracle:
+`Free` and `Pacioli` realize the representation tower, and `Parse`,
+`Journal`, `Oracle`, `Register`, and `Driver` read journal text,
+evaluate it, and print balances for bisimulation against other
+implementations. The specification never imports the executable
+layer; dependency flows one way.
 
 ## Module index
 
@@ -56,4 +60,15 @@ computational oracle for C++ bisimulation is a later phase (Phase 5+).
 - `Ledger.Theorems`   — the fundamental theorems (K3), all proved
 - `Ledger.Trivial`    — the one-point model: every structure is
                         inhabited (consistency, not adequacy)
+- `Ledger.TimedPrices`— time-indexed price observations
+- `Ledger.Free`       — L2: the free construction (reified morphisms)
+- `Ledger.Pacioli`    — L1: per-account rational flows, `netFlow`,
+                        the degeneracy results
+- `Ledger.Derived`    — derived operations and their laws
+- `Ledger.Parse`      — amounts, numbers, regular expressions
+- `Ledger.Journal`    — the journal engine (C++-faithful conventions)
+- `Ledger.Oracle`     — the executable balance oracle
+- `Ledger.Register`   — register-report specification
+- `Ledger.Gen`        — seeded journal generator for property sweeps
+- `Ledger.Driver`     — the bisimulation driver (IO, output protocol)
 -/
