@@ -37,11 +37,12 @@
 
             src = self;
 
-            nativeBuildInputs = [ pkgs.lean4 pkgs.git pkgs.curl pkgs.cacert ];
+            nativeBuildInputs =
+              [ pkgs.lean4 pkgs.git pkgs.curl pkgs.cacert pkgs.jq ];
 
             outputHashAlgo = "sha256";
             outputHashMode = "recursive";
-            outputHash = "sha256-qnUoEuhFVZk3BlEe3Jl85UDvvrNbUevifTVMyq7mnPU=";
+            outputHash = "sha256-Jz5I/bnV7P2OuL8nPhuMd8HnMUZkWXwGCOWLGScEp/Q=";
 
             buildCommand = ''
               cp -r $src work
@@ -66,6 +67,22 @@
                 sed -i 's|/nix/store/[a-z0-9]\{32\}-|/nix/store/@scrubbed@-|g' "$f"
               done
 
+              # Lake validates a git-type dependency by reading the
+              # checkout's .git (remote URL and HEAD revision) and
+              # re-clones on any mismatch.  Real .git directories are
+              # not reproducible, so each package instead receives a
+              # minimal deterministic skeleton: a detached HEAD at the
+              # manifest revision and a config naming the origin URL.
+              # That satisfies the check; nothing else reads .git.
+              jq -r '.packages[] | .name + " " + .rev + " " + .url' \
+                  lake-manifest.json | while read -r name rev url; do
+                d=".lake/packages/$name/.git"
+                mkdir -p "$d/objects" "$d/refs"
+                printf '%s\n' "$rev" > "$d/HEAD"
+                printf '[core]\n\trepositoryformatversion = 0\n\tbare = false\n[remote "origin"]\n\turl = %s\n' \
+                  "$url" > "$d/config"
+              done
+
               mv .lake/packages $out
             '';
           };
@@ -82,7 +99,12 @@
 
             src = self;
 
-            nativeBuildInputs = [ pkgs.lean4 ];
+            # Lake validates each dependency by querying its .git with
+            # the git binary; the skeletons in `deps` answer the query,
+            # and safe.directory quiets git's ownership check for
+            # store-owned paths.  Without either, Lake concludes the
+            # URL changed and attempts a re-clone.
+            nativeBuildInputs = [ pkgs.lean4 pkgs.git ];
 
             buildCommand = ''
               cp -r $src $out
@@ -91,6 +113,9 @@
               ln -s ${deps} $out/.lake/packages
               cd $out
               export HOME=$TMPDIR
+              export GIT_CONFIG_COUNT=1
+              export GIT_CONFIG_KEY_0=safe.directory
+              export GIT_CONFIG_VALUE_0="*"
               lake build
             '';
           };
@@ -112,7 +137,15 @@
         in {
           default = pkgs.mkShell {
             name = "ledger-semantics";
-            buildInputs = [ pkgs.lean4 ];
+            buildInputs = [ pkgs.lean4 pkgs.git ];
+            # Running the oracle from the Nix store (`lake env lean
+            # --run` inside the built tree) needs git's ownership
+            # check quieted; see the oracle derivation.
+            shellHook = ''
+              export GIT_CONFIG_COUNT=1
+              export GIT_CONFIG_KEY_0=safe.directory
+              export GIT_CONFIG_VALUE_0="*"
+            '';
           };
         });
     };
