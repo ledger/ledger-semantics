@@ -51,8 +51,8 @@
             # declared per kernel; refresh both after an upgrade.
             outputHash =
               if pkgs.stdenv.hostPlatform.isDarwin
-              then "sha256-Jz5I/bnV7P2OuL8nPhuMd8HnMUZkWXwGCOWLGScEp/Q="
-              else "sha256-8aL7Va476K1tT7s2zb2eopE5LQZxcXA1Hq7g6W8NLbU=";
+              then "sha256-HkmM9c/MlKy41XI6VE7Pe+7pxqmA3VkYvI4NzOv+rtc="
+              else "sha256-bXOxPjy0WLMNBIisuHksnAmyBcLwBvpUwL8zi0SjOTY=";
 
             buildCommand = ''
               cp -r $src work
@@ -64,6 +64,17 @@
               export NIX_SSL_CERT_FILE=$SSL_CERT_FILE
 
               lake exe cache get
+              # Validate and, where the fetched cache proves stale,
+              # rebuild EVERY Mathlib module while this tree is still
+              # writable.  A handful of modules in the upstream cache
+              # fail Lake's trace validation; if such a module is not
+              # in this repository's import closure today, nothing
+              # notices — until an added import pulls it in and Lake
+              # tries to rebuild it inside the read-only store, which
+              # is exactly how the Monoidal.Braided import broke the
+              # oracle build.  Building all of Mathlib here makes the
+              # store tree valid for any future import.
+              lake build Mathlib
               lake build
 
               find .lake/packages -name .git -prune -exec rm -rf {} +
