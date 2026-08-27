@@ -1,10 +1,24 @@
+import Mathlib.CategoryTheory.Monoidal.Braided.Basic
 import Ledger.Accounts
 
 /-!
 # The free symmetric monoidal groupoid 𝕋
 
 The core mathematical object. `𝕋` is the free symmetric monoidal
-groupoid enriched over commutative monoids:
+groupoid enriched over commutative monoids, and this file says so in
+the standard vocabulary: for every lawful model `L : 𝕋Laws T`, the
+tagged object type `L.Obj` carries genuine Mathlib instances of
+`Category`, `Groupoid`, `MonoidalCategory`, `SymmetricCategory`, and
+a per-hom-set `AddCommMonoid` (see the bridge section at the end).
+The fields of `𝕋` and `𝕋Laws` are exactly the data and obligations a
+model must supply to earn those instances; all monoidal coherence
+(pentagon, triangle, hexagons, naturality) is then inherited from
+Mathlib rather than restated here. The one standard structure that
+is deliberately ABSENT is `Preadditive`-style compatibility between
+hom-addition and composition: decision D16 proves that those laws
+degenerate every valuation to zero, so `𝕋` is a symmetric monoidal
+groupoid whose hom-sets carry commutative-monoid structure that
+interacts only with valuations.
 
 - **Objects**: `Object` — the free commutative monoid `Multiset Account`
   (concrete; see `Accounts.lean`). Tensor on objects is `+`, the unit
@@ -243,6 +257,178 @@ theorem comp_cast_id_cast_id (L : 𝕋Laws T) {X Y : Object}
 theorem braid_invol (L : 𝕋Laws T) (A B : Object) :
     T.comp (T.braiding B A) (T.braiding A B) = T.id (A + B) :=
   L.comp_cast_id_cast_id (add_comm A B) (add_comm B A)
+
+end 𝕋Laws
+
+end Ledger
+
+/-! ## The bridge: 𝕋 in the standard vocabulary
+
+A lawful model is, literally, a symmetric monoidal groupoid with
+commutative-monoid hom-sets. The instances below make that sentence
+type-check. The objects are tagged by the laws (`L.Obj` is `Object`
+carrying `L` in its type) so that each model's instances are its
+own. Every coherence isomorphism of the strict structure is
+`eqToHom` of an equality in the object monoid, so every coherence
+obligation reduces, through `conj_eqToHom_iff_heq`, to one of the
+`HEq` law fields or to `eqToHom` algebra. -/
+
+namespace Ledger
+
+open CategoryTheory MonoidalCategory
+
+/-- The objects of a lawful model, tagged by its laws so that the
+    category-theoretic instances attach to this model alone. -/
+def 𝕋Laws.Obj {T : 𝕋} (_L : 𝕋Laws T) : Type := Object
+
+namespace 𝕋Laws
+
+variable {T : 𝕋} {L : 𝕋Laws T}
+
+instance : AddCommMonoid L.Obj := inferInstanceAs (AddCommMonoid Object)
+
+instance : Category L.Obj where
+  Hom A B := T.Hom A B
+  id A := T.id A
+  comp f g := T.comp g f
+  id_comp := L.comp_id
+  comp_id := L.id_comp
+  assoc f g h := L.comp_assoc h g f
+
+/-- Every transaction is reversible: a lawful model is a groupoid. -/
+instance : Groupoid L.Obj where
+  inv := T.inv
+  inv_comp := L.comp_inv
+  comp_inv := L.inv_comp
+
+/-- In this strict setting `eqToHom` is transport of the identity,
+    which is the bespoke `castHom` on identities. -/
+theorem eqToHom_eq_castHom {A B : L.Obj} (h : A = B) :
+    eqToHom h = T.castHom rfl h (T.id A) := by
+  subst h; rfl
+
+instance : MonoidalCategoryStruct L.Obj where
+  tensorObj A B := A + B
+  whiskerLeft X _ _ f := T.tensor (T.id X) f
+  whiskerRight f Y := T.tensor f (T.id Y)
+  tensorHom f g := T.tensor f g
+  tensorUnit := (0 : Object)
+  associator A B C := eqToIso (add_assoc A B C)
+  leftUnitor A := eqToIso (zero_add A)
+  rightUnitor A := eqToIso (add_zero A)
+
+private theorem tensorHom_eqToHom_id {A B : L.Obj} (h : A = B)
+    (Z : L.Obj) :
+    (eqToHom h ⊗ₘ 𝟙 Z) = eqToHom (congrArg (· + Z) h) := by
+  subst h
+  simpa using L.tensor_id A Z
+
+private theorem id_tensorHom_eqToHom (Z : L.Obj) {A B : L.Obj}
+    (h : A = B) :
+    (𝟙 Z ⊗ₘ eqToHom h) = eqToHom (congrArg (Z + ·) h) := by
+  subst h
+  simpa using L.tensor_id Z A
+
+private theorem whiskerRight_eqToHom {A B : L.Obj} (h : A = B)
+    (Z : L.Obj) :
+    (eqToHom h ▷ Z) = eqToHom (congrArg (· + Z) h) := by
+  subst h
+  simpa using L.tensor_id A Z
+
+private theorem whiskerLeft_eqToHom (Z : L.Obj) {A B : L.Obj}
+    (h : A = B) :
+    (Z ◁ eqToHom h) = eqToHom (congrArg (Z + ·) h) := by
+  subst h
+  simpa using L.tensor_id Z A
+
+/-- A lawful model is a monoidal category, strictly: all coherence
+    isomorphisms are `eqToHom`s of object-monoid equalities. -/
+instance : MonoidalCategory L.Obj :=
+  .ofTensorHom
+    (id_tensorHom_id := L.tensor_id)
+    (id_tensorHom := by intros; rfl)
+    (tensorHom_id := by intros; rfl)
+    (tensorHom_comp_tensorHom := fun f₁ f₂ g₁ g₂ =>
+      L.tensor_comp g₁ f₁ g₂ f₂)
+    (associator_naturality := by
+      intro X₁ X₂ X₃ Y₁ Y₂ Y₃ f₁ f₂ f₃
+      simp only [associator, eqToIso.hom]
+      rw [comp_eqToHom_iff, Category.assoc]
+      refine (conj_eqToHom_iff_heq _ _ (add_assoc X₁ X₂ X₃)
+        (add_assoc Y₁ Y₂ Y₃)).mpr ?_
+      exact L.tensor_assoc f₁ f₂ f₃)
+    (leftUnitor_naturality := by
+      intro X Y f
+      simp only [leftUnitor, eqToIso.hom]
+      rw [comp_eqToHom_iff, Category.assoc]
+      refine (conj_eqToHom_iff_heq _ _ (zero_add X) (zero_add Y)).mpr ?_
+      exact (L.tensor_comm (T.id 0) f).trans (L.tensor_unit f))
+    (rightUnitor_naturality := by
+      intro X Y f
+      simp only [rightUnitor, eqToIso.hom]
+      rw [comp_eqToHom_iff, Category.assoc]
+      refine (conj_eqToHom_iff_heq _ _ (add_zero X) (add_zero Y)).mpr ?_
+      exact L.tensor_unit f)
+    (pentagon := fun W X Y Z => by
+      simp only [associator, eqToIso.hom]
+      rw [tensorHom_eqToHom_id, id_tensorHom_eqToHom]
+      simp [eqToHom_trans])
+    (triangle := fun X Y => by
+      simp only [associator, leftUnitor, rightUnitor, eqToIso.hom]
+      rw [tensorHom_eqToHom_id, id_tensorHom_eqToHom]
+      simp [eqToHom_trans])
+
+/-- Posting order is meaningless: a lawful model is symmetric, with
+    the braiding given by commutativity of the object monoid. -/
+instance : BraidedCategory L.Obj where
+  braiding A B := eqToIso (add_comm A B)
+  braiding_naturality_right := by
+    intro X Y Z f
+    simp only [eqToIso.hom]
+    rw [comp_eqToHom_iff, Category.assoc]
+    refine (conj_eqToHom_iff_heq _ _ (add_comm X Y) (add_comm X Z)).mpr ?_
+    exact L.tensor_comm (T.id X) f
+  braiding_naturality_left := by
+    intro X Y f Z
+    simp only [eqToIso.hom]
+    rw [comp_eqToHom_iff, Category.assoc]
+    refine (conj_eqToHom_iff_heq _ _ (add_comm X Z) (add_comm Y Z)).mpr ?_
+    exact L.tensor_comm f (T.id Z)
+  hexagon_forward := fun X Y Z => by
+    simp only [associator, eqToIso.hom]
+    rw [whiskerRight_eqToHom, whiskerLeft_eqToHom]
+    simp [eqToHom_trans]
+  hexagon_reverse := fun X Y Z => by
+    simp only [associator, eqToIso.hom, eqToIso.inv]
+    rw [whiskerRight_eqToHom, whiskerLeft_eqToHom]
+    simp [eqToHom_trans]
+
+instance : SymmetricCategory L.Obj where
+  symmetry := fun A B => by
+    show eqToHom (add_comm A B) ≫ eqToHom (add_comm B A) = 𝟙 (A + B)
+    simp [eqToHom_trans]
+
+/-- The CMon enrichment, stated on the categorical homs. It is
+    deliberately bare: no `Preadditive` instance exists or may be
+    added, because compatibility between `+` and `≫` degenerates
+    every valuation to zero (decision D16; see
+    `zero_absorption_degenerates` in `Ledger.Pacioli`). -/
+instance (A B : L.Obj) : AddCommMonoid (A ⟶ B) := T.homAddCommMonoid A B
+
+/-- The braiding of the bridge agrees with the bespoke `braiding`. -/
+theorem braiding_eq_castHom (A B : L.Obj) :
+    (β_ A B).hom = T.braiding A B := by
+  have h : (β_ A B).hom = eqToHom (add_comm A B) := rfl
+  rw [h, eqToHom_eq_castHom]
+  rfl
+
+/-- `braid_invol`, re-derived from the standard API: symmetry of the
+    braiding is exactly the bespoke involution law. -/
+example (A B : L.Obj) :
+    T.comp (T.braiding B A) (T.braiding A B) = T.id (A + B) := by
+  have h := SymmetricCategory.symmetry (C := L.Obj) A B
+  rw [braiding_eq_castHom, braiding_eq_castHom] at h
+  exact h
 
 end 𝕋Laws
 
