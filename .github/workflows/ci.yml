@@ -16,6 +16,28 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
 
+        # MEASUREMENT LEGS.  The flake declares the `deps` fixed-output
+        # hash per kernel, but only two platforms have ever verified it:
+        # aarch64-darwin (macos-latest) and x86_64-linux
+        # (ubuntu-latest).  These two legs MEASURE the dependency hash on
+        # the remaining platforms — x86_64-darwin and aarch64-linux.
+        # They are expected to fail, and the failure is the result: Nix
+        # reports `hash mismatch in fixed-output derivation ... got:
+        # sha256-...`, and that `got:` value is the platform's true hash.
+        # Once both are read out of the logs, extend the flake's
+        # outputHash selection to cover them (or confirm the kernel's
+        # existing hash reproduces) and delete `continue-on-error` below,
+        # promoting these legs to enforced ones.
+        include:
+          - os: macos-13         # x86_64-darwin
+            measure: true
+          - os: ubuntu-24.04-arm # aarch64-linux
+            measure: true
+
+    # Only the measurement legs may fail; ubuntu-latest and macos-latest
+    # stay enforced, since `matrix.measure` is unset for them.
+    continue-on-error: ${{ matrix.measure == true }}
+
     steps:
       - uses: cachix/install-nix-action@v31
 
@@ -26,7 +48,18 @@ jobs:
       # derivation, several gigabytes), which would otherwise be
       # fetched on every run.  The key follows the toolchain pins, so
       # an upgrade rebuilds the cache exactly once.
+      #
+      # The measurement legs skip the cache deliberately.  `deps` is a
+      # fixed-output derivation, so its store path is a function of its
+      # declared outputHash and name only — not of the system.  Its
+      # cache key is keyed on `runner.os`, which does not distinguish
+      # architectures, so macos-13 would restore macos-latest's store
+      # and ubuntu-24.04-arm would restore ubuntu-latest's.  Nix would
+      # then find the path already valid, skip the fetch, and measure
+      # nothing.  An unseeded store is what forces the fetch that
+      # produces the hash report.
       - uses: nix-community/cache-nix-action@v6
+        if: ${{ matrix.measure != true }}
         with:
           primary-key: nix-${{ runner.os }}-${{ hashFiles('flake.lock', 'lake-manifest.json', 'lean-toolchain') }}
           restore-prefixes-first-match: nix-${{ runner.os }}-
