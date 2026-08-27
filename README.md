@@ -76,6 +76,18 @@ step is a homomorphism, each commuting square is checked by Lean,
 and the proofs depend on no axioms beyond propositional
 extensionality, choice, and quotient soundness.
 
+These claims are stated in the standard vocabulary rather than in a
+private one. For every lawful model, `Ledger/Groupoid.lean`
+constructs genuine Mathlib instances of `Category`, `Groupoid`,
+`MonoidalCategory`, and `SymmetricCategory` on the model's tagged
+object type, together with the commutative-monoid structure on each
+hom-set, so the sentence "a journal lives in a symmetric monoidal
+groupoid" is a set of type-class instances rather than a figure of
+speech. The coherence conditions are inherited from Mathlib. The one
+standard structure deliberately absent is compatibility between
+hom-addition and composition, which the degeneracy result above
+rules out.
+
 The modules divide along the same lines. The objects and their
 meaning are defined in `Basic`, `Accounts`, `Groupoid`, `Labels`,
 `Hierarchy`, and `Valuation`. The representation tower is built in
