@@ -95,14 +95,22 @@ announced, never as a side effect.
 
 ## The pins, and how to move them
 
-Four things must agree at all times: `lean-toolchain`
+Five things must agree at all times: `lean-toolchain`
 (leanprover/lean4:v4.30.0), the Mathlib revision in
 `lake-manifest.json`, the nixpkgs revision in `flake.nix` (chosen so
-that its `lean4` matches the toolchain), and the `outputHash` values
-of the `deps` fixed-output derivation. To upgrade Lean or Mathlib,
-change the first three together, then refresh the hashes: set each
-hash to a placeholder, run `nix build .#deps`, and copy the true
-hash from the mismatch report. Nix registers the fetched output even
+that its `lean4` is built from that release), `leanGithash` in
+`flake.nix`, and the `outputHash` values of the `deps` fixed-output
+derivation. `leanGithash` is the commit behind the release tag
+(`git rev-parse v4.30.0^{commit}` in leanprover/lean4, or
+`lean --githash` from the elan toolchain). Lake keys every build
+trace on the compiler's githash, and nixpkgs' `lean4` reports the tag
+name rather than the commit, so the flake exports it as
+`LEAN_GITHASH` wherever lake runs; without it every artifact that
+`lake exe cache get` fetches is judged stale and `lake build Mathlib`
+recompiles all of Mathlib, which is hours on a CI runner. To upgrade
+Lean or Mathlib, change the first four together, then refresh the
+hashes: set each hash to a placeholder, run `nix build .#deps`, and
+copy the true hash from the mismatch report. Nix registers the fetched output even
 on mismatch, so the rebuild after pinning is instant. The hash is
 declared per kernel because Darwin and Linux fetch measurably
 different trees (the working hypothesis is case-insensitive
