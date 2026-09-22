@@ -14,29 +14,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
-
-        # MEASUREMENT LEGS.  The flake declares one `deps` fixed-output
-        # hash for every platform, measured byte-identical on
-        # x86_64-linux, aarch64-linux and aarch64-darwin.  These two
-        # legs check it on the platforms CI would otherwise never
-        # build: x86_64-darwin, which no measurement has covered, and
-        # aarch64-linux.  A failure is the result: Nix reports `hash
-        # mismatch in fixed-output derivation ... got: sha256-...`, and
-        # that `got:` value is the platform's true hash, which means a
-        # platform-specific file survived the flake's normalization.
-        # Once x86_64-darwin has been seen to reproduce the hash, delete
-        # `continue-on-error` below and promote these legs to enforced
-        # ones.
-        include:
-          - os: macos-13         # x86_64-darwin
-            measure: true
-          - os: ubuntu-24.04-arm # aarch64-linux
-            measure: true
-
-    # Only the measurement legs may fail; ubuntu-latest and macos-latest
-    # stay enforced, since `matrix.measure` is unset for them.
-    continue-on-error: ${{ matrix.measure == true }}
+        # The flake declares one `deps` fixed-output hash for every
+        # platform, measured byte-identical on x86_64-linux,
+        # aarch64-linux and aarch64-darwin, and each of the three has
+        # a leg here.  x86_64-darwin has none: the pinned nixpkgs has
+        # dropped that platform ("Nixpkgs 26.11 has dropped support for
+        # x86_64-darwin"), so the flake no longer lists it either.
+        os: [ubuntu-latest, macos-latest, ubuntu-24.04-arm]
 
     steps:
       - uses: cachix/install-nix-action@v31
@@ -49,17 +33,18 @@ jobs:
       # fetched on every run.  The key follows the toolchain pins, so
       # an upgrade rebuilds the cache exactly once.
       #
-      # The measurement legs skip the cache deliberately.  `deps` is a
+      # The aarch64-linux leg skips the cache deliberately.  `deps` is a
       # fixed-output derivation, so its store path is a function of its
-      # declared outputHash and name only — not of the system.  Its
+      # declared outputHash and name only — not of the system — and the
       # cache key is keyed on `runner.os`, which does not distinguish
-      # architectures, so macos-13 would restore macos-latest's store
-      # and ubuntu-24.04-arm would restore ubuntu-latest's.  Nix would
-      # then find the path already valid, skip the fetch, and measure
-      # nothing.  An unseeded store is what forces the fetch that
-      # produces the hash report.
+      # architectures: the leg would restore ubuntu-latest's store, find
+      # the path already valid, skip the fetch, and verify nothing.  An
+      # unseeded store forces the fetch, and a hash mismatch there
+      # (`hash mismatch in fixed-output derivation ... got: sha256-...`)
+      # means a platform-specific file survived the flake's
+      # normalization.
       - uses: nix-community/cache-nix-action@v6
-        if: ${{ matrix.measure != true }}
+        if: ${{ matrix.os != 'ubuntu-24.04-arm' }}
         with:
           primary-key: nix-${{ runner.os }}-${{ hashFiles('flake.lock', 'lake-manifest.json', 'lean-toolchain') }}
           restore-prefixes-first-match: nix-${{ runner.os }}-
