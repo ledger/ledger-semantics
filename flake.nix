@@ -168,8 +168,20 @@
         in {
           inherit deps oracle;
           # The exact toolchain, for downstream flakes that run the
-          # oracle (the C++ Ledger repository consumes this).
-          lean = pkgs.lean4;
+          # oracle in place (the C++ Ledger repository consumes this).
+          # Its `lake` is wrapped to carry the githash the oracle was
+          # built with: Lake keys its cached lakefile elaboration on the
+          # githash as well, and a lake reporting a different one judges
+          # that cache stale and tries to rewrite it inside the read-only
+          # store tree ("permission denied" on lakefile.olean.lock).
+          lean = pkgs.symlinkJoin {
+            name = "lean4-${pkgs.lean4.version}-githash";
+            paths = [ pkgs.lean4 ];
+            nativeBuildInputs = [ pkgs.makeWrapper ];
+            postBuild = ''
+              wrapProgram $out/bin/lake --set LEAN_GITHASH ${leanGithash}
+            '';
+          };
           default = oracle;
         });
 
