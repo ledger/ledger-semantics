@@ -14,6 +14,19 @@
       systems = [ "x86_64-linux" "aarch64-linux" "x86_64-darwin" "aarch64-darwin" ];
       forAllSystems = f: nixpkgs.lib.genAttrs systems (system: f system);
       pkgsFor = forAllSystems (system: import nixpkgs { inherit system; });
+
+      # The commit behind the release named in ./lean-toolchain
+      # (leanprover/lean4:v4.30.0).  Lake keys every build trace on the
+      # compiler's githash, and the Mathlib artifact cache was produced
+      # by the official release, whose `lean --githash` is this commit;
+      # nixpkgs' lean4 is built from the same source but reports the
+      # literal tag ("v4.30.0") instead.  Without the override Lake
+      # judges every fetched artifact stale and `lake build Mathlib`
+      # recompiles all of Mathlib — four hours on a CI runner.  Lake
+      # honours LEAN_GITHASH as the detected hash (Lake/Config/Env.lean),
+      # so every lake invocation below sets it.  Move it together with
+      # the other pins.
+      leanGithash = "d024af099ca4bf2c86f649261ebf59565dc8c622";
     in
     {
       packages = forAllSystems (system:
@@ -23,10 +36,13 @@
           # The full `.lake/packages` dependency tree as a fixed-output
           # derivation.  Lake clones each dependency at the revision in
           # lake-manifest.json and downloads the prebuilt Mathlib
-          # artifact cache, so no build of Mathlib occurs.  The output
-          # is normalized so that its hash is stable across builders
-          # and platforms: git metadata and natively compiled artifacts
-          # are removed, and absolute paths in the Lake replay logs are
+          # artifact cache; with LEAN_GITHASH set the `lake build
+          # Mathlib` that follows replays those artifacts instead of
+          # recompiling them, so the derivation is a download plus a
+          # few minutes of validation.  The output is normalized so
+          # that its hash is the same on every builder and platform:
+          # git metadata and every natively compiled artifact are
+          # removed, and absolute paths in the Lake replay logs are
           # rewritten to fixed tokens.  The paths are logs only; Lake
           # keys rebuilds on content hashes.  After a Lean or Mathlib
           # upgrade, run `nix build .#deps` and copy the new hash from
@@ -42,17 +58,12 @@
 
             outputHashAlgo = "sha256";
             outputHashMode = "recursive";
-            # The fetched tree differs by kernel: Darwin and Linux
-            # each reproduce their own hash exactly (verified on two
-            # independent Darwin machines and on CI's Linux runner),
-            # but not each other's — the working hypothesis is
-            # case-insensitive filesystems merging case-colliding
-            # paths.  Until that is normalized away, the hash is
-            # declared per kernel; refresh both after an upgrade.
-            outputHash =
-              if pkgs.stdenv.hostPlatform.isDarwin
-              then "sha256-HkmM9c/MlKy41XI6VE7Pe+7pxqmA3VkYvI4NzOv+rtc="
-              else "sha256-bXOxPjy0WLMNBIisuHksnAmyBcLwBvpUwL8zi0SjOTY=";
+            # One hash for every platform.  The normalized tree has
+            # been measured byte-identical on x86_64-linux,
+            # aarch64-linux and aarch64-darwin: the only files that
+            # ever differed were the natively compiled products of
+            # `lake exe cache`, which the cleanup below removes.
+            outputHash = "sha256-NGu7QxR0rLAqWvdHMEXBiBjdNWTKP5a3lLW9fQnslic=";
 
             buildCommand = ''
               cp -r $src work
@@ -62,29 +73,42 @@
               export SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt
               export GIT_SSL_CAINFO=$SSL_CERT_FILE
               export NIX_SSL_CERT_FILE=$SSL_CERT_FILE
+              export LEAN_GITHASH=${leanGithash}
 
               lake exe cache get
-              # Validate and, where the fetched cache proves stale,
-              # rebuild EVERY Mathlib module while this tree is still
-              # writable.  A handful of modules in the upstream cache
-              # fail Lake's trace validation; if such a module is not
-              # in this repository's import closure today, nothing
-              # notices — until an added import pulls it in and Lake
-              # tries to rebuild it inside the read-only store, which
-              # is exactly how the Monoidal.Braided import broke the
-              # oracle build.  Building all of Mathlib here makes the
-              # store tree valid for any future import.
+              # Validate EVERY Mathlib module while this tree is still
+              # writable, rebuilding any whose fetched artifact fails
+              # Lake's trace check.  With LEAN_GITHASH matching the
+              # toolchain that produced the cache this is a replay;
+              # without it every module failed the check, only the
+              # import closure was rebuilt, and an added import
+              # (Monoidal.Braided) then made Lake rebuild inside the
+              # read-only store.  Validating all of Mathlib here keeps
+              # the store tree valid for any future import.
               lake build Mathlib
               lake build
 
               find .lake/packages -name .git -prune -exec rm -rf {} +
               rm -rf .lake/packages/*/.lake/build/bin
-              find .lake/packages \( -name '*.o' -o -name '*.dylib' \
-                -o -name '*.so' \) -delete
-              grep -rlI "$PWD" .lake/packages | while read -r f; do
+              # Everything that differs between platforms is a product of
+              # `lake exe cache get` compiling Mathlib's `cache`
+              # executable natively: the `.c.o.export` objects (with
+              # their .hash and .trace records) under build/ir, and the
+              # `Cache.*` modules' own artifacts, whose traces embed the
+              # native facet.  The interpreted oracle imports none of it,
+              # so with these gone the tree, and hence the hash, is the
+              # same on every platform.
+              find .lake/packages \( -name '*.o' -o -name '*.o.*' \
+                -o -name '*.dylib' -o -name '*.so' \) -delete
+              rm -rf .lake/packages/mathlib/.lake/build/lib/lean/Cache \
+                .lake/packages/mathlib/.lake/build/ir/Cache
+              # A grep that matches nothing exits 1, which under the
+              # builder's pipefail would fail the derivation; nothing
+              # left to scrub is success.
+              { grep -rlI "$PWD" .lake/packages || true; } | while read -r f; do
                 sed -i "s|$PWD|@ledger-semantics-work@|g" "$f"
               done
-              grep -rlI '/nix/store/' .lake/packages | while read -r f; do
+              { grep -rlI '/nix/store/' .lake/packages || true; } | while read -r f; do
                 sed -i 's|/nix/store/[a-z0-9]\{32\}-|/nix/store/@scrubbed@-|g' "$f"
               done
 
@@ -137,6 +161,7 @@
               export GIT_CONFIG_COUNT=1
               export GIT_CONFIG_KEY_0=safe.directory
               export GIT_CONFIG_VALUE_0="*"
+              export LEAN_GITHASH=${leanGithash}
               lake build
             '';
           };
@@ -166,6 +191,7 @@
               export GIT_CONFIG_COUNT=1
               export GIT_CONFIG_KEY_0=safe.directory
               export GIT_CONFIG_VALUE_0="*"
+              export LEAN_GITHASH=${leanGithash}
             '';
           };
         });
