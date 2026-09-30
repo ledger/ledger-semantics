@@ -4,46 +4,125 @@ import Mathlib.Tactic.Abel
 import Ledger.Free
 
 /-!
-# L1: the Pacioli skeleton, and the denotation L2 → L1
+# L1: the signed carrier, and the denotation L2 → L1
 
-Ellerman's Pacioli group, per commodity and account: the free abelian
-group of per-account flows, carried by finitely-supported functions
-`Account →₀ ℚ` (D2: exact rationals below L0). The **denotation** of a
-reified morphism is its net per-account flow:
+## The carrier
+
+`PacioliGroup` is `Account →₀ ℚ`: finitely supported rational
+quantities indexed by an account name and a commodity (D2: exact
+rationals below L0). It is the free ℚ-vector space on `Account`
+(`Finsupp.basisSingleOne` is a basis), and it is the signed,
+single-sided image of Ellerman's Pacioli group under his debit
+isomorphism `[d // c] ↦ d - c`, which carries his `P(N^n)` onto
+`Z^n`; the carrier is the rational, finitely supported analogue of
+that `Z^n`, indexed by `Account` in place of his n property types.
+It is not the group of T-accounts itself, whose elements are pairs
+of unsigned quantities compared by their cross-sums; the carrier
+keeps only each pair's signed difference. The module's name and the
+name `PacioliGroup` refer to that group and do not claim that the
+carrier is it.
+
+Reference: David Ellerman, "On Double-Entry Bookkeeping: The
+Mathematical Treatment", Accounting Education 23:5 (2014) 483-501,
+doi:10.1080/09639284.2014.949803. Page 486 gives the two
+isomorphisms, p. 488 allows a program to map debits and credits to
+signed numbers internally under either of them, p. 492 adopts the
+debit isomorphism, and pp. 493-494 extend the construction to
+vectors of property types.
+
+The debit-positive convention is inherited from the journal syntax,
+not chosen here. C++ Ledger "uses only subtractions and additions",
+adding an amount to the account a posting names
+(`doc/ledger3.texi`, node "Stating where money goes"), and its
+`--dc` option shows positive amounts as debits and the magnitudes of
+negative amounts as credits. The output protocol fixes the
+convention, and `Driver.flowsFor` passes the signs of the engine's
+postings through unchanged. Under the credit isomorphism every
+printed row would change sign, so a comparison survives that change
+only if both sides make it together.
+
+## The denotation
+
+The denotation of a reified morphism is its net per-account flow:
 
     ⟦gen t⟧ = flows t     ⟦id⟧ = ⟦0⟧ = 0      ⟦g ∘ f⟧ = ⟦g⟧ + ⟦f⟧
     ⟦f⁻¹⟧ = −⟦f⟧          ⟦f ⊗ g⟧ = ⟦f⟧ + ⟦g⟧   ⟦f + g⟧ = ⟦f⟧ + ⟦g⟧
 
-`flowAux_respects` — the Phase 8 obligation — checks this assignment
+`flowAux_respects`, the Phase 8 obligation, checks this assignment
 against every `Rel` equation, so it descends to the quotient
-(`flow`), and the commuting squares (`flow_comp` etc.) then hold by
-construction. As the worksheet records, the skeleton deliberately
-loses morphism identity: adequate for *balance* queries, not for
-*register* queries.
+(`flow`), and the commuting squares (`flow_comp` and its companions)
+then hold by construction. As the worksheet records, the carrier
+deliberately loses morphism identity: it is adequate for balance
+queries and not for register queries.
+
+## Balance in every commodity
+
+`trialBalance` sums a vector over the accounts of each commodity, and
+its kernel `zeroRows` holds Ellerman's zero-rows (p. 492): the vectors
+that balance in every commodity. `free_double_entry` carries
+membership in `zeroRows` from the generators to every derived flow,
+which is the free model's double-entry theorem, and
+`free_trial_balance`, the per-commodity statement from which it is
+proved, needs balance only in the one commodity. The hypothesis is a
+condition on the entries, and the docstring of `free_trial_balance`
+names several kinds of generator the oracle emits that do not meet
+it. `free_flow_balanced`, the degenerate case `ψ = id` of
+`free_ker_balanced`, concludes that every derived flow is zero when
+every entry moves nothing.
+
+`one_term_change` states Ellerman's observation that no equation
+survives a change to one of its terms alone (pp. 486-487), and
+`zeroRow_two_accounts` is its signed form: every nonzero zero-row
+touches two accounts of one commodity. `free_flow_two_accounts`
+carries that to every nonzero derived flow of a journal whose
+entries are zero-rows. A single-sided system shares the property, so
+it cannot be what is double in double-entry bookkeeping (p. 492).
 
 ## The finding this module forced (decision D16)
 
-Writing `flowAux_respects` against the Phase 1–3 law set **failed**
-at `f ∘ 0 = 0`: the flow of the left side is `⟦f⟧`, of the right `0`.
-Unwinding: `comp_zero` together with `V_comp` forces `V f = 0` for
-*every* morphism — the Phase 1 axioms admitted only the identically
-zero valuation, so every valuation theorem was true of a degenerate
-subject. The same argument refutes bilinearity (`(g+g') ∘ f =
-g∘f + g'∘f` double-counts `V f`). The repair: hom-set `+` is
-compatible with valuations (`V_add`) and with nothing else — the
-four bilinearity/absorption laws are gone from `𝕋Laws`, and this
-module's model is the standing proof of non-degeneracy. The formal
-witnesses are at the bottom of this file:
+Writing `flowAux_respects` against the law set of Phases 1 to 3
+failed at `f ∘ 0 = 0`: the flow of the left side is `⟦f⟧`, and of
+the right side `0`. Unwound, `comp_zero` together with `V_comp`
+forced `V f = 0` for every morphism, so the Phase 1 axioms admitted
+only the identically zero valuation, and every valuation theorem was
+true of a degenerate subject. The repair is that hom-set `+` is
+compatible with valuations (`V_add`) and with nothing else: the
+two absorption laws, `0 ∘ f = 0` and `f ∘ 0 = 0`, and the two
+distributive laws of composition over `+` are gone from `𝕋Laws`,
+additivity of tensor was never among its laws, and this module's
+model is the standing proof of non-degeneracy. The formal witnesses
+are at the bottom of this file:
 
-- `zero_absorption_degenerates` — adding the absorption law back
-  collapses every valuation to zero (three lines);
-- `comp_not_zero_absorbing`, `tensor_not_additive` — the free model
-  refutes the removed laws, so they are not derivable from `𝕋Laws`.
+- `zero_absorption_degenerates`, `left_distrib_degenerates`,
+  `right_distrib_degenerates`, and `tensor_additive_degenerates`:
+  restoring `f ∘ 0 = 0` or either distributive law of composition
+  over `+`, or adding additivity of tensor in its first argument,
+  collapses every valuation to zero;
+- `comp_not_zero_absorbing`, `comp_not_left_additive`, and
+  `tensor_not_additive`: the free model refutes `f ∘ 0 = 0`, left
+  distributivity, and tensor additivity, so none of them is
+  derivable from `𝕋Laws`;
+- `endpoint_law_refuted`: the free model also refutes the reading of
+  a valuation as the difference of a measure of a morphism's two
+  ends.
+
+Right distributivity has no refutation of its own, but it is not
+derivable either: in the free model it would, by
+`right_distrib_degenerates`, collapse
+`accountValuation oneFlow someAccount`, which `oneFlow_gen_measure`
+shows to be nonzero. The mirror absorption law `0 ∘ f = 0` is
+excluded in the same way by the mirror image of
+`zero_absorption_degenerates`, an argument of three lines that this
+file does not state as a theorem.
 -/
 
 namespace Ledger
 
-/-- L1 carrier: per-account rational net flows — the Pacioli group. -/
+/-- The L1 carrier: finitely supported rational quantities indexed by
+    account name and commodity, the free ℚ-vector space on `Account`.
+    It is the signed image of Ellerman's Pacioli group under the
+    debit isomorphism, not that group itself; see the module
+    docstring. -/
 abbrev PacioliGroup : Type := Account →₀ ℚ
 
 /-! ### The per-commodity trial balance -/
@@ -211,7 +290,7 @@ def flowAux (flows : S.Gen → G) :
     flowAux flows (f.cast hA hB) = flowAux flows f := by
   subst hA; subst hB; rfl
 
-/-- The flow denotation respects every equation of the free model —
+/-- The flow denotation respects every equation of the free model:
     the L2 → L1 leg of the commuting squares, checked constructor by
     constructor. This induction is where a wrong law refuses to
     close; see the module docstring. -/
@@ -248,10 +327,11 @@ def flow (flows : S.Gen → PacioliGroup) {A B : Object} :
 /-! ### The commuting squares (Phase 8)
 
 Each fundamental operation of the free model commutes with the
-denotation into the Pacioli group. The proofs are induction to
-representatives plus the defining clauses of `flowAux` — the solved
-forms *are* the definition, which is what "solve, don't verify"
-buys. -/
+denotation into the carrier. The proofs are induction to
+representatives plus the defining clauses of `flowAux`: the solved
+forms *are* the definition, which is the benefit of solving the
+equations rather than verifying a separate implementation against
+them. -/
 
 @[simp] theorem flow_mk (flows : S.Gen → PacioliGroup)
     {A B : Object} (f : S.FreeMor A B) :
@@ -302,9 +382,9 @@ buys. -/
 
 /-- The per-account ℝ-valued valuation functors of the free model:
     project the flow at one account and embed ℚ ↪ ℝ (the L1 → L0
-    leg). This ties the concrete tower to the abstract kernel — every
-    Phase 3 theorem now speaks about the free model with no further
-    proof. -/
+    leg). This ties the concrete tower to the abstract kernel, so
+    every Phase 3 theorem speaks about the free model with no
+    further proof. -/
 def accountValuation (flows : S.Gen → PacioliGroup) (a : Account) :
     ValuationFunctor (freeT S) where
   V f := ((flow flows f) a : ℝ)
@@ -570,7 +650,7 @@ theorem right_distrib_degenerates (T : 𝕋) (W : ValuationFunctor T)
   rw [W.V_comp, W.V_add, W.V_add, W.V_comp, W.V_zero] at h1
   linarith
 
-/-- Putting tensor-additivity back degenerates the theory. The law is
+/-- Adding tensor-additivity degenerates the theory. The law is
     additivity of tensor in its first operand,
     `(f + f') ⊗ g = f ⊗ g + f' ⊗ g`: `(0 + 0) ⊗ g` measures `g` once
     and `0 ⊗ g + 0 ⊗ g` twice. -/
@@ -583,7 +663,11 @@ theorem tensor_additive_degenerates (T : 𝕋) (W : ValuationFunctor T)
   linarith
 
 /-- A one-generator specification: a single atomic transaction on the
-    empty endpoints. -/
+    empty endpoints. Paired with `oneFlow`, whose flow is nonzero, it
+    is deliberately not sign-coherent (`unitSpec_not_signCoherent`):
+    the counterexamples below take a flow that no endpoint constrains,
+    a freedom the abstract theory allows and the oracle's generators
+    never exercise (`Driver.specFor_coherent`). -/
 def unitSpec : GenSpec := ⟨PUnit, fun _ => 0, fun _ => 0⟩
 
 /-- The account the counterexamples flow through. -/
@@ -609,7 +693,7 @@ example : ∃ flows : unitSpec.Gen → PacioliGroup, (∀ t, flows t ∈ zeroRow
 
 /-- The free model refutes zero-absorption: `f ∘ 0 ≠ 0` when `f`
     carries flow. Hence the removed law is not derivable from
-    `𝕋Laws` — the removal (D16) is forced, not merely prudent. -/
+    `𝕋Laws`, and its removal (D16) is forced, not merely prudent. -/
 theorem comp_not_zero_absorbing :
     ¬ (∀ (T : 𝕋) (_ : 𝕋Laws T) {A B C : Object} (f : T.Hom B C),
         T.comp f (0 : T.Hom A B) = (0 : T.Hom A C)) := by
