@@ -180,17 +180,41 @@ theorem conserved_measure_zero {T : 𝕋} (φ : Object → ℝ) (h0 : φ 0 = 0)
     (A : Object) : φ A = 0 := by
   rw [conserved_measure_const φ hφ A 0, h0]
 
-/-- A static valuation: each account×commodity pair is assigned a
-    quantity at rest. This is the *object-level* companion of a
-    valuation functor (opening balances, price tables). The pointwise
-    `AddCommMonoid` structure on `Account → ℝ` is Mathlib's Pi
-    instance — nothing bespoke. -/
+/-- A static valuation: a quantity at rest for each account, given as
+    a real number, where an account is a name paired with a commodity.
+    It is the *object-level* companion of a valuation functor,
+    measuring state rather than flow, and it represents neither
+    opening balances nor price tables. Opening balances are excluded
+    for two reasons. First, in Ellerman's treatment the T-accounts of
+    a beginning ledger add up to the zero-account, as those of each
+    transaction do (p. 489), so a beginning ledger can be recorded as
+    one entry posted to the empty ledger rather than as a state; the
+    oracle has no construct for opening balances and records an
+    opening entry as a generator like any other. Second, an
+    unconstrained function on accounts is not confined to ledgers
+    that add up to the zero-account, since nothing requires its values
+    to sum to zero within each commodity, whereas the signed form of
+    Ellerman's beginning ledger does so within each property type (a
+    zero-row, p. 492, and a zero-row of vectors, p. 498). The second
+    reason rests on Ellerman's model and does not carry over to C++
+    Ledger, which accepts opening entries that do not sum to zero
+    within each commodity, since a posting with a lot price or a cost
+    is balanced at that price or cost rather than at its own amount
+    (the balancing convention recorded in the `Ledger/Journal.lean`
+    module docstring); for C++ journals the first reason stands
+    alone. Prices are rates between commodities, carried by
+    `PriceGroupoid` in `Prices.lean` and, when dated, by
+    `TimedPrices` in `TimedPrices.lean`, not quantities held by
+    accounts. The pointwise additive structure on `Account → ℝ` is
+    Mathlib's Pi instance. -/
 abbrev Valuation : Type := Account → ℝ
 
 namespace Valuation
 
-/-- Extend a static valuation from atomic accounts to objects — the
-    unique commutative-monoid homomorphism from the free CMon. -/
+/-- Extend a static valuation from accounts to objects by summing
+    over the multiset. As a map `Object →+ ℝ` this is `ofObjectHom`
+    (`ofObjectHom_apply`), the unique additive map that agrees with
+    `v` on singletons (`ofObjectHom_unique`). -/
 def ofObject (v : Valuation) (obj : Object) : ℝ :=
   (obj.map v).sum
 
@@ -208,6 +232,21 @@ def ofObject (v : Valuation) (obj : Object) : ℝ :=
 @[simp] theorem ofObject_singleton (v : Valuation) (a : Account) :
     ofObject v {a} = v a := by
   simp [ofObject]
+
+/-- `ofObject` as an additive map on the free commutative monoid of
+    accounts. -/
+def ofObjectHom (v : Valuation) : Object →+ ℝ :=
+  Multiset.sumAddMonoidHom.comp (Multiset.mapAddMonoidHom v)
+
+/-- The additive map computes `ofObject`, by definition. -/
+@[simp] theorem ofObjectHom_apply (v : Valuation) (obj : Object) :
+    ofObjectHom v obj = ofObject v obj := rfl
+
+/-- The extension is unique: an additive map on objects that agrees
+    with `v` on every singleton is `ofObjectHom v`. -/
+theorem ofObjectHom_unique (v : Valuation) (F : Object →+ ℝ)
+    (h : ∀ a, F {a} = v a) : F = ofObjectHom v :=
+  Multiset.addHom_ext fun a => by simp [h]
 
 /-- **Equal-ends form.** If every morphism of `T` has the same static
     value at both ends, the static valuation is zero on every account:
