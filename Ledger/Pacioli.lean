@@ -459,6 +459,77 @@ theorem free_flow_two_accounts (flows : S.Gen → PacioliGroup)
       flow flows f a ≠ 0 ∧ flow flows f b ≠ 0 :=
   zeroRow_two_accounts (flow_mem flows zeroRows hbal f) h0
 
+/-! ### Extensionality and naturality of the free model -/
+
+/-- The morphism of the free model that the generator `t` denotes. -/
+def genHom (t : S.Gen) : (freeT S).Hom (S.dom t) (S.cod t) := ⟦.gen t⟧
+
+@[simp] theorem flow_genHom (flows : S.Gen → PacioliGroup) (t : S.Gen) :
+    flow flows (genHom t) = flows t :=
+  flow_gen flows t
+
+/-- A flow valuation evaluated on a generator. This is not a simp
+    lemma, because `simp` already reaches the same right side through
+    `ofFlowHom_V` and `flow_genHom`; it exists to be cited by name. -/
+theorem ofFlowHom_gen (flows : S.Gen → PacioliGroup) (φ : PacioliGroup →+ ℚ)
+    (t : S.Gen) : (ofFlowHom flows φ).V (genHom t) = ((φ (flows t) : ℚ) : ℝ) := by
+  rw [ofFlowHom_V, flow_genHom]
+
+/-- **Extensionality on the free model**: two valuation functors that
+    agree on every generator agree on every morphism. The proof is the
+    generatedness induction of `freeGenerated`. The structural cases
+    are discharged by the functor laws of both sides, and the generator
+    case by the transport lemma `V_castHom` together with the
+    hypothesis. It uses nothing from the valuation-functor algebra of
+    `Derived`, and this module does not import `Derived`. -/
+theorem free_valuation_ext (W₁ W₂ : ValuationFunctor (freeT S))
+    (h : ∀ t : S.Gen, W₁.V (genHom t) = W₂.V (genHom t))
+    {A B : Object} (f : FreeHom S A B) : W₁.V f = W₂.V f := by
+  refine (freeGenerated S).induction (fun {A B} g => W₁.V g = W₂.V g)
+    (fun {A B} g hg => ?_)
+    (fun A => by simp only [W₁.V_id (freeLaws S), W₂.V_id (freeLaws S)])
+    (fun A B => by simp only [W₁.V_zero, W₂.V_zero])
+    (fun g f hg hf => by simp only [W₁.V_comp, W₂.V_comp, hg, hf])
+    (fun f hf => by simp only [W₁.V_inv (freeLaws S), W₂.V_inv (freeLaws S), hf])
+    (fun f g hf hg => by simp only [W₁.V_tensor, W₂.V_tensor, hf, hg])
+    (fun f g hf hg => by simp only [W₁.V_add, W₂.V_add, hf, hg]) f
+  obtain ⟨t, hA, hB, rfl⟩ := hg
+  show W₁.V _ = W₂.V _
+  rw [W₁.V_castHom, W₂.V_castHom]
+  exact h t
+
+/-- The flow denotation is natural in the generator assignment:
+    post-composing every generator's flow with an additive endomorphism
+    post-composes every morphism's flow with it. This is `map_flowAux`
+    passed through the quotient. -/
+theorem flow_map (φ : PacioliGroup →+ PacioliGroup) (flows : S.Gen → PacioliGroup)
+    {A B : Object} (f : FreeHom S A B) :
+    flow (fun t => φ (flows t)) f = φ (flow flows f) :=
+  Quotient.inductionOn f fun x => (map_flowAux φ flows x).symm
+
+/-- The flow denotation is additive in the generator assignment. -/
+theorem flow_add_flows (flows conv : S.Gen → PacioliGroup)
+    {A B : Object} (f : FreeHom S A B) :
+    flow (fun t => flows t + conv t) f = flow flows f + flow conv f := by
+  induction f using Quotient.inductionOn with
+  | h x =>
+    show flowAux (fun t => flows t + conv t) x = flowAux flows x + flowAux conv x
+    induction x with
+    | gen t => rfl
+    | id _ => simp [flowAux]
+    | zero _ _ => simp [flowAux]
+    | comp g f ihg ihf => simp only [flowAux, ihg, ihf]; abel
+    | inv f ih => simp only [flowAux, ih]; abel
+    | tensor f g ihf ihg => simp only [flowAux, ihf, ihg]; abel
+    | add f g ihf ihg => simp only [flowAux, ihf, ihg]; abel
+
+/-- Flow valuations are additive in the generator assignment. -/
+theorem ofFlowHom_add_flows (flows conv : S.Gen → PacioliGroup)
+    (φ : PacioliGroup →+ ℚ) {A B : Object} (f : FreeHom S A B) :
+    (ofFlowHom (fun t => flows t + conv t) φ).V f
+      = (ofFlowHom flows φ).V f + (ofFlowHom conv φ).V f := by
+  simp only [ofFlowHom_V, flow_add_flows, map_add, Rat.cast_add]
+
 /-! ### Formal witnesses of the D16 finding -/
 
 /-- Putting the zero-absorption law back degenerates the theory:
