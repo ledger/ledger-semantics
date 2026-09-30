@@ -512,6 +512,40 @@ theorem comp_not_zero_absorbing :
   rw [Finsupp.single_eq_zero] at hfl
   exact one_ne_zero hfl
 
+/-- The valuation of `oneFlow` at `someAccount` measures the generator
+    of `unitSpec` as `1`. The generator is a morphism `0 ⟶ 0`, so its
+    two ends are the same object and carry no information about its
+    flow. -/
+theorem oneFlow_gen_measure :
+    (accountValuation oneFlow someAccount).V
+      (⟦.gen PUnit.unit⟧ : FreeHom unitSpec 0 0) = 1 := by
+  show ((flow oneFlow (⟦.gen PUnit.unit⟧ : FreeHom unitSpec _ _))
+    someAccount : ℝ) = 1
+  rw [flow_gen]
+  simp [oneFlow]
+
+/-- **The endpoint law is refuted**: it is not the case that every
+    valuation of every lawful model is the difference of an object
+    measure across each morphism. The witness is the generator of
+    `unitSpec`, a morphism from the empty object to itself that the
+    valuation measures as `1` (`oneFlow_gen_measure`), so the
+    difference form fails on the generator itself and the zero
+    morphism plays no part. What the theorem adds to
+    `ValuationFunctor.endpoint_measure_degenerates` is a lawful model
+    with a nonzero valuation: the degeneracy theorem excludes a
+    valuation that exists, not merely a hypothetical one. -/
+theorem endpoint_law_refuted :
+    ¬ (∀ (T : 𝕋) (_ : 𝕋Laws T) (W : ValuationFunctor T),
+        ∃ φ : Object → ℝ,
+          ∀ {A B : Object} (f : T.Hom A B), W.V f = φ B - φ A) := by
+  intro hlaw
+  obtain ⟨φ, hφ⟩ := hlaw (freeT unitSpec) (freeLaws unitSpec)
+    (accountValuation oneFlow someAccount)
+  have h := (accountValuation oneFlow someAccount).endpoint_measure_degenerates
+    φ hφ (⟦.gen PUnit.unit⟧ : FreeHom unitSpec 0 0)
+  rw [oneFlow_gen_measure] at h
+  exact one_ne_zero h
+
 /-- The free model refutes tensor-additivity: `(f + f') ⊗ g` and
     `f ⊗ g + f' ⊗ g` measure `g`'s flow once and twice
     respectively. -/

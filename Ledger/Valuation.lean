@@ -23,10 +23,22 @@ make valuation a *separate structure over* `𝕋`, of which there are
 many: one per commodity, one per budget scenario, one per account
 (the per-account family is what reports consume).
 
-`V_obj` is deleted: the object part of a valuation is derived from a
+`V_obj` is deleted. The object part of a valuation is derived from a
 static account assignment (`Valuation.ofObject` below), and no law
-connected `V_obj` to `V_hom` — nor should one: hom-valuations measure
-*flow*, account assignments measure *state at rest*.
+connects it to the measure of morphisms, nor should one:
+hom-valuations measure *flow*, account assignments measure *state at
+rest*. The endpoint theorems below make this precise. A valuation
+that equals the change of an object measure across every morphism
+vanishes (`ValuationFunctor.endpoint_measure_degenerates`); an object
+measure equal at the two ends of every morphism is constant
+(`conserved_measure_const`); a static valuation whose extension to
+objects is equal at the two ends of every morphism is zero
+(`Valuation.ofObject_ends_equal_degenerates`). Each follows because
+the zero morphism `0 : Hom A B` exists for every pair of objects.
+These refute only the object-measure readings of a morphism's two
+ends. The free model has a nonzero valuation, which shows that the
+difference-form refutation is not vacuous
+(`GenSpec.endpoint_law_refuted` in `Pacioli.lean`).
 
 ## The minimal law basis (solved, not verified)
 
@@ -99,6 +111,23 @@ theorem V_braiding (L : 𝕋Laws T) (A B : Object) :
   unfold 𝕋.braiding
   rw [W.V_castHom, W.V_id L]
 
+/-- An object measure whose difference across every morphism is the
+    valuation is constant: compare the ends of `0 : T.Hom A B`. -/
+theorem endpoint_measure_const (φ : Object → ℝ)
+    (hφ : ∀ {A B : Object} (f : T.Hom A B), W.V f = φ B - φ A)
+    (A B : Object) : φ A = φ B := by
+  have h := hφ (0 : T.Hom A B)
+  rw [W.V_zero] at h
+  exact (sub_eq_zero.mp h.symm).symm
+
+/-- **Only the zero valuation is a difference of endpoint measures**:
+    if `W.V f = φ B - φ A` for every `f : T.Hom A B`, then `W`
+    vanishes identically. No `𝕋Laws` are needed. -/
+theorem endpoint_measure_degenerates (φ : Object → ℝ)
+    (hφ : ∀ {A B : Object} (f : T.Hom A B), W.V f = φ B - φ A)
+    {A B : Object} (f : T.Hom A B) : W.V f = 0 := by
+  rw [hφ f, W.endpoint_measure_const φ hφ A B, sub_self]
+
 /-- Pointwise sum of valuation functors (e.g. summing per-account
     measurements into a trial balance). -/
 def add (W₁ W₂ : ValuationFunctor T) : ValuationFunctor T where
@@ -136,6 +165,21 @@ def finsetSum {ι : Type*} (s : Finset ι) (Ws : ι → ValuationFunctor T) :
 
 end ValuationFunctor
 
+/-- An object measure equal at the two ends of every morphism of `T`
+    is constant: the conservation reading of "equal measure on its
+    two ends" holds of no measure that distinguishes objects. -/
+theorem conserved_measure_const {T : 𝕋} (φ : Object → ℝ)
+    (hφ : ∀ {A B : Object} (_ : T.Hom A B), φ A = φ B)
+    (A B : Object) : φ A = φ B :=
+  hφ (0 : T.Hom A B)
+
+/-- An object measure that is zero on the empty object and equal at
+    the two ends of every morphism is identically zero. -/
+theorem conserved_measure_zero {T : 𝕋} (φ : Object → ℝ) (h0 : φ 0 = 0)
+    (hφ : ∀ {A B : Object} (_ : T.Hom A B), φ A = φ B)
+    (A : Object) : φ A = 0 := by
+  rw [conserved_measure_const φ hφ A 0, h0]
+
 /-- A static valuation: each account×commodity pair is assigned a
     quantity at rest. This is the *object-level* companion of a
     valuation functor (opening balances, price tables). The pointwise
@@ -159,6 +203,34 @@ def ofObject (v : Valuation) (obj : Object) : ℝ :=
 @[simp] theorem ofObject_add (v : Valuation) (A B : Object) :
     ofObject v (A + B) = ofObject v A + ofObject v B := by
   simp [ofObject]
+
+/-- A one-account object has the value of its account. -/
+@[simp] theorem ofObject_singleton (v : Valuation) (a : Account) :
+    ofObject v {a} = v a := by
+  simp [ofObject]
+
+/-- **Equal-ends form.** If every morphism of `T` has the same static
+    value at both ends, the static valuation is zero on every account:
+    compare `{a}` with the empty object along `0`. -/
+theorem ofObject_ends_equal_degenerates {T : 𝕋} (v : Valuation)
+    (hv : ∀ {A B : Object} (_ : T.Hom A B), ofObject v A = ofObject v B) :
+    v = 0 := by
+  funext a
+  have h := hv (0 : T.Hom 0 {a})
+  simpa using h.symm
+
+/-- **Difference form, at a static valuation.** If some valuation
+    functor measures every morphism as the change of a static
+    valuation between its ends, the static valuation is zero on every
+    account, and by `ValuationFunctor.endpoint_measure_degenerates` so
+    is the functor. -/
+theorem ofObject_endpoint_degenerates {T : 𝕋} (W : ValuationFunctor T)
+    (v : Valuation)
+    (hv : ∀ {A B : Object} (f : T.Hom A B),
+      W.V f = ofObject v B - ofObject v A) :
+    v = 0 :=
+  ofObject_ends_equal_degenerates (T := T) v
+    (fun {A B} _ => W.endpoint_measure_const (ofObject v) hv A B)
 
 end Valuation
 
