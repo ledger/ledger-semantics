@@ -102,4 +102,18 @@ noncomputable def timedConstRates (Time : Type) (T : 𝕋) (W : ValuationFunctor
   CV t := fun c => (1 / priceAt t c) • W
   act t := PriceAction.constModel T W (priceAt t) (hne t)
 
+/-- Value in a fixed numeraire does not move in the constant-rate
+    model: at every instant, the price of `b` times the
+    `b`-measurement of a transaction is its measurement under the base
+    functional `W`, whatever the prices are. -/
+theorem timedConstRates_value_const (Time : Type) (T : 𝕋)
+    (W : ValuationFunctor T) (priceAt : Time → Commodity → ℝ)
+    (hne : ∀ t c, priceAt t c ≠ 0) (t : Time) (b : Commodity)
+    {A B : Object} (f : T.Hom A B) :
+    priceAt t b * ((timedConstRates Time T W priceAt hne).CV t b).V f
+      = W.V f := by
+  have hb := hne t b
+  show priceAt t b * ((1 / priceAt t b) * W.V f) = W.V f
+  field_simp
+
 end Ledger
