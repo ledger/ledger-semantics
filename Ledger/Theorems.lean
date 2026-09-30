@@ -94,7 +94,7 @@ theorem trial_balance (L : 𝕋Laws T) {ι : Type*} (s : Finset ι)
     credit-positive (the negations on the right). Given balanced
     journal entries, the equation holds for every derived flow —
     it is the trial balance, rearranged. -/
-theorem pacioli_equation (L : 𝕋Laws T) {ι : Type*}
+theorem balance_sheet_equation (L : 𝕋Laws T) {ι : Type*}
     (assets liabs eqs : Finset ι) (Ws : ι → ValuationFunctor T)
     (hgen : ∀ {A B : Object} (f : T.Hom A B), G.IsGen f →
       (∑ i ∈ assets, (Ws i).V f) + (∑ i ∈ liabs, (Ws i).V f)
@@ -108,6 +108,9 @@ theorem pacioli_equation (L : 𝕋Laws T) {ι : Type*}
   simp only [add_V, finsetSum_V] at h
   rw [Finset.sum_neg_distrib, Finset.sum_neg_distrib]
   linarith
+
+@[deprecated balance_sheet_equation (since := "2026-09-27")]
+alias pacioli_equation := balance_sheet_equation
 
 end TrialBalance
 

@@ -51,9 +51,10 @@ which every balance report computes, is then an additive
 homomorphism out of the free model. Seen this way, the Pacioli
 invariant that debits equal credits is a theorem about the shape of
 morphisms, since every morphism has equal measure on its two ends.
-The theorem `pacioli_equation` in `Ledger/Theorems.lean` establishes
-the invariant for the abstract category, and `free_flow_balanced` in
-`Ledger/Pacioli.lean` carries it down to the computed flows.
+The theorem `balance_sheet_equation` in `Ledger/Theorems.lean`
+establishes the invariant for the abstract category, and
+`free_flow_balanced` in `Ledger/Pacioli.lean` carries it down to the
+computed flows.
 
 The theory also contains a negative result, one that explains a
 design constraint visible in every mature accounting program. The
