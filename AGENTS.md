@@ -165,9 +165,12 @@ cover. Divergences are the product. One that exposes your defect you
 fix; one that exposes an unrecorded convention belongs here as a
 pull request adding the rule with its witness.
 
-The oracle compares balances. Register rows, market valuation, and
-lot matching are specified in the theory and not yet bisimulated, so
-do not claim coverage of them on the strength of this oracle.
+The oracle compares balances. Register rows, valuation at fixed
+prices, price-vector valuation, holding gains at dated prices, and
+lot refinement with its valuation are specified in the theory and
+are not bisimulated. Lot matching is not specified at all, and the
+oracle's flows do not distinguish lots. Do not claim coverage of any
+of these on the strength of this oracle.
 
 ## Style for prose and commits
 

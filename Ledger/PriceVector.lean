@@ -28,9 +28,10 @@ appears in `GenSpec.valueIn_eq_quantity_of_single` and, over
 `priceVectorValuation`, in `exchangeReport`. The latter presents
 `-X b` as `constModel` over the price-vector functional; that is an
 idealization, not a bisimulated claim, because it needs a total,
-nowhere-zero price table and ignores fixated lot prices. That
-cost-basis reports need lots as commodities is an extrapolation from
-Ellerman's note 20, not his claim.
+nowhere-zero price table and ignores fixated lot prices
+(`Ledger/Lots.lean`). That cost-basis reports need lots as
+commodities is an extrapolation from Ellerman's note 20, not his
+claim.
 
 `priceDot`, `valueHom` and the free-model functors built on them are
 noncomputable, so an executable market valuation needs a computable
