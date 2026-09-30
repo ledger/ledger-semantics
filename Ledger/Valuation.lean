@@ -274,8 +274,20 @@ theorem ofObject_endpoint_degenerates {T : 𝕋} (W : ValuationFunctor T)
 end Valuation
 
 /-- Multi-commodity valuation: one valuation functor per commodity.
-    `CV c` measures net flow denominated in commodity `c`. The price
-    groupoid (`Prices.lean`) relates the members of the family. -/
+
+    The type admits two readings, and the specification uses both.
+    Under the quantity reading, `CV c` measures the net quantity of
+    commodity `c` that a morphism moves, summed over accounts
+    (`GenSpec.quantityValuation` in `Ledger/PriceVector.lean`); it
+    vanishes identically on a journal whose entries balance per
+    commodity. Under the value reading, `CV c` measures value expressed
+    in the numeraire `c` at a fixed, nowhere-zero price vector `p`, the
+    family `fun c => (1 / (p c : ℝ)) • GenSpec.priceValuation flows p`
+    over which `PriceAction.constModel` is sound. The price groupoid
+    (`Prices.lean`) relates the members of a family under the value
+    reading. On a journal that moves only commodity `c`, the readings
+    agree at the member `c` (`GenSpec.valueIn_eq_quantity_of_single`);
+    they differ in general. -/
 abbrev CommodityValuation (T : 𝕋) : Type := Commodity → ValuationFunctor T
 
 end Ledger
