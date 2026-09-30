@@ -5,9 +5,9 @@ import Ledger.Accounts
 # The free symmetric monoidal groupoid 𝕋
 
 The core mathematical object. `𝕋` is the free symmetric monoidal
-groupoid enriched over commutative monoids, and this file says so in
-the standard vocabulary: for every lawful model `L : 𝕋Laws T`, the
-tagged object type `L.Obj` carries genuine Mathlib instances of
+groupoid whose hom-sets are commutative monoids, and this file says
+so in the standard vocabulary: for every lawful model `L : 𝕋Laws T`,
+the tagged object type `L.Obj` carries genuine Mathlib instances of
 `Category`, `Groupoid`, `MonoidalCategory`, `SymmetricCategory`, and
 a per-hom-set `AddCommMonoid` (see the bridge section at the end).
 The fields of `𝕋` and `𝕋Laws` are exactly the data and obligations a
@@ -15,10 +15,12 @@ model must supply to earn those instances; all monoidal coherence
 (pentagon, triangle, hexagons, naturality) is then inherited from
 Mathlib rather than restated here. The one standard structure that
 is deliberately ABSENT is `Preadditive`-style compatibility between
-hom-addition and composition: decision D16 proves that those laws
-degenerate every valuation to zero, so `𝕋` is a symmetric monoidal
-groupoid whose hom-sets carry commutative-monoid structure that
-interacts only with valuations.
+hom-addition and composition: decision D16 records, and
+`Ledger.Pacioli` proves, that those laws degenerate every valuation
+to zero, so `𝕋` is a symmetric monoidal groupoid whose hom-sets
+carry commutative-monoid structure that interacts only with
+valuations, and it is not enriched over commutative monoids in the
+standard sense.
 
 - **Objects**: `Object` — the free commutative monoid `Multiset Account`
   (concrete; see `Accounts.lean`). Tensor on objects is `+`, the unit
@@ -32,9 +34,12 @@ interacts only with valuations.
 
 ## What is structure and what is derived
 
-Structure (`𝕋` fields): `Hom`, per-hom-set `AddCommMonoid` (the CMon
-enrichment — Mathlib's class, so `f + g` and `0` notation and all
-commutative-monoid laws come for free), `id`, `comp`, `inv`, `tensor`.
+Structure (`𝕋` fields): `Hom`, per-hom-set `AddCommMonoid` (each
+hom-set is a commutative monoid under Mathlib's class, so `f + g` and
+`0` notation and all commutative-monoid laws come for free; by
+decision D16 that structure is compatible with valuations only, so it
+is not an enrichment in the standard sense), `id`, `comp`, `inv`,
+`tensor`.
 
 Derived (definitions below, laws proved from `𝕋Laws`):
 
@@ -63,17 +68,20 @@ text: every flow it denotes is built from its entries."
 
 namespace Ledger
 
-/-- The free symmetric monoidal groupoid enriched over CMon — the
-    **specification** every representation must implement. `Hom` is
-    abstract; only its properties (via `𝕋Laws`) are specified.
+/-- The free symmetric monoidal groupoid with commutative-monoid
+    hom-sets: the **specification** every representation must
+    implement. `Hom` is abstract; only its properties (via `𝕋Laws`)
+    are specified.
 
-    The CMon enrichment is Mathlib's `AddCommMonoid` on each hom-set:
-    `f + g` aggregates two transactions of the same shape, `0` is the
-    empty (balanced, moves-nothing) transaction. -/
+    Each hom-set is a commutative monoid (Mathlib's `AddCommMonoid`):
+    `f + g` aggregates two transactions of the same shape, and `0` is
+    the empty (balanced, moves-nothing) transaction. By decision D16
+    this structure is compatible with valuations only, so it is not an
+    enrichment in the standard sense (see `𝕋Laws`). -/
 structure 𝕋 where
   /-- Morphisms (transactions) — an abstract family of types. -/
   Hom : Object → Object → Type
-  /-- CMon enrichment: each hom-set is a commutative monoid. -/
+  /-- Aggregation: each hom-set is a commutative monoid. -/
   homAddCommMonoid : ∀ A B : Object, AddCommMonoid (Hom A B)
   /-- Identity morphism: doing nothing on an account multiset. -/
   id : (A : Object) → Hom A A
@@ -177,15 +185,22 @@ end 𝕋
 
     **Aggregation is compatible with nothing but the valuation**
     (decision D16). Neither composition nor tensor distributes over
-    hom-set `+`, and composition does not absorb `0`: each candidate
-    law is refuted by the valuation, which counts some flow twice —
-    e.g. `V((g + g') ∘ f) = V g + V g' + V f` but
-    `V(g∘f + g'∘f) = V g + V g' + 2·V f`. Worse, Phase 1's
-    `comp_zero` (`f ∘ 0 = 0`) together with `V_comp` *forced
-    `V f = 0` for every morphism* — the whole Phase 1 axiom set
-    admitted only the identically-zero valuation. The flow model in
-    `Pacioli.lean` (which exists precisely because these laws are
-    gone) is the standing witness of non-degeneracy. Consequently 𝕋
+    hom-set `+`, and composition does not absorb `0`. Additivity of
+    composition in either operand forces every valuation to vanish,
+    because the valuation would count some flow twice:
+    `V((g + g') ∘ f) = V g + V g' + V f` but
+    `V(g∘f + g'∘f) = V g + V g' + 2·V f`; additivity of tensor in its
+    first operand fails in the same way. Phase 1's `comp_zero`
+    (`f ∘ 0 = 0`) together with `V_comp` *forced `V f = 0` for every
+    morphism*, so the whole Phase 1 axiom set admitted only the
+    identically-zero valuation. `Pacioli.lean` records these four
+    collapses: `left_distrib_degenerates` for a sum in the left
+    operand of `∘`, `(g + g') ∘ f`; `right_distrib_degenerates` for a
+    sum in the right operand, `g ∘ (f + f')`;
+    `tensor_additive_degenerates` for `(f + f') ⊗ g`; and
+    `zero_absorption_degenerates` for `f ∘ 0 = 0`. The flow model of
+    that file, which exists precisely because these laws are gone, is
+    the standing witness of non-degeneracy. Consequently 𝕋
     is *not* a CMon-enriched category in the standard sense: hom-sets
     carry CMon structure (aggregation), and that structure interacts
     only with valuations (`V_add`). -/
@@ -408,11 +423,12 @@ instance : SymmetricCategory L.Obj where
     show eqToHom (add_comm A B) ≫ eqToHom (add_comm B A) = 𝟙 (A + B)
     simp [eqToHom_trans]
 
-/-- The CMon enrichment, stated on the categorical homs. It is
-    deliberately bare: no `Preadditive` instance exists or may be
-    added, because compatibility between `+` and `≫` degenerates
-    every valuation to zero (decision D16; see
-    `zero_absorption_degenerates` in `Ledger.Pacioli`). -/
+/-- The commutative monoid on each hom-set, stated on the categorical
+    homs. It is deliberately bare: no `Preadditive` instance exists or
+    may be added, because compatibility between `+` and `≫`
+    degenerates every valuation to zero (decision D16; see
+    `zero_absorption_degenerates`, `left_distrib_degenerates` and
+    `right_distrib_degenerates` in `Ledger.Pacioli`). -/
 instance (A B : L.Obj) : AddCommMonoid (A ⟶ B) := T.homAddCommMonoid A B
 
 /-- The braiding of the bridge agrees with the bespoke `braiding`. -/

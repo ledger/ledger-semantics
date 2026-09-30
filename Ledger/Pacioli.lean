@@ -472,6 +472,45 @@ theorem zero_absorption_degenerates (T : 𝕋) (W : ValuationFunctor T)
   rw [habs, W.V_zero, W.V_zero] at h1
   linarith
 
+/-- Putting left distributivity back degenerates the theory. The law
+    is additivity of composition in its left operand,
+    `(g + g') ∘ f = g ∘ f + g' ∘ f`; "left" names the operand of `∘`,
+    as in `𝕋Laws.id_comp`, so read as multiplication this is the
+    shape usually called right distributivity. `(0 + 0) ∘ f` measures
+    `f` once and `0 ∘ f + 0 ∘ f` measures it twice, so every valuation
+    of every morphism is zero. -/
+theorem left_distrib_degenerates (T : 𝕋) (W : ValuationFunctor T)
+    (hdist : ∀ {A B C : Object} (g g' : T.Hom B C) (f : T.Hom A B),
+      T.comp (g + g') f = T.comp g f + T.comp g' f)
+    {A B : Object} (f : T.Hom A B) : W.V f = 0 := by
+  have h1 := congrArg W.V (hdist (0 : T.Hom B B) 0 f)
+  rw [W.V_comp, W.V_add, W.V_add, W.V_comp, W.V_zero] at h1
+  linarith
+
+/-- Putting right distributivity back degenerates the theory. The law
+    is additivity of composition in its right operand,
+    `g ∘ (f + f') = g ∘ f + g ∘ f'`, and the argument is the mirror
+    image of `left_distrib_degenerates`, at `f ∘ (0 + 0)`. -/
+theorem right_distrib_degenerates (T : 𝕋) (W : ValuationFunctor T)
+    (hdist : ∀ {A B C : Object} (g : T.Hom B C) (f f' : T.Hom A B),
+      T.comp g (f + f') = T.comp g f + T.comp g f')
+    {A B : Object} (f : T.Hom A B) : W.V f = 0 := by
+  have h1 := congrArg W.V (hdist f (0 : T.Hom A A) 0)
+  rw [W.V_comp, W.V_add, W.V_add, W.V_comp, W.V_zero] at h1
+  linarith
+
+/-- Putting tensor-additivity back degenerates the theory. The law is
+    additivity of tensor in its first operand,
+    `(f + f') ⊗ g = f ⊗ g + f' ⊗ g`: `(0 + 0) ⊗ g` measures `g` once
+    and `0 ⊗ g + 0 ⊗ g` twice. -/
+theorem tensor_additive_degenerates (T : 𝕋) (W : ValuationFunctor T)
+    (hdist : ∀ {A B C D : Object} (f f' : T.Hom A B) (g : T.Hom C D),
+      T.tensor (f + f') g = T.tensor f g + T.tensor f' g)
+    {C D : Object} (g : T.Hom C D) : W.V g = 0 := by
+  have h1 := congrArg W.V (hdist (0 : T.Hom 0 0) 0 g)
+  rw [W.V_tensor, W.V_add, W.V_add, W.V_tensor, W.V_zero] at h1
+  linarith
+
 /-- A one-generator specification: a single atomic transaction on the
     empty endpoints. -/
 def unitSpec : GenSpec := ⟨PUnit, fun _ => 0, fun _ => 0⟩
@@ -545,6 +584,24 @@ theorem endpoint_law_refuted :
     φ hφ (⟦.gen PUnit.unit⟧ : FreeHom unitSpec 0 0)
   rw [oneFlow_gen_measure] at h
   exact one_ne_zero h
+
+/-- The free model refutes left distributivity: for `f` the generator
+    of `unitSpec`, `(id + id) ∘ f` and `id ∘ f + id ∘ f` measure the
+    flow of `f` once and twice respectively. Hence the removed law is
+    not derivable from `𝕋Laws`. -/
+theorem comp_not_left_additive :
+    ¬ (∀ (T : 𝕋) (_ : 𝕋Laws T) {A B C : Object}
+        (g g' : T.Hom B C) (f : T.Hom A B),
+        T.comp (g + g') f = T.comp g f + T.comp g' f) := by
+  intro hlaw
+  have h := hlaw (freeT unitSpec) (freeLaws unitSpec)
+    (⟦.id 0⟧ : FreeHom unitSpec 0 0) (⟦.id 0⟧) (⟦.gen PUnit.unit⟧)
+  have hrel := Quotient.exact h
+  have hfl := flowAux_respects oneFlow hrel
+  simp only [flowAux, oneFlow, add_zero, zero_add] at hfl
+  have happ := congrArg (fun v : PacioliGroup => v someAccount) hfl
+  simp only [Finsupp.add_apply, Finsupp.single_eq_same] at happ
+  norm_num at happ
 
 /-- The free model refutes tensor-additivity: `(f + f') ⊗ g` and
     `f ⊗ g + f' ⊗ g` measure `g`'s flow once and twice
