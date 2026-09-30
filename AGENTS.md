@@ -27,7 +27,13 @@ The executable layer reads journals and computes balances:
 
     Basic → Parse → Journal, and Pacioli → Oracle → Register, Driver
 
-`Driver` is the only module that joins the two sides. The
+Apart from the index `Ledger.lean`, `Driver` is the only module
+that joins the two chains of the executable layer, the
+journal-reading chain of `Parse` and `Journal` and the evaluating
+chain that begins at `Oracle`. A module that imports an executable
+module together with a specification module only to state proofs,
+such as `DriverTwoSides`, is imported by no module on the oracle's
+run path, which is the import closure of `Driver`. The
 specification layer never imports the executable layer, and that
 direction must be preserved; it was verified by import scan and any
 change that reverses an edge is wrong regardless of whether it

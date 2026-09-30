@@ -52,6 +52,10 @@ that are not. The abstract theory leaves endpoints unconstrained by
 flows, and the counterexample model of `Pacioli.lean` is deliberately
 incoherent (`GenSpec.unitSpec_not_signCoherent`).
 
+`DriverTwoSides.lean` proves that the oracle's generators are
+coherent (`Driver.specFor_coherent`), so the theorems of this module
+apply to them.
+
 The endpoint theorems of `Valuation.lean` refute a different reading,
 in which one object measure is compared across every morphism, and do
 not bear on this one.
