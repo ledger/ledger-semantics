@@ -88,6 +88,99 @@ theorem trialBalance_apply (x : PacioliGroup) (c : Commodity) :
 @[simp] theorem commodityTotal_apply (c : Commodity) (v : PacioliGroup) :
     commodityTotal c v = trialBalance v c := rfl
 
+/-! ### What a zero-row touches (Ellerman pp. 486-487, 492) -/
+
+/-- **Ellerman pp. 486-487.** An equation `∑ j ∈ s, f j = r` cannot
+    survive a change to exactly one term: if `g` agrees with `f` on
+    `s` except possibly at `i`, and satisfies the same equation, then
+    it agrees at `i` as well. The total `r` is held fixed. Ellerman's
+    two-sided equation `x + ... + y = w + ... + z` is the case in
+    which `r` is the sum of the right side; a change confined to the
+    right side is the same statement with the sides exchanged.
+    Nothing about double entry is used, only cancellation in an
+    `AddCancelCommMonoid`, which is Ellerman's point that the property
+    belongs to the transaction and not to the method of recording it
+    (p. 487). -/
+theorem one_term_change {ι M : Type*} [AddCancelCommMonoid M]
+    (s : Finset ι) (f g : ι → M) {r : M} {i : ι} (hi : i ∈ s)
+    (hrest : ∀ j ∈ s, j ≠ i → f j = g j)
+    (hf : ∑ j ∈ s, f j = r) (hg : ∑ j ∈ s, g j = r) : f i = g i := by
+  classical
+  have hrest' : ∑ j ∈ s.erase i, f j = ∑ j ∈ s.erase i, g j :=
+    Finset.sum_congr rfl fun j hj =>
+      hrest j (Finset.mem_of_mem_erase hj) (Finset.ne_of_mem_erase hj)
+  rw [← Finset.add_sum_erase s f hi] at hf
+  rw [← Finset.add_sum_erase s g hi, ← hrest'] at hg
+  exact add_right_cancel (hf.trans hg.symm)
+
+/-- **Ellerman p. 492, in the signed carrier.** A nonzero zero-row
+    touches at least two accounts of one commodity.
+
+    `PacioliGroup` holds signed numbers in single-sided accounts. It
+    is Ellerman's single-sided system: the image of his group of
+    T-accounts under the debit isomorphism, and not that group itself.
+    This is therefore his observation that the single-sided system
+    shares the property of each transaction affecting two or more
+    accounts, so that the property cannot be what is double in
+    double-entry bookkeeping; what is double is the two-sidedness of
+    the T-accounts (p. 487). An `Account` pairs a name with a
+    commodity, so the two accounts, sharing a commodity, differ in
+    name; they are two accounts also in Ellerman's vector sense, in
+    which one account may hold several property types. The statement
+    concerns zero-rows only and says nothing about entries accepted
+    outside `zeroRows`, such as an implicit exchange
+    (`implicit_exchange_not_mem_zeroRows`).
+
+    Proof: pick an account `a` that the row touches and compare the
+    row with the zero flow in the column of the commodity of `a`. Both
+    satisfy the column equation `∑ = 0`, so by `one_term_change` they
+    cannot differ at `a` alone, and the row touches a second account
+    of that commodity. -/
+theorem zeroRow_two_accounts {x : PacioliGroup} (hx : x ∈ zeroRows)
+    (h0 : x ≠ 0) :
+    ∃ a b : Account, a ≠ b ∧ a.commodity = b.commodity ∧ x a ≠ 0 ∧ x b ≠ 0 := by
+  obtain ⟨a, ha⟩ : ∃ a, x a ≠ 0 := by
+    by_contra h
+    push Not at h
+    exact h0 (Finsupp.ext h)
+  by_contra hno
+  push Not at hno
+  have hs : a ∈ x.support.filter (fun b => b.commodity = a.commodity) :=
+    Finset.mem_filter.mpr ⟨Finsupp.mem_support_iff.mpr ha, rfl⟩
+  have hcol : ∑ b ∈ x.support.filter (fun b => b.commodity = a.commodity), x b = 0 := by
+    rw [← trialBalance_apply, mem_zeroRows.mp hx, Finsupp.zero_apply]
+  refine ha (one_term_change _ (⇑x) (fun _ => (0 : ℚ)) hs ?_ hcol (by simp))
+  intro b hb hba
+  exact hno a b (Ne.symm hba) (Finset.mem_filter.mp hb).2.symm ha
+
+/-- The same fact read as Ellerman's "change": two distinct zero-rows
+    differ in at least two accounts of one commodity. -/
+theorem zeroRows_change_two_accounts {x y : PacioliGroup}
+    (hx : x ∈ zeroRows) (hy : y ∈ zeroRows) (hne : x ≠ y) :
+    ∃ a b : Account, a ≠ b ∧ a.commodity = b.commodity ∧ x a ≠ y a ∧ x b ≠ y b := by
+  obtain ⟨a, b, hab, hc, ha, hb⟩ :=
+    zeroRow_two_accounts (zeroRows.sub_mem hx hy) (sub_ne_zero.mpr hne)
+  refine ⟨a, b, hab, hc, fun h => ha ?_, fun h => hb ?_⟩ <;> simp [h]
+
+/-- A lone posting is a zero-row only when it moves nothing. -/
+theorem single_mem_zeroRows_iff (a : Account) (q : ℚ) :
+    Finsupp.single a q ∈ zeroRows ↔ q = 0 := by
+  rw [mem_zeroRows, trialBalance_single, Finsupp.single_eq_zero]
+
+/-- A two-commodity exchange with no stated price, `10 EUR` against
+    `-11 USD`, touches two accounts but not two of one commodity, and
+    is not a zero-row. C++ Ledger and the oracle both accept this
+    transaction as an implicit exchange (the two-commodity residual
+    convention recorded in the `Ledger/Journal.lean` module
+    docstring), so an accepted transaction need not be a zero-row. -/
+theorem implicit_exchange_not_mem_zeroRows :
+    Finsupp.single (⟨"Assets:EUR", "EUR"⟩ : Account) 10
+      + Finsupp.single (⟨"Assets:USD", "USD"⟩ : Account) (-11) ∉ zeroRows := by
+  rw [mem_zeroRows, map_add, trialBalance_single, trialBalance_single]
+  intro h
+  have := congrArg (fun v : Commodity →₀ ℚ => v "EUR") h
+  simp at this
+
 namespace GenSpec
 
 variable {S : GenSpec}
@@ -354,6 +447,18 @@ theorem free_flow_balanced (flows : S.Gen → PacioliGroup)
     flow flows f = 0 :=
   free_ker_balanced flows (AddMonoidHom.id _) hbal f
 
+/-- **The free-model form of Ellerman p. 492**: if every journal entry
+    is a zero-row, every nonzero derived flow touches two accounts of
+    one commodity. The hypothesis is that of `free_double_entry`;
+    under the hypothesis of `free_flow_balanced` every flow is zero,
+    and the statement would hold vacuously. -/
+theorem free_flow_two_accounts (flows : S.Gen → PacioliGroup)
+    (hbal : ∀ t, flows t ∈ zeroRows) {A B : Object} (f : FreeHom S A B)
+    (h0 : flow flows f ≠ 0) :
+    ∃ a b : Account, a ≠ b ∧ a.commodity = b.commodity ∧
+      flow flows f a ≠ 0 ∧ flow flows f b ≠ 0 :=
+  zeroRow_two_accounts (flow_mem flows zeroRows hbal f) h0
+
 /-! ### Formal witnesses of the D16 finding -/
 
 /-- Putting the zero-absorption law back degenerates the theory:
@@ -376,6 +481,21 @@ def someAccount : Account := ⟨"Assets:Cash", "USD"⟩
 
 def oneFlow : unitSpec.Gen → PacioliGroup :=
   fun _ => Finsupp.single someAccount 1
+
+/-- The hypotheses of `free_flow_two_accounts` are jointly
+    satisfiable: one generator moving a dollar from cash to food.
+    This is not a witness of the D16 finding; it stands in this
+    section only because it uses `unitSpec` and `someAccount`. -/
+example : ∃ flows : unitSpec.Gen → PacioliGroup, (∀ t, flows t ∈ zeroRows) ∧
+    flow flows (⟦.gen PUnit.unit⟧ : FreeHom unitSpec _ _) ≠ 0 := by
+  refine ⟨fun _ => Finsupp.single (⟨"Expenses:Food", "USD"⟩ : Account) 1
+      - Finsupp.single someAccount 1, fun _ => ?_, ?_⟩
+  · rw [mem_zeroRows, map_sub, trialBalance_single, trialBalance_single]
+    simp [someAccount]
+  · rw [flow_gen]
+    intro h
+    have := congrArg (fun v : PacioliGroup => v someAccount) h
+    simp [someAccount] at this
 
 /-- The free model refutes zero-absorption: `f ∘ 0 ≠ 0` when `f`
     carries flow. Hence the removed law is not derivable from
