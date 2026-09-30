@@ -1,4 +1,5 @@
 import Mathlib.Data.Finsupp.Basic
+import Mathlib.Algebra.Group.Subgroup.Ker
 import Mathlib.Tactic.Abel
 import Ledger.Free
 
@@ -45,15 +46,65 @@ namespace Ledger
 /-- L1 carrier: per-account rational net flows — the Pacioli group. -/
 abbrev PacioliGroup : Type := Account →₀ ℚ
 
+/-! ### The per-commodity trial balance -/
+
+/-- Ellerman's vector trial balance (pp. 494, 496): collapse each
+    account to its commodity and sum, one column per property type. -/
+noncomputable def trialBalance : PacioliGroup →+ (Commodity →₀ ℚ) :=
+  Finsupp.mapDomain.addMonoidHom Account.commodity
+
+/-- The trial-balance column of one commodity. Taken over every
+    account, it vanishes on each derived flow of a journal whose
+    entries balance in that commodity (`free_trial_balance`), as they
+    do when they are zero-rows. It is therefore a check and not a
+    report; a report measures selected accounts, as
+    `accountValuation` measures one. -/
+noncomputable def commodityTotal (c : Commodity) : PacioliGroup →+ ℚ :=
+  (Finsupp.applyAddHom c).comp trialBalance
+
+/-- Zero-rows: the flows whose amounts sum to zero over the accounts
+    of each commodity. Ellerman's name for a signed row that sums to
+    zero (p. 492), which in the vector case is a row of vectors that
+    adds to zero (p. 498); on the T-account side of his debit
+    isomorphism the corresponding rows of T-accounts are transaction
+    zero-terms (pp. 488-489). -/
+noncomputable def zeroRows : AddSubgroup PacioliGroup := trialBalance.ker
+
+theorem mem_zeroRows {v : PacioliGroup} : v ∈ zeroRows ↔ trialBalance v = 0 :=
+  AddMonoidHom.mem_ker
+
+@[simp] theorem trialBalance_single (a : Account) (q : ℚ) :
+    trialBalance (Finsupp.single a q) = Finsupp.single a.commodity q :=
+  Finsupp.mapDomain_single
+
+/-- A column of the trial balance is the sum of the flow over the
+    accounts of that commodity that it touches. -/
+theorem trialBalance_apply (x : PacioliGroup) (c : Commodity) :
+    trialBalance x c = ∑ a ∈ x.support with a.commodity = c, x a := by
+  rw [Finset.sum_filter]
+  simp only [trialBalance, Finsupp.mapDomain.addMonoidHom_apply,
+    Finsupp.mapDomain, Finsupp.sum, Finsupp.finsetSum_apply, Finsupp.single_apply]
+
+@[simp] theorem commodityTotal_apply (c : Commodity) (v : PacioliGroup) :
+    commodityTotal c v = trialBalance v c := rfl
+
 namespace GenSpec
 
 variable {S : GenSpec}
 
 noncomputable section
 
-/-- The flow denotation on terms. -/
-def flowAux (flows : S.Gen → PacioliGroup) :
-    {A B : Object} → S.FreeMor A B → PacioliGroup
+variable {G H : Type*} [AddCommGroup G] [AddCommGroup H]
+
+/-- The flow denotation on terms, into any additive commutative
+    group. The L1 denotation `flow` is valued in `PacioliGroup`; the
+    generality is what makes `map_flowAux` (naturality) statable,
+    because its right-hand side is a denotation into another group,
+    which `trialBalance_flowAux` takes to be `Commodity →₀ ℚ`.
+    `flowAux_mem` (subgroup preservation) is stated at the same
+    generality. -/
+def flowAux (flows : S.Gen → G) :
+    {A B : Object} → S.FreeMor A B → G
   | _, _, .gen t => flows t
   | _, _, .id _ => 0
   | _, _, .zero _ _ => 0
@@ -62,7 +113,7 @@ def flowAux (flows : S.Gen → PacioliGroup) :
   | _, _, .tensor f g => flowAux flows f + flowAux flows g
   | _, _, .add f g => flowAux flows f + flowAux flows g
 
-@[simp] theorem flowAux_cast (flows : S.Gen → PacioliGroup)
+@[simp] theorem flowAux_cast (flows : S.Gen → G)
     {A A' B B' : Object} (hA : A = A') (hB : B = B') (f : S.FreeMor A B) :
     flowAux flows (f.cast hA hB) = flowAux flows f := by
   subst hA; subst hB; rfl
@@ -71,7 +122,7 @@ def flowAux (flows : S.Gen → PacioliGroup) :
     the L2 → L1 leg of the commuting squares, checked constructor by
     constructor. This induction is where a wrong law refuses to
     close; see the module docstring. -/
-theorem flowAux_respects (flows : S.Gen → PacioliGroup)
+theorem flowAux_respects (flows : S.Gen → G)
     {A B : Object} {f g : S.FreeMor A B} (h : Rel f g) :
     flowAux flows f = flowAux flows g := by
   induction h with
@@ -168,25 +219,140 @@ def accountValuation (flows : S.Gen → PacioliGroup) (a : Account) :
   V_tensor f g := by rw [flow_tensor, Finsupp.add_apply, Rat.cast_add]
   V_add f g := by rw [flow_add, Finsupp.add_apply, Rat.cast_add]
 
-/-- **The free model's double-entry theorem**, by instantiating the
-    abstract master theorem at the per-account valuations: balanced
-    journal entries make every derived flow vanish, account by
-    account. The kernel and the tower meet here. -/
+/-! ### Naturality, and the bridge to the abstract kernel -/
+
+/-- Naturality: an additive map commutes with the denotation. -/
+theorem map_flowAux (φ : G →+ H) (flows : S.Gen → G)
+    {A B : Object} (f : S.FreeMor A B) :
+    φ (flowAux flows f) = flowAux (φ ∘ flows) f := by
+  induction f with
+  | gen t => rfl
+  | id A => simp [flowAux]
+  | zero A B => simp [flowAux]
+  | comp g f ihg ihf => simp [flowAux, ihg, ihf]
+  | inv f ih => simp [flowAux, ih]
+  | tensor f g ihf ihg => simp [flowAux, ihf, ihg]
+  | add f g ihf ihg => simp [flowAux, ihf, ihg]
+
+/-- Subgroup preservation: a subgroup that contains every
+    generator's flow contains the flow of every term. -/
+theorem flowAux_mem (flows : S.Gen → G) (K : AddSubgroup G)
+    (h : ∀ t, flows t ∈ K) {A B : Object} (f : S.FreeMor A B) :
+    flowAux flows f ∈ K := by
+  induction f with
+  | gen t => exact h t
+  | id A => exact K.zero_mem
+  | zero A B => exact K.zero_mem
+  | comp g f ihg ihf => exact K.add_mem ihg ihf
+  | inv f ih => exact K.neg_mem ih
+  | tensor f g ihf ihg => exact K.add_mem ihf ihg
+  | add f g ihf ihg => exact K.add_mem ihf ihg
+
+/-- Subgroup preservation for the denotation of L2 morphisms. -/
+theorem flow_mem (flows : S.Gen → PacioliGroup) (K : AddSubgroup PacioliGroup)
+    (h : ∀ t, flows t ∈ K) {A B : Object} (f : FreeHom S A B) :
+    flow flows f ∈ K :=
+  Quotient.inductionOn f fun x => flowAux_mem flows K h x
+
+/-- **Residual formula**: the trial balance of any term's flow is the
+    denotation of the generators' own trial balances. When entries
+    fail to be zero-rows, the per-commodity totals of a journal are
+    the sum of the per-entry residuals, which may cancel. -/
+theorem trialBalance_flowAux (flows : S.Gen → PacioliGroup)
+    {A B : Object} (f : S.FreeMor A B) :
+    trialBalance (flowAux flows f) = flowAux (trialBalance ∘ flows) f :=
+  map_flowAux trialBalance flows f
+
+/-- Every additive functional of L1 flows is a valuation functor of
+    the free model, measured in ℝ through ℚ ↪ ℝ: the bridge from L1 to
+    the abstract kernel. `accountValuation` is its instance at
+    evaluation at one account. -/
+def ofFlowHom (flows : S.Gen → PacioliGroup) (φ : PacioliGroup →+ ℚ) :
+    ValuationFunctor (freeT S) where
+  V f := ((φ (flow flows f) : ℚ) : ℝ)
+  V_comp g f := by rw [flow_comp, map_add, Rat.cast_add]
+  V_tensor f g := by rw [flow_tensor, map_add, Rat.cast_add]
+  V_add f g := by rw [flow_add, map_add, Rat.cast_add]
+
+@[simp] theorem ofFlowHom_V (flows : S.Gen → PacioliGroup) (φ : PacioliGroup →+ ℚ)
+    {A B : Object} (f : FreeHom S A B) :
+    (ofFlowHom flows φ).V f = ((φ (flow flows f) : ℚ) : ℝ) := rfl
+
+example (flows : S.Gen → PacioliGroup) (a : Account) {A B : Object}
+    (f : FreeHom S A B) :
+    (accountValuation flows a).V f = (ofFlowHom flows (Finsupp.applyAddHom a)).V f :=
+  rfl
+
+/-- The master theorem at any additive functional: a functional of
+    flows that vanishes on every generator vanishes on every derived
+    flow. This instantiates `balanced_generators_balance` at
+    `ofFlowHom`, so the abstract kernel and the tower meet here. -/
+theorem free_hom_balanced (flows : S.Gen → PacioliGroup) (φ : PacioliGroup →+ ℚ)
+    (hbal : ∀ t, φ (flows t) = 0) {A B : Object} (f : FreeHom S A B) :
+    φ (flow flows f) = 0 := by
+  have h := balanced_generators_balance (freeT S) (freeGenerated S)
+    (ofFlowHom flows φ) (freeLaws S)
+    (fun {A B} g hg => by
+      obtain ⟨t, hA, hB, rfl⟩ := hg
+      rw [(ofFlowHom flows φ).V_castHom]
+      show ((φ (flow flows (⟦.gen t⟧ : FreeHom S _ _)) : ℚ) : ℝ) = 0
+      rw [flow_gen, hbal t]; simp) f
+  exact Rat.cast_eq_zero.mp h
+
+/-- The kernel form, for an additive map into any additive
+    commutative group: a map that vanishes on every generator's flow
+    vanishes on every derived flow. -/
+theorem free_ker_balanced (flows : S.Gen → PacioliGroup) (ψ : PacioliGroup →+ H)
+    (hbal : ∀ t, ψ (flows t) = 0) {A B : Object} (f : FreeHom S A B) :
+    ψ (flow flows f) = 0 :=
+  AddMonoidHom.mem_ker.mp
+    (flow_mem flows ψ.ker (fun t => AddMonoidHom.mem_ker.mpr (hbal t)) f)
+
+/-- **Per-commodity double entry** (Ellerman pp. 493-496): if every
+    journal entry balances in commodity `c`, so does every derived
+    flow.
+
+    The hypothesis is a condition on the entries, and not every
+    generator the oracle emits meets it. `Ledger/Journal.lean`
+    balances each transaction on weights, valuing a posting at its lot
+    price or cost where it carries one, but records the posting's own
+    amount, so a priced exchange leaves a nonzero column in each of
+    its commodities. A residual accepted as an implicit exchange or
+    within the balancing tolerance, a paren-virtual posting (exempt
+    from balancing, whether written in the transaction or appended by
+    an automated transaction), and a timeclock entry (added without a
+    balance check) can each do the same. `Ledger/Journal.lean` records
+    each of these conventions in its module docstring or beside the
+    rule that implements it. -/
+theorem free_trial_balance (flows : S.Gen → PacioliGroup) (c : Commodity)
+    (hbal : ∀ t, commodityTotal c (flows t) = 0) {A B : Object}
+    (f : FreeHom S A B) :
+    commodityTotal c (flow flows f) = 0 :=
+  free_hom_balanced flows (commodityTotal c) hbal f
+
+/-- **The free model's double-entry theorem**, Ellerman's vector
+    trial balance (p. 496): if every journal entry is a zero-row,
+    every derived flow is a zero-row. Proved column by column from
+    `free_trial_balance`; the scope of the hypothesis is stated
+    there. -/
+theorem free_double_entry (flows : S.Gen → PacioliGroup)
+    (hbal : ∀ t, flows t ∈ zeroRows) {A B : Object} (f : FreeHom S A B) :
+    trialBalance (flow flows f) = 0 := by
+  ext c
+  have h := free_trial_balance flows c
+    (fun t => by rw [commodityTotal_apply, mem_zeroRows.mp (hbal t)]; rfl) f
+  simpa using h
+
+/-- The degenerate case `ψ = id` of `free_ker_balanced`: if every
+    entry moves nothing, every derived flow is zero. Only a journal
+    whose entries move nothing satisfies the hypothesis, so this
+    theorem does not carry double entry down to computed flows;
+    `free_double_entry` does, under the zero-row hypothesis. -/
 theorem free_flow_balanced (flows : S.Gen → PacioliGroup)
     (hbal : ∀ t : S.Gen, flows t = 0)
     {A B : Object} (f : FreeHom S A B) :
-    flow flows f = 0 := by
-  ext a
-  have h := balanced_generators_balance (freeT S) (freeGenerated S)
-    (accountValuation flows a) (freeLaws S)
-    (fun {A B} g hg => by
-      obtain ⟨t, hA, hB, rfl⟩ := hg
-      rw [(accountValuation flows a).V_castHom]
-      show ((flow flows (⟦.gen t⟧ : FreeHom S _ _)) a : ℝ) = 0
-      rw [flow_gen, hbal t]
-      simp) f
-  have hq : (flow flows f) a = 0 := Rat.cast_eq_zero.mp h
-  simpa using hq
+    flow flows f = 0 :=
+  free_ker_balanced flows (AddMonoidHom.id _) hbal f
 
 /-! ### Formal witnesses of the D16 finding -/
 
