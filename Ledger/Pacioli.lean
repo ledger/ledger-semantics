@@ -41,6 +41,12 @@ postings through unchanged. Under the credit isomorphism every
 printed row would change sign, so a comparison survives that change
 only if both sides make it together.
 
+The pair construction itself, Ellerman's T-accounts with their
+cross-sum equality, reduced forms, and the debit and credit
+isomorphisms, is built in `Ledger/TAccount.lean`, where
+`TAccount.accountDebitIso` identifies this carrier with the debit
+image of the group of differences over `Account`.
+
 ## The denotation
 
 The denotation of a reified morphism is its net per-account flow:
