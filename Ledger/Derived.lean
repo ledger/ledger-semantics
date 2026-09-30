@@ -41,6 +41,18 @@ namespace ValuationFunctor
 
 variable {T : 𝕋}
 
+/-- Valuation functors are determined by their measurement: the three
+    laws are propositions, so two functors with the same `V` are equal.
+    This is what lets a statement about reports be an equality of
+    functors rather than a family of pointwise equations. -/
+theorem ext_V {W₁ W₂ : ValuationFunctor T}
+    (h : ∀ {A B : Object} (f : T.Hom A B), W₁.V f = W₂.V f) : W₁ = W₂ := by
+  obtain ⟨V₁, _, _, _⟩ := W₁
+  obtain ⟨V₂, _, _, _⟩ := W₂
+  have hV : @V₁ = @V₂ := funext fun A => funext fun B => funext fun f => h f
+  subst hV
+  rfl
+
 /-- Pointwise negation (e.g. flip a measurement's sign convention). -/
 def neg (W : ValuationFunctor T) : ValuationFunctor T where
   V f := -W.V f
