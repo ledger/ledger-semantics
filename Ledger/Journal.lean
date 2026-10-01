@@ -11,17 +11,64 @@ effective transaction: its final per-account, per-commodity flows.
 Semantics implemented, each pinned by the C++ suite's own expected
 outputs (the `SemanticBisimulation` ctest is the standing check):
 
-- **Balancing**: per commodity over real/bracket-virtual/deferred
-  postings, each contributing its lot-price value `{P}`×qty if
-  annotated, else its `@`/`@@` cost, else its own amount; one elided
-  posting absorbs the residual per commodity; a `bucket` account
-  absorbs a real residual only in a transaction of exactly one
-  parsed posting; a two-commodity real residual, its commodities
-  keyed by lot price as C++ keys them, is an implicit exchange only
-  where C++ infers one (Phase 3, `impliedExchange`, which lists its
-  departures), and a bracket-virtual residual never is; lot values
-  never settle a bracket-virtual residual; paren-virtuals `(A)` are
-  exempt.
+- **Balancing**: per commodity and per pool, on *weights*, not on own
+  amounts, while the recorded flows are own amounts.
+  - *Pools*: real and deferred postings balance together,
+    bracket-virtuals `[A]` apart (regress/563), and paren-virtuals
+    `(A)` are exempt.
+  - *First pass*: a posting weighs its `@`/`@@` cost if it has one
+    and else its own amount. No lot is valued, except that outside a
+    periodic template a lot priced in the commodity of its posting's
+    cost adds its rounded gain to that cost (baseline/opt-base). C++
+    Phase 6 does so for a posting of the real pool whose amount has a
+    commodity (xact.cc:692-729); for a bracket-virtual posting it
+    adds the gain to the real balance, and for an amount with no
+    commodity it adds none, two departures that the comment beside
+    `costVal` records.
+  - *Elision and bucket*: one elided posting absorbs the residual per
+    commodity, and a `bucket` account absorbs a real residual only in
+    a transaction of a single posting, counting the parsed postings of
+    every kind (xact.cc:368).
+  - *Implicit exchange*: otherwise a two-commodity real residual, its
+    commodities keyed by lot price as C++ keys them, is an implicit
+    exchange only where C++ infers one (Phase 3, `impliedExchange`,
+    which lists its departures), and a bracket-virtual residual never
+    is. Where C++ converts, its verdict decides, and neither the
+    allowance nor the second pass below applies. Where the top
+    posting's key is not an entry of the real balance, C++ takes the
+    two entries in an unspecified order (balance.h:99,
+    xact.cc:422-423), and when the two orders lead to different
+    verdicts, the order-dependent rule passes a real residual in
+    exactly two commodities.
+  - *Zero test and allowance*: the zero test rounds at display
+    precision, widened in the real pool for a cost commodity shown
+    without decimals (regress/1114), and asks for exact zero in the
+    null commodity. A residual left to these tests passes when its
+    part in each commodity passes the zero test or lies within the sum
+    of half a unit in the last place of each cost written with
+    decimals in that commodity. In either pool that allowance stands
+    in for the per-unit cost rounding that C++ adjusts in the real
+    pool alone (regress/1125, `costTol`).
+  - *Second pass*: only a real residual that still fails reaches a
+    second pass (regress/coverage-wave3-fixated-price), which weighs
+    each lot at its price `{P}`×qty, in place of its cost except in a
+    periodic template; its residual must pass the zero test or the
+    order-dependent rule. The bracket-virtual pool has no second
+    pass. C++ values a lot only in Phase 4, for a fixated lot on a
+    posting without a cost, and in Phase 6, for a lot whose posting
+    has a cost, written or computed, in the lot price's commodity or
+    whose cost itself carries a lot price in that commodity
+    (xact.cc:475-518, 692-774), and it adds neither value to the
+    bracket-virtual balance (xact.cc:505-516, 712-713). The docstring
+    of `impliedExchange` lists the lot shapes known to be accepted
+    here in consequence, a lot whose posting has a cost in another
+    commodity among them.
+  - *Flows*: the recorded flows are each posting's own amount, never
+    its weight, so a transaction balanced through a cost, a lot value
+    or an implicit exchange can leave nonzero per-commodity totals:
+    regress/1784 totals 28 ABCDEF and -280.00 EUR, and an unfiltered
+    `equity` report books the negation of such totals to
+    Equity:Opening Balances (baseline/cmd-equity).
 - **Assignments** `= AMT` on an amountless posting: computed
   sequentially against the running account balance including earlier
   postings of the same transaction (regress/1005). With an amount
@@ -31,8 +78,9 @@ outputs (the `SemanticBisimulation` ctest is the standing check):
   bare multipliers × the matched posting's amount) are appended per
   matching real posting of each later transaction — after balancing,
   as `extend_xact` does; templates may be virtual.
-- **Timeclock** `i`/`o`: single-sided time postings (duration in
-  canonical seconds); no balancing.
+- **Timeclock** `i`/`o`: time postings (duration in canonical
+  seconds), with the opposite amount posted to the bucket account
+  when one is declared (regress/1607); no balance check.
 - **UUID dedup**: a transaction whose note carries an already-seen
   `UUID:` is dropped whole (C++ `journal.cc` semantics) — the one
   documented non-flow-inert label.
@@ -832,6 +880,22 @@ private def parseAmountField (ctx : AmtCtx) (line : Nat) (field : String)
               (roundAt ((ctx.precs.lookup c.comm).getD 0 + r.decimals) gl))
           else none
       | _, _ => none
+    -- The gain enters the weight of the posting in its own pool: the
+    -- second transaction of baseline/opt-base, `-40h {$20} @ $100.00`,
+    -- balances through it in the first pass of `balancePool`. This
+    -- departs from C++ in two cases, each of which can fail either
+    -- way. C++ adds the gain of a bracket-virtual posting to the real
+    -- balance (xact.cc:712-713) and tests the bracket-virtual balance
+    -- with the cost as written (xact.cc:322-325, 973-979): a
+    -- bracket-virtual `10 AAA {$5} @ $6` against a bracket-virtual
+    -- `-$50` is accepted here and rejected by C++ with a remainder of
+    -- `$-10` (fail-open), and against a bracket-virtual `-$60` beside a
+    -- real `$10` it is rejected here and accepted by C++
+    -- (fail-closed). C++ keeps no lot on an amount with no commodity
+    -- (amount.cc:1908) and so adds no gain for it: `10 {$5} @ $6`
+    -- against `-$50` is accepted here and rejected by C++ with a
+    -- remainder of `$10` (fail-open), and against `-$60` it is
+    -- rejected here and accepted by C++ (fail-closed)
     let costVal := match lot, cost with
       | some (p, _), some c =>
           if periodic then some c
@@ -1237,20 +1301,34 @@ private inductive Exchange where
       `A {$33.333333}` are one key for C++ and two here, so beside a
       same-sign `0.001 B` that rounds away when doubled, C++ accepts
       the exchange and it is rejected here (fail-closed).
-    Outside this predicate the first pass of `balancePool` is
-    lot-blind, and in the real pool the second pass values every lot,
-    where C++ values only fixated lots (Phase 4) and the lot of `x`
-    (Phase 6). Six lot shapes that C++ rejects are therefore still
-    accepted here, each fail-open: a lot against plain units of its
-    commodity, a fixated lot against plain units, a lot against a lot
-    of its commodity at another price, three or more keys settled by
+    Outside this predicate the first pass of `balancePool` values a lot
+    only through the gain that `costVal` adds, outside a periodic
+    template, to a cost in the lot price's commodity, and in the real
+    pool the second pass values every lot, except that a periodic
+    template keeps a cost where one is written. C++ values a lot only
+    in Phase 4, for a fixated lot on a posting without a cost, and in
+    Phase 6, for a lot whose posting has a cost, written or computed,
+    in the lot price's commodity or whose cost itself carries a lot
+    price in that commodity (xact.cc:475-518, 692-774); among postings
+    with no cost written, that is a fixated lot and the lot of `x`.
+    Seven lot shapes that C++ rejects are therefore still accepted
+    here, each fail-open: a lot against plain units of its commodity,
+    a fixated lot against plain units, a lot against a lot of its
+    commodity at another price, three or more keys settled by
     unfixated lots, a fixated lot among other keys when it is not the
-    top posting, and a fixated lot as the top posting against an
-    unfixated lot of another commodity priced in the same commodity.
-    The bracket-virtual pool has no second pass, since C++ values no
-    lot there, but its lot-blind first pass still accepts the first
-    three shapes there, whose quantities net to zero when lots are
-    ignored. -/
+    top posting, a fixated lot as the top posting against an unfixated
+    lot of another commodity priced in the same commodity, and, in a
+    dated transaction, a lot whose posting has a cost in another
+    commodity. The last is `10 AAA {5 EUR} @ $6` against `-50 EUR`,
+    whose first pass leaves `$60` and `-50 EUR` and whose second pass
+    settles it at the lot value, while C++ books no gain across the
+    two commodities and leaves it unbalanced.
+    The bracket-virtual pool has no second pass, since C++ adds no lot
+    value to the bracket-virtual balance (xact.cc:505-516, 712-713),
+    but its first pass, which keys an amount without its lot, still
+    accepts the first three shapes there, whose quantities net to zero
+    when lots are ignored. The gain that `costVal` adds there is a
+    further departure, which the comment beside `costVal` records. -/
 private def impliedExchange (st : St) (xact pool : List PostSpec)
     (periodic : Bool := false) : Exchange :=
   let keyOf := fun (p : PostSpec) (a : Amount) => ((a.comm,
@@ -1547,7 +1625,13 @@ private def finalizeXact (st : St) (hline : Nat) (_header : String)
               -- tests at the widened precision 4, and the same with
               -- `@@ 0.4921 EUR` against `-1.00 EUR`, which it tests at
               -- the display precision 2, are rejected here and accepted
-              -- by C++ (fail-closed)
+              -- by C++ (fail-closed). The tolerance applies in the
+              -- bracket-virtual pool as well, where C++ makes no
+              -- adjustment (xact.cc:910 skips a virtual posting) and
+              -- tests the balance at the display precision
+              -- (xact.cc:973-979): the journal of regress/1125 with
+              -- every posting bracket-virtual is accepted here and
+              -- rejected by C++ (fail-open)
               let costTol := fun (c : String) =>
                 pool.foldl (init := (0 : ℚ)) fun acc p =>
                   match p.costVal with
@@ -1584,14 +1668,15 @@ private def finalizeXact (st : St) (hline : Nat) (_header : String)
                       settles c s
                         || (s ≤ costTol c && -s ≤ costTol c) then
                   pure pool
-                -- C++ values no lot in a bracket-virtual pool: Phase 1
-                -- sums it once, Phase 4's recompute skips its postings,
+                -- C++ adds no lot value to the bracket-virtual balance:
+                -- Phase 1 sums it once, Phase 4's recompute skips its
+                -- postings, Phase 6 adds their gain to the real balance,
                 -- and Phase 8 tests it as it stands (xact.cc:505-516,
-                -- 973-979)
+                -- 712-713, 973-979)
                 else if !isReal then unbalanced
                 else
                   -- second pass: substitute lot/fixated values
-                  -- (coverage-wave3 fixated, opt-base lot+cost). The
+                  -- (regress/coverage-wave3-fixated-price). The
                   -- lot-valued residual must itself round to zero: C++
                   -- prices fixated lots in Phase 4, after Phase 3, and
                   -- infers no exchange from what they leave
@@ -2544,6 +2629,12 @@ def run (input0 : String) (dcDefault : Bool := false)
         match pick? with
         | none => err n "timeclock check-out without check-in"
         | some (start, acct) =>
+            -- create_timelog_xact: with a bucket account declared, C++
+            -- adds a second posting of the negated duration to it, so
+            -- the entry balances; with none the account's posting
+            -- stands alone (timelog.cc:84-91, regress/1607). Neither
+            -- is balance-checked, since a timelog posting need not
+            -- balance (post.h:244-245)
             let flows := match st.bucket with
               | some b => [(Account.mk acct "s", stop - start),
                            (Account.mk b "s", start - stop)]
@@ -2640,6 +2731,9 @@ def run (input0 : String) (dcDefault : Bool := false)
       -- future check-ins are dropped, not negatively closed (1689)
       for (start, acct) in st.clockIn do
         if start ≤ nowS then
+          -- time_log_t::close checks each one out through the same
+          -- create_timelog_xact, bucket posting included
+          -- (timelog.cc:173-195, 84-91)
           let flows := match st.bucket with
             | some b => [(Account.mk acct "s", nowS - start),
                          (Account.mk b "s", start - nowS)]
