@@ -105,6 +105,21 @@ structure PostSpec where
       the docstring of `impliedExchange` gives a journal shape for each
       direction. -/
   fixated : Bool := false
+  /-- the precision of an explicit cost amount: the cost literal's
+      decimals, plus the amount's precision for a per-unit `@`
+      (textual_xacts.cc:699-710, amount.cc:720), raised to the basis's
+      precision when the posting's own lot price is in the cost's
+      commodity and the basis differs from the cost at all, even by a
+      gain that rounds to zero (xact.cc:696, 729; `parseAmountField`
+      states the remaining conditions); 0 without a cost. This is the
+      precision at which Phase 6 of `xact_base_t::finalize` leaves the
+      cost, except where Phase 6 rewrites a cost that carries its own
+      lot price into that price's commodity (xact.cc:735-774), and
+      `costPrec` stays with the cost as written. The final zero test of
+      `finalizeXact` widens a cost commodity of display precision 0 to
+      the first positive `costPrec` of a cost in it (`zeroTestPrec`,
+      regress/1114), whose docstring records the departures. -/
+  costPrec : Nat := 0
   deriving Repr
 
 instance : Inhabited PostSpec :=
@@ -246,13 +261,118 @@ private def bumpPrecision (st : St) (comm : String) (d : Nat) : St :=
       | none => { st with precisions := (comm, d) :: st.precisions }
     { st' with amt := { st'.amt with precs := st'.precisions } }
 
+/-- Does `q` round to zero at `p` decimals? -/
+private def roundsToZeroAt (p : Nat) (q : ℚ) : Bool :=
+  let scaled := (if q < 0 then -q else q) * (10 ^ p : ℕ)
+  scaled * 2 ≤ 1
+
 /-- Display-precision-tolerant zero test: does the residual round to
     zero at the commodity's learned precision? (Cost amounts never
     feed precision — confirmed on standard.dat's 22-decimal prices.) -/
 private def roundsToZero (st : St) (comm : String) (q : ℚ) : Bool :=
-  let p := (st.precisions.lookup comm).getD 0
-  let scaled := (if q < 0 then -q else q) * (10 ^ p : ℕ)
-  scaled * 2 ≤ 1
+  roundsToZeroAt ((st.precisions.lookup comm).getD 0) q
+
+/-- The precision at which the final zero test of a real pool reads a
+    residual in `comm` (xact.cc:868-895, issue #1114, regress/1114).
+    C++ widens a cost commodity of display precision 0 to the precision
+    of the first explicit cost in it whose precision is positive, as
+    Phase 6 leaves that cost, on a posting of any kind
+    (`PostSpec.costPrec`), so that a sub-unit remainder is not read as
+    zero; it restores the precision before it tests the bracket-virtual
+    balance (xact.cc:971-979), which `finalizeXact` therefore tests at
+    the display precision. C++ widens no cost without a commodity
+    (xact.cc:881) and tests a residual without one exactly, in either
+    pool (amount.cc:1378, 1429); `finalizeXact` does the same, apart
+    from the regress/1125 tolerance beside `costTol`, and never asks
+    this function about the null commodity. `posts` are the
+    transaction's postings in order, before automated postings are
+    added.
+
+    `parseAmountField` approximates the precision of an amount
+    expression and of a lot price, compares the commodities of a lot
+    price and a cost as written, and keeps a cost in the commodity in
+    which it is written; the display precision read here is the one
+    that this reader learns. Each departure below was measured against
+    C++ and is marked with the direction in which it fails:
+    - a cost written as an expression counts only its literals'
+      decimals, while C++ extends a division by six places
+      (amount.cc:805-812) and, parsing a cost without migration, does
+      not cap the quotient (amount.cc:1832-1835), so the cost of
+      `1 FOO @ ($1.4/1.4000001)` has precision 14 where it counts 7
+      here: `2 FOO @ ($100/9)` against `-$22`, and `2 FOO @@ ($200/9)`
+      against `-$22`, are accepted here and rejected by C++
+      (fail-open);
+    - C++ caps the precision of a product or quotient amount at its
+      commodity's display precision plus six (amount.cc:748-749,
+      825-826), so `(1.25/3 FOO)` has precision 6 where it counts 8
+      here: a transaction of `(1.25/3 FOO) @ 1 EUR`,
+      `(-1.25/3 FOO) @ 1 EUR`, `1 BAR @ 0.0000001 EUR` and `0 EUR` is
+      rejected here and accepted by C++ (fail-closed);
+    - a quotient counts its larger operand's decimals plus six, where
+      C++ adds both operands' precisions and six (amount.cc:811-812),
+      which shows once the cap does not bind: after `1.00 FOO` has
+      taught FOO two places, `(1.5/0.5 FOO) @ 1 EUR` with
+      `1 BAR @ 0.000000006 EUR` against `-3 EUR` is accepted here and
+      rejected by C++ (fail-open);
+    - a product counts its larger factor's decimals, or six more when
+      its value is not representable at them, where C++ adds the
+      factors' precisions, and two places more for a `%` factor
+      (amount.cc:720, 733):
+      `(0.5 * 0.4 FOO) @ 1 EUR` against `-1 BAR @ 0.16 EUR` is accepted
+      here and rejected by C++ (fail-open), and
+      `(0.5 * 0.5 FOO) @ 4 EUR` with `1 BAR @ 0.001 EUR` against
+      `-1 EUR`, and `(1 FOO * 50%) @ 1 EUR` twice with
+      `1 BAR @ 0.001 EUR` against `-1 EUR`, are rejected here and
+      accepted by C++ (fail-closed);
+    - C++ tests the residual exactly when its precision does not exceed
+      the widened one (amount.cc:1407), where this rounds at the
+      widened precision: `(1/3000000 FOO) @ 1 EUR` against `0 EUR` is
+      accepted here and rejected by C++ (fail-open);
+    - the raise of Phase 6 compares the lot price's commodity with the
+      cost's before `finalizeXact` resolves a `commodity` alias, which
+      C++ resolves as it parses (pool.cc:150-155), so where `E` is an
+      alias of `EUR`, `-0.5 FOO {1.001 E} @ 1 EUR` twice with
+      `1 BAR @@ 0.0004 EUR` against `1 EUR`, whose cost C++ raises to
+      precision 4, is accepted here and rejected by C++ (fail-open);
+    - the raise reads a `{P}` price at its own literal's decimals, while
+      C++ keys an annotated commodity by the value of its price
+      (pool.cc:200, annotate.cc:97-100) and so reads the price at the
+      decimals of the first literal of that value which annotated the
+      commodity: after `1 FOO {1.00100 EUR}`,
+      `-0.5 FOO {1.001 EUR} @ 1 EUR` twice with `(4/100000 EUR)`
+      against `1 EUR` is accepted here and rejected by C++
+      (fail-open), and after `1 FOO {1.001 EUR}` the same transaction
+      written with `{1.00100 EUR}` is rejected here and accepted by C++
+      (fail-closed);
+    - where a cost carries its own lot price in the commodity of the
+      posting's basis, Phase 6 rewrites the cost into that commodity
+      (xact.cc:735-774), and C++ widens that commodity to the precision
+      of the rewritten cost, while `costPrec` stays with the cost as
+      written: `10 FOO {1 USD} @ 2 EUR {0.5 USD}` and
+      `-20 EUR {0.5 USD}` with `(1/10 USD)` against `0 USD` are
+      accepted here and rejected by C++ (fail-open);
+    - the display precision read here omits what C++ learns from the
+      amounts of an automated transaction's postings
+      (textual_xacts.cc:271) and of a periodic template
+      (textual_xacts.cc:952), from a `define` and a typed metadata
+      value, which it evaluates as expressions whose amounts migrate
+      their precision (textual_directives.cc:1081, metadata.cc:194,
+      token.cc:555), and from an `apply fixed` rate
+      (textual_directives.cc:534-535). Where C++ holds a positive
+      precision from one of these it widens nothing, so after
+      `= /^NEVER/` with `(Y) 0.50 EUR`, `~ Monthly` with `X 0.50 EUR`,
+      `define x = 0.50 EUR`, `; X:: 0.50 EUR` or
+      `apply fixed FOO 0.50 EUR`, the transaction `1.0001 FOO @ 1 EUR`
+      against `-1 BAR @ 1 EUR` is rejected here and accepted by C++
+      (fail-closed). The comment on periodic templates in
+      `flushPending` and the `apply fixed` entry of `impliedExchange`
+      record what the same gaps do to the other tests. -/
+private def zeroTestPrec (st : St) (posts : List PostSpec) (comm : String) :
+    Nat :=
+  match (st.precisions.lookup comm).getD 0 with
+  | 0 => ((posts.find? fun q => q.costPrec > 0
+            && q.costVal.any (·.comm == comm)).map (·.costPrec)).getD 0
+  | p => p
 
 private def lookupBal (st : St) (acct comm : String) : ℚ :=
   (st.balances.lookup (acct, comm)).getD 0
@@ -440,6 +560,22 @@ private def takeBalanced (opn cls : Char) : List Char → Option (List Char × L
       go 0 [] rest
   | [] => none
 
+/-- What `annotLoop` reads from the tail of an amount; each field is
+    the argument of `annotLoop` that bears its name. -/
+private structure AnnotTail where
+  lot : Option (Amount × Bool)
+  cost : Option Amount
+  teach : List (String × Nat)
+  costDecs : Nat
+  annotated : Bool
+  fixated : Bool
+  ownLot : Bool
+  /-- the cost is a per-unit `@`, not a total `@@` -/
+  perUnit : Bool
+  /-- the decimals of the kept lot's literal, and whether it is a
+      `{{total}}` -/
+  lotLit : Option (Nat × Bool)
+
 /-- Consume the annotation/cost/assertion tail of an amount:
     `{lot} [date] (note) @ P / @@ T / = ASSERT` in any order. -/
 private partial def annotLoop (ctx : AmtCtx) (line : Nat) (a : Amount)
@@ -447,9 +583,9 @@ private partial def annotLoop (ctx : AmtCtx) (line : Nat) (a : Amount)
     (teach : List (String × Nat) := []) (afterCost : Bool := false)
     (costDecs : Nat := 0) (afterAssert : Bool := false)
     (annotated : Bool := false) (fixated : Bool := false)
-    (ownLot : Bool := false) :
-    Except String (Option (Amount × Bool) × Option Amount ×
-      List (String × Nat) × Nat × Bool × Bool × Bool) := do
+    (ownLot : Bool := false) (perUnit : Bool := false)
+    (lotLit : Option (Nat × Bool) := none) :
+    Except String AnnotTail := do
   -- `annotated`, `fixated` and `ownLot`: an annotation met before any
   -- cost or assertion belongs to the posting's own amount; after a
   -- cost it annotates the cost amount, after an assertion the
@@ -458,7 +594,8 @@ private partial def annotLoop (ctx : AmtCtx) (line : Nat) (a : Amount)
   let own := !afterCost && !afterAssert
   let t := trimS tail
   if t.isEmpty || t == "." then
-    pure (lot, cost, teach, costDecs, annotated, fixated, ownLot)
+    pure { lot, cost, teach, costDecs, annotated, fixated, ownLot, perUnit,
+           lotLit }
   else if t.startsWith "{" then
     -- `{{total}}` and `{per-unit}` lot prices, possibly `{=fixated}`;
     -- lots parse with PARSE_NO_MIGRATE — no precision teaching
@@ -486,24 +623,29 @@ private partial def annotLoop (ctx : AmtCtx) (line : Nat) (a : Amount)
       else match lot with
         | some l => some l
         | none => some (lotAmt, fix)
+    let lotLit' := if afterCost || lot.isSome then lotLit
+      else some (pr.decimals, total)
     -- while `own` holds, every lot taken so far is the posting's own
     annotLoop ctx line a (String.ofList rest) lot' cost teach afterCost costDecs
       (afterAssert := afterAssert) (annotated := annotated || own)
       (fixated := if own then lot'.any (·.2) else fixated)
-      (ownLot := if own then lot'.isSome else ownLot)
+      (ownLot := if own then lot'.isSome else ownLot) (perUnit := perUnit)
+      (lotLit := lotLit')
   else if t.startsWith "[" then
     match takeBalanced '[' ']' t.toList with
     | some (_, rest) =>
         annotLoop ctx line a (String.ofList rest) lot cost teach afterCost costDecs
           (afterAssert := afterAssert) (annotated := annotated || own)
-          (fixated := fixated) (ownLot := ownLot)
+          (fixated := fixated) (ownLot := ownLot) (perUnit := perUnit)
+          (lotLit := lotLit)
     | none => err line s!"unclosed lot date in '{t}'"
   else if t.startsWith "(" && !(t.startsWith "(@") then
     match takeBalanced '(' ')' t.toList with
     | some (_, rest) =>
         annotLoop ctx line a (String.ofList rest) lot cost teach afterCost costDecs
           (afterAssert := afterAssert) (annotated := annotated || own)
-          (fixated := fixated) (ownLot := ownLot)
+          (fixated := fixated) (ownLot := ownLot) (perUnit := perUnit)
+          (lotLit := lotLit)
     | none => err line s!"unclosed lot note in '{t}'"
   else if t.startsWith "(@@)" || t.startsWith "@@" then
     let off := if t.startsWith "(@@)" then 4 else 2
@@ -517,6 +659,7 @@ private partial def annotLoop (ctx : AmtCtx) (line : Nat) (a : Amount)
     annotLoop ctx line a pr.tail lot (some ⟨pr.amount.comm, signed⟩) teach true
       (max costDecs pr.decimals) (afterAssert := afterAssert)
       (annotated := annotated) (fixated := fixated) (ownLot := ownLot)
+      (perUnit := false) (lotLit := lotLit)
   else if t.startsWith "(@)" || t.startsWith "@" then
     -- per-unit costs round at the cost literal's own precision,
     -- posting by posting (regress/1125); `@ =` fixates (1794); cost
@@ -531,6 +674,7 @@ private partial def annotLoop (ctx : AmtCtx) (line : Nat) (a : Amount)
       (some ⟨pr.amount.comm, pr.amount.q * a.q⟩) teach true
       (max costDecs pr.decimals) (afterAssert := afterAssert)
       (annotated := annotated) (fixated := fixated) (ownLot := ownLot)
+      (perUnit := true) (lotLit := lotLit)
   else if t.startsWith "=" then
     -- assertion: the C++ side checks it; positive tests pass it, but
     -- the literal still teaches display precision (1699). C++ parses
@@ -545,7 +689,7 @@ private partial def annotLoop (ctx : AmtCtx) (line : Nat) (a : Amount)
         (pr.amount.comm, pr.decimals) :: teach else teach
     annotLoop ctx line a pr.tail lot cost teach afterCost costDecs
       (afterAssert := true) (annotated := annotated) (fixated := fixated)
-      (ownLot := ownLot)
+      (ownLot := ownLot) (perUnit := perUnit) (lotLit := lotLit)
   else
     err line s!"trailing junk after amount '{t}'"
 
@@ -573,6 +717,8 @@ private structure AmountField where
   gainVal : Option Amount := none
   annotated : Bool := false
   fixated : Bool := false
+  /-- `PostSpec.costPrec` -/
+  costPrec : Nat := 0
 
 /-- Parse the amount field of a posting (everything after the
     account): amount, lot annotations, cost, assertion/assignment.
@@ -618,9 +764,58 @@ private def parseAmountField (ctx : AmtCtx) (line : Nat) (field : String)
     -- note, which C++ reports as more than one (annotate.cc:157, 193,
     -- 249). annotLoop reads the first as it reads an annotation on a
     -- plain amount, and of two lot prices it keeps the first.
-    let (lot, cost, teach, costDecs, annotated, fixated, ownLot) ←
+    let { lot, cost, teach, costDecs, annotated, fixated, ownLot, perUnit,
+          lotLit } ←
       annotLoop ctx line a r.tail preLot none (annotated := preLot.isSome)
         (fixated := preLot.any (·.2)) (ownLot := preLot.isSome)
+    -- the precision of the cost amount, for the widened zero test of
+    -- `finalizeXact`: C++ keeps a cost at its literal's precision and,
+    -- for a per-unit `@`, multiplies it by the amount, which adds the
+    -- amount's precision (textual_xacts.cc:699-710, amount.cc:720).
+    -- `Parse` does not track the precision of an expression amount,
+    -- whose division C++ extends by six places (amount.cc:805-812);
+    -- an expression that divides, or whose value its literals'
+    -- decimals cannot represent, counts six places more than those
+    -- decimals (regress/1114's `(1/9 FOO)` has precision 6). The
+    -- docstring of `zeroTestPrec` lists the measured departures
+    let divides := match takeBalanced '(' ')' field.toList with
+      | some (inner, _) => inner.contains '/'
+      | none => false
+    let amtPrec :=
+      if field.startsWith "("
+          && (divides || roundAt r.decimals a.q != a.q) then
+        r.decimals + 6
+      else r.decimals
+    let costPrec := if perUnit then costDecs + amtPrec else costDecs
+    -- Phase 6 raises it (xact.cc:693-729): when the posting's own lot
+    -- price is in the cost's commodity and the basis, the lot price
+    -- times the amount kept unrounded (pool.cc:502), differs from the
+    -- cost at all (xact.cc:696), C++ adds the gain to the cost, and the
+    -- sum keeps the larger precision (amount.cc:630-632) even when the
+    -- gain rounds to zero. A `{P}` price counts its own literal's
+    -- decimals (annotate.cc:187), where C++ can reuse the annotated
+    -- commodity of an earlier literal of equal value (pool.cc:200), a
+    -- departure the docstring of `zeroTestPrec` records; a `{{T}}`
+    -- price is divided by the amount, which adds the amount's
+    -- precision and six places (amount.cc:812), and rounded at the
+    -- amount's precision, the commodity's and six
+    -- (amount.cc:1908-1923). Only an amount with a commodity is
+    -- annotated (amount.cc:1908), a periodic template skips Phase 6
+    -- (see `costVal`), and a leading lot, which C++ rejects, records
+    -- no `lotLit`
+    let costPrec := match lot, lotLit, cost with
+      | some (p, _), some (d, total), some c =>
+          if periodic || !ownLot || a.comm == "" || p.comm != c.comm then
+            costPrec
+          else
+            let (unit, prec) :=
+              if total then
+                (roundAt (r.decimals + (ctx.precs.lookup p.comm).getD 0 + 6)
+                  p.q, d + r.decimals + 6)
+              else (p.q, d)
+            if unit * a.q != c.q then max costPrec (prec + amtPrec)
+            else costPrec
+      | _, _, _ => costPrec
     -- xact.cc phase 4/6: a fixated lot with no cost derives the cost
     -- from the annotation; a lot WITH a cost books the rounded
     -- gain/loss (basis - cost, rounded at commodity precision plus
@@ -659,7 +854,7 @@ private def parseAmountField (ctx : AmtCtx) (line : Nat) (field : String)
            learned := r.learned
            decimals := r.decimals, isExpr := field.startsWith "(", teach
            costDecs, gainVal, annotated := hasComm && annotated
-           fixated := hasComm && fixated }
+           fixated := hasComm && fixated, costPrec }
 
 private def parsePosting (st : St) (line : Nat) (raw : String)
     (periodic : Bool := false) :
@@ -691,7 +886,8 @@ private def parsePosting (st : St) (line : Nat) (raw : String)
                      lotUnit := af.lotUnit
                      assignTarget := af.assignTarget, amtDecs := af.decimals
                      costDecs := af.costDecs, gainVal := af.gainVal
-                     annotated := af.annotated, fixated := af.fixated },
+                     annotated := af.annotated, fixated := af.fixated
+                     costPrec := af.costPrec },
               af.learned, af.amount.map (·.comm), af.decimals, af.isExpr,
               af.teach)
 
@@ -1297,6 +1493,15 @@ private def finalizeXact (st : St) (hline : Nat) (_header : String)
             | none => (v.comm, v.q) :: acc
         | none => acc
     let residualExact := (sumsWith false).filter fun (_, s) => s != 0
+    -- the final zero test: a residual without a commodity is tested
+    -- exactly (amount.cc:1378, 1429), a real pool widens a cost
+    -- commodity of display precision 0 (`zeroTestPrec`, regress/1114),
+    -- and a bracket-virtual pool is tested at the display precision
+    -- (xact.cc:971-979)
+    let settles := fun (c : String) (s : ℚ) =>
+      if c == "" then s == 0
+      else if isReal then roundsToZeroAt (zeroTestPrec stv rposts c) s
+      else roundsToZero stv c s
     let elided := pool.filter fun p => p.amount.isNone && p.assignTarget.isNone
     match elided with
     | [] =>
@@ -1320,7 +1525,29 @@ private def finalizeXact (st : St) (hline : Nat) (_header : String)
               pure (pool ++ comps)
           | none =>
               -- per-posting cost rounding may explain the residual
-              -- (xact.cc phase 8, regress/1125)
+              -- (xact.cc phase 8, regress/1125). C++ adds the exact
+              -- adjustment of rounding each per-unit cost of a real
+              -- posting at its price's decimals (xact.cc:908-929);
+              -- this tolerates instead half a unit in the last place of
+              -- every cost in that commodity written with decimals,
+              -- total costs included, and it does so also where the
+              -- widened test of `zeroTestPrec` or the exact test of
+              -- the null commodity rejects the residual. So
+              -- `-0.5 FOO @ 1.00 EUR` twice with `1 BAR @@ 0.01 EUR`
+              -- against `1.00 EUR`, the same with `@@ 0.50 EUR` for
+              -- each `@ 1.00 EUR`, `0.5 FOO @ 0.5 EUR` twice with
+              -- `(49/100 EUR)` against `-1 EUR`, and `1 FOO @ 0.333`
+              -- against `(-1/3)` are accepted here and rejected by C++
+              -- (fail-open). C++ then tests the residual plus its
+              -- adjustment, at the widened precision of `zeroTestPrec`
+              -- or at the display precision, where this accepts a
+              -- residual only when it settles alone or lies within the
+              -- tolerance: `0.5 FOO @ 1.005 EUR` with
+              -- `1 BAR @@ 0.49696 EUR` against `-1 EUR`, which C++
+              -- tests at the widened precision 4, and the same with
+              -- `@@ 0.4921 EUR` against `-1.00 EUR`, which it tests at
+              -- the display precision 2, are rejected here and accepted
+              -- by C++ (fail-closed)
               let costTol := fun (c : String) =>
                 pool.foldl (init := (0 : ℚ)) fun acc p =>
                   match p.costVal with
@@ -1354,7 +1581,7 @@ private def finalizeXact (st : St) (hline : Nat) (_header : String)
               | _ =>
                 if (unordered && residualExact.length == 2)
                     || residualExact.all fun (c, s) =>
-                      roundsToZero stv c s
+                      settles c s
                         || (s ≤ costTol c && -s ≤ costTol c) then
                   pure pool
                 -- C++ values no lot in a bracket-virtual pool: Phase 1
@@ -1371,7 +1598,7 @@ private def finalizeXact (st : St) (hline : Nat) (_header : String)
                   -- (xact.cc:475-518, regress/1029)
                   let residual2 := (sumsWith true).filter fun (_, s) => s != 0
                   if residual2.isEmpty
-                      || residual2.all (fun (c, s) => roundsToZero stv c s)
+                      || residual2.all (fun (c, s) => settles c s)
                       || (unordered && residual2.length == 2) then
                     pure pool
                   else unbalanced
