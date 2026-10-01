@@ -14,9 +14,10 @@ outputs (the `SemanticBisimulation` ctest is the standing check):
 - **Balancing**: per commodity over real/bracket-virtual/deferred
   postings, each contributing its lot-price value `{P}`×qty if
   annotated, else its `@`/`@@` cost, else its own amount; one elided
-  posting absorbs the residual per commodity; with no elided posting
-  a `bucket` account absorbs it; a two-commodity residual is an
-  implicit exchange; paren-virtuals `(A)` are exempt.
+  posting absorbs the residual per commodity; a `bucket` account
+  absorbs a real residual only in a transaction of exactly one
+  parsed posting; a two-commodity residual is an implicit exchange;
+  paren-virtuals `(A)` are exempt.
 - **Assignments** `= AMT` on an amountless posting: computed
   sequentially against the running account balance including earlier
   postings of the same transaction (regress/1005). With an amount
@@ -814,7 +815,7 @@ private def finalizeXact (st : St) (hline : Nat) (_header : String)
   -- paren-virtuals `(A)` are exempt. Each pool may have one elided
   -- posting. Structural decisions use EXACT residuals; the
   -- display-precision tolerance is only the final acceptance test.
-  let balancePool := fun (pool : List PostSpec) (allowBucket : Bool) => do
+  let balancePool := fun (pool : List PostSpec) (isReal : Bool) => do
     let sumsWith := fun (useLot : Bool) =>
       pool.foldl (init := ([] : List (String × ℚ))) fun acc p =>
         match p.amount with
@@ -831,7 +832,16 @@ private def finalizeXact (st : St) (hline : Nat) (_header : String)
     match elided with
     | [] =>
         if residualExact.isEmpty then pure pool
-        else match (if allowBucket then st.bucket else none) with
+        -- the `bucket` (`A`, account `default`) completes only a
+        -- transaction of exactly ONE parsed posting of any kind,
+        -- counted before a bare `=0` fans out and before automated
+        -- postings; with two or more postings the residual is left to
+        -- the implicit-exchange, rounding, second-pass lot-value and
+        -- error cases below
+        -- (xact.cc:368 `posts.size() == 1 && !balance.is_null()`, the
+        -- second conjunct implied by a nonzero real residual;
+        -- regress/coverage-bucket-single-post)
+        else match (if isReal && ordered.length == 1 then st.bucket else none) with
           | some b =>
               -- bucket names were resolved when declared
               let comps := residualExact.map fun (c, s) =>
