@@ -59,6 +59,27 @@ structure PostSpec where
   costVal : Option Amount := none    -- @/@@ substitution (pass 1)
   lotVal : Option Amount := none     -- {P}/{=P} substitution (pass 2)
   assignTarget : Option Amount := none
+  /-- the amount itself is annotated (`{lot}`, `[date]` or `(note)`
+      before any cost or balance assertion): C++'s
+      `amount.has_annotation()`, which picks the top posting of an
+      implicit exchange (xact.cc:386-393). C++ discards the annotation
+      of an amount with no commodity (amount.cc:1908), and so does
+      this flag. The two departures recorded at `fixated` apply to
+      this flag as well. -/
+  annotated : Bool := false
+  /-- the amount's own lot price is fixated, `{=P}` or `{{=T}}`
+      (ANNOTATION_PRICE_FIXATED, annotate.cc:169), under the same
+      conditions as `annotated`. Unlike `LotPrice.fixated` in
+      `Ledger/Lots.lean`, it is not set by the fixated costs `@ =P` and
+      `@@ =T`: C++ fixates the annotation price they meet only in
+      Phase 6 of finalize (xact.cc:816-819), after Phase 3 has chosen
+      the top posting. Two departures affect both flags, and both are
+      fail-open: the annotation C++ adds for an `apply fixed` rate
+      (textual_xacts.cc:626-638) is not parsed and sets neither flag,
+      and on a balance assignment `= AMT` both flags are false,
+      although C++ can carry the target's lot or the account's single
+      lot into the amount it computes (textual_xacts.cc:843-862). -/
+  fixated : Bool := false
   deriving Repr
 
 instance : Inhabited PostSpec :=
@@ -397,12 +418,18 @@ private def takeBalanced (opn cls : Char) : List Char → Option (List Char × L
 private partial def annotLoop (ctx : AmtCtx) (line : Nat) (a : Amount)
     (tail : String) (lot : Option (Amount × Bool)) (cost : Option Amount)
     (teach : List (String × Nat) := []) (afterCost : Bool := false)
-    (costDecs : Nat := 0) :
+    (costDecs : Nat := 0) (afterAssert : Bool := false)
+    (annotated : Bool := false) (fixated : Bool := false) :
     Except String (Option (Amount × Bool) × Option Amount ×
-      List (String × Nat) × Nat) := do
+      List (String × Nat) × Nat × Bool × Bool) := do
+  -- `annotated` and `fixated`: an annotation met before any cost or
+  -- assertion belongs to the posting's own amount; after a cost it
+  -- annotates the cost amount, after an assertion the assertion
+  -- amount (textual_xacts.cc:756-757)
+  let own := !afterCost && !afterAssert
   let t := trimS tail
   if t.isEmpty || t == "." then
-    pure (lot, cost, teach, costDecs)
+    pure (lot, cost, teach, costDecs, annotated, fixated)
   else if t.startsWith "{" then
     -- `{{total}}` and `{per-unit}` lot prices, possibly `{=fixated}`;
     -- lots parse with PARSE_NO_MIGRATE — no precision teaching
@@ -415,8 +442,8 @@ private partial def annotLoop (ctx : AmtCtx) (line : Nat) (a : Amount)
       | some (i2, _) => (i2, true)     -- {{TOTAL}}
       | none => (inner, false)
     let innerS := trimS (String.ofList inner)
-    let fixated := innerS.startsWith "="
-    let innerS := if fixated then trimS (innerS.drop 1).toString else innerS
+    let fix := innerS.startsWith "="
+    let innerS := if fix then trimS (innerS.drop 1).toString else innerS
     let pr ← parseAmount ctx line innerS
     let lotAmt := if total && a.q != 0 then
         Amount.mk pr.amount.comm (pr.amount.q / (if a.q < 0 then -a.q else a.q))
@@ -429,17 +456,24 @@ private partial def annotLoop (ctx : AmtCtx) (line : Nat) (a : Amount)
       if afterCost then lot
       else match lot with
         | some l => some l
-        | none => some (lotAmt, fixated)
+        | none => some (lotAmt, fix)
+    -- while `own` holds, every lot taken so far is the posting's own
     annotLoop ctx line a (String.ofList rest) lot' cost teach afterCost costDecs
+      (afterAssert := afterAssert) (annotated := annotated || own)
+      (fixated := if own then lot'.any (·.2) else fixated)
   else if t.startsWith "[" then
     match takeBalanced '[' ']' t.toList with
     | some (_, rest) =>
         annotLoop ctx line a (String.ofList rest) lot cost teach afterCost costDecs
+          (afterAssert := afterAssert) (annotated := annotated || own)
+          (fixated := fixated)
     | none => err line s!"unclosed lot date in '{t}'"
   else if t.startsWith "(" && !(t.startsWith "(@") then
     match takeBalanced '(' ')' t.toList with
     | some (_, rest) =>
         annotLoop ctx line a (String.ofList rest) lot cost teach afterCost costDecs
+          (afterAssert := afterAssert) (annotated := annotated || own)
+          (fixated := fixated)
     | none => err line s!"unclosed lot note in '{t}'"
   else if t.startsWith "(@@)" || t.startsWith "@@" then
     let off := if t.startsWith "(@@)" then 4 else 2
@@ -451,7 +485,8 @@ private partial def annotLoop (ctx : AmtCtx) (line : Nat) (a : Amount)
     let mag := if pr.amount.q < 0 then -pr.amount.q else pr.amount.q
     let signed := if a.q < 0 then -mag else mag
     annotLoop ctx line a pr.tail lot (some ⟨pr.amount.comm, signed⟩) teach true
-      (max costDecs pr.decimals)
+      (max costDecs pr.decimals) (afterAssert := afterAssert)
+      (annotated := annotated) (fixated := fixated)
   else if t.startsWith "(@)" || t.startsWith "@" then
     -- per-unit costs round at the cost literal's own precision,
     -- posting by posting (regress/1125); `@ =` fixates (1794); cost
@@ -464,51 +499,87 @@ private partial def annotLoop (ctx : AmtCtx) (line : Nat) (a : Amount)
     let pr ← parseAmount ctx line rest0
     annotLoop ctx line a pr.tail lot
       (some ⟨pr.amount.comm, pr.amount.q * a.q⟩) teach true
-      (max costDecs pr.decimals)
+      (max costDecs pr.decimals) (afterAssert := afterAssert)
+      (annotated := annotated) (fixated := fixated)
   else if t.startsWith "=" then
     -- assertion: the C++ side checks it; positive tests pass it, but
-    -- the literal still teaches display precision (1699)
+    -- the literal still teaches display precision (1699). C++ parses
+    -- the assertion amount with its own annotations
+    -- (textual_xacts.cc:756-757), so a later `{lot}`, `[date]` or
+    -- `(note)` sets neither flag; the lot reading above still takes a
+    -- lot written there as the posting's own, a reading that no C++
+    -- test exercises (regress/2318 writes the posting's lot first)
     let pr ← parseAmount ctx line (trimS (t.drop 1).toString)
     let teach := if pr.decimals <= 6 then
         (pr.amount.comm, pr.decimals) :: teach else teach
     annotLoop ctx line a pr.tail lot cost teach afterCost costDecs
+      (afterAssert := true) (annotated := annotated) (fixated := fixated)
   else
     err line s!"trailing junk after amount '{t}'"
+
+/-- The parsed amount field of a posting. -/
+private structure AmountField where
+  amount : Option Amount := none
+  /-- the `@`/`@@` cost, adjusted by the rounded gain of a lot priced
+      in the cost's commodity (pass 1) -/
+  costVal : Option Amount := none
+  /-- the lot price times the quantity (pass 2) -/
+  lotVal : Option Amount := none
+  assignTarget : Option Amount := none
+  learned : Option (String × Bool) := none
+  decimals : Nat := 0
+  isExpr : Bool := false
+  teach : List (String × Nat) := []
+  costDecs : Nat := 0
+  gainVal : Option Amount := none
+  annotated : Bool := false
+  fixated : Bool := false
 
 /-- Parse the amount field of a posting (everything after the
     account): amount, lot annotations, cost, assertion/assignment. -/
 private def parseAmountField (ctx : AmtCtx) (line : Nat) (field : String) :
-    Except String (Option Amount × Option Amount × Option Amount ×
-      Option Amount × Option (String × Bool) × Nat × Bool ×
-      List (String × Nat) × Nat × Option Amount) := do
-  -- returns (amount, balancing, assignTarget, learnedStyle, decimals)
+    Except String AmountField := do
   let field := trimS field
   if field.isEmpty then
-    pure (none, none, none, none, none, 0, false, [], 0, none)
+    pure {}
   else if field.startsWith "=" then
     -- balance assignment (amountless posting); lot annotations on the
-    -- target are parsed and dropped (1603)
+    -- target are parsed and dropped (1603), and the flags stay false
+    -- (the departure recorded at `PostSpec.fixated`)
     let r ← parseAmount ctx line (trimS (field.drop 1).toString)
     let _ ← annotLoop ctx line r.amount r.tail none none
-    pure (none, none, none, some r.amount, r.learned, r.decimals, false,
-          (if r.decimals <= 6 then [(r.amount.comm, r.decimals)] else []),
-          0, none)
+    pure { assignTarget := some r.amount, learned := r.learned
+           decimals := r.decimals
+           teach := if r.decimals <= 6 then [(r.amount.comm, r.decimals)] else [] }
   else do
+    -- a leading lot `{P} AMT` has no witness: C++ rejects the form
+    -- ("No quantity specified for amount", amount.cc:1665), since `{`
+    -- cannot begin a commodity symbol (commodity.cc:331-349) and no
+    -- quantity is read. The oracle accepts it, a fail-open, and reads
+    -- its lot and flags as it reads a lot written after the amount.
     let (preLot, field) ←
       if field.startsWith "{" then
         match takeBalanced '{' '}' field.toList with
         | some (inner, rest) => do
             let innerS := trimS (String.ofList inner)
-            let innerS := if innerS.startsWith "=" then
-                trimS (innerS.drop 1).toString else innerS
+            let fix := innerS.startsWith "="
+            let innerS := if fix then trimS (innerS.drop 1).toString else innerS
             let pr ← parseAmount ctx line innerS
-            pure (some pr.amount, trimS (String.ofList rest))
+            pure (some (pr.amount, fix), trimS (String.ofList rest))
         | none => err line s!"unclosed leading lot in '{field}'"
       else pure (none, field)
     let r ← parseAmount ctx line field
     let a := r.amount
-    let (lot, cost, teach, costDecs) ←
-      annotLoop ctx line a r.tail (preLot.map (·, true)) none
+    -- Two more forms that C++ rejects are accepted, both fail-open: an
+    -- annotation after an amount expression, `(EXPR) {lot}`, which C++
+    -- leaves unparsed and reports as an unexpected character
+    -- (textual_xacts.cc:908-910), and a second lot price, date or
+    -- note, which C++ reports as more than one (annotate.cc:157, 193,
+    -- 249). annotLoop reads the first as it reads an annotation on a
+    -- plain amount, and of two lot prices it keeps the first.
+    let (lot, cost, teach, costDecs, annotated, fixated) ←
+      annotLoop ctx line a r.tail preLot none (annotated := preLot.isSome)
+        (fixated := preLot.any (·.2))
     -- xact.cc phase 4/6: a fixated lot with no cost derives the cost
     -- from the annotation; a lot WITH a cost books the rounded
     -- gain/loss (basis - cost, rounded at commodity precision plus
@@ -531,8 +602,13 @@ private def parseAmountField (ctx : AmtCtx) (line : Nat) (field : String) :
           else some c
       | _, _ => cost
     let lotVal := lot.map fun (p, _) => Amount.mk p.comm (p.q * a.q)
-    pure (some a, costVal, lotVal, none, r.learned, r.decimals,
-          field.startsWith "(", teach, costDecs, gainVal)
+    -- C++ keeps an annotation only on an amount with a commodity
+    -- (amount.cc:1908); the lot of a bare number still reaches lotVal
+    let hasComm := a.comm != ""
+    pure { amount := some a, costVal, lotVal, learned := r.learned
+           decimals := r.decimals, isExpr := field.startsWith "(", teach
+           costDecs, gainVal, annotated := hasComm && annotated
+           fixated := hasComm && fixated }
 
 private def parsePosting (st : St) (line : Nat) (raw : String) :
     Except String (Option PostSpec × Option (String × Bool) ×
@@ -552,11 +628,14 @@ private def parsePosting (st : St) (line : Nat) (raw : String) :
     match amtField with
     | none => pure (some { line, account, kind, note }, none, none, 0, false, [])
     | some f => do
-        let (amount, costVal, lotVal, assignTarget, learned, decs, isExpr,
-             teach, costDecs, gainVal) ← parseAmountField st.amt line f
-        pure (some { line, account, kind, note, amount, costVal, lotVal,
-                     assignTarget, amtDecs := decs, costDecs, gainVal },
-              learned, amount.map (·.comm), decs, isExpr, teach)
+        let af ← parseAmountField st.amt line f
+        pure (some { line, account, kind, note, amount := af.amount
+                     costVal := af.costVal, lotVal := af.lotVal
+                     assignTarget := af.assignTarget, amtDecs := af.decimals
+                     costDecs := af.costDecs, gainVal := af.gainVal
+                     annotated := af.annotated, fixated := af.fixated },
+              af.learned, af.amount.map (·.comm), af.decimals, af.isExpr,
+              af.teach)
 
 /-! ## Transaction finalization -/
 
