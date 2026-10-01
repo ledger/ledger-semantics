@@ -16,8 +16,12 @@ outputs (the `SemanticBisimulation` ctest is the standing check):
   annotated, else its `@`/`@@` cost, else its own amount; one elided
   posting absorbs the residual per commodity; a `bucket` account
   absorbs a real residual only in a transaction of exactly one
-  parsed posting; a two-commodity residual is an implicit exchange;
-  paren-virtuals `(A)` are exempt.
+  parsed posting; a two-commodity real residual, its commodities
+  keyed by lot price as C++ keys them, is an implicit exchange only
+  where C++ infers one (Phase 3, `impliedExchange`, which lists its
+  departures), and a bracket-virtual residual never is; lot values
+  never settle a bracket-virtual residual; paren-virtuals `(A)` are
+  exempt.
 - **Assignments** `= AMT` on an amountless posting: computed
   sequentially against the running account balance including earlier
   postings of the same transaction (regress/1005). With an amount
@@ -58,6 +62,18 @@ structure PostSpec where
   amount : Option Amount := none
   costVal : Option Amount := none    -- @/@@ substitution (pass 1)
   lotVal : Option Amount := none     -- {P}/{=P} substitution (pass 2)
+  /-- the lot price per unit of the amount's own lot, one written
+      before any cost or balance assertion: `{P}`, or `{{T}}` divided
+      by the absolute quantity when that is nonzero. On a zero
+      quantity C++ rejects `{{T}}` (a division by zero, amount.cc:1911)
+      and this keeps `T`. `impliedExchange` keys the amount by it, as
+      C++ keys an annotated amount by its per-unit price
+      (annotate.h:120-125), and a `{P}` survives a zero quantity, which
+      `lotVal` does not. C++ rounds the quotient of `{{T}}`
+      (amount.cc:1909-1923), where this keeps it exact. `finalizeXact`
+      divides it by the factor by which a commodity equivalence
+      reduces the amount, as C++ does (amount.cc:1153-1176). -/
+  lotUnit : Option Amount := none
   assignTarget : Option Amount := none
   /-- the amount itself is annotated (`{lot}`, `[date]` or `(note)`
       before any cost or balance assertion): C++'s
@@ -73,12 +89,15 @@ structure PostSpec where
       `Ledger/Lots.lean`, it is not set by the fixated costs `@ =P` and
       `@@ =T`: C++ fixates the annotation price they meet only in
       Phase 6 of finalize (xact.cc:816-819), after Phase 3 has chosen
-      the top posting. Two departures affect both flags, and both are
-      fail-open: the annotation C++ adds for an `apply fixed` rate
-      (textual_xacts.cc:626-638) is not parsed and sets neither flag,
-      and on a balance assignment `= AMT` both flags are false,
-      although C++ can carry the target's lot or the account's single
-      lot into the amount it computes (textual_xacts.cc:843-862). -/
+      the top posting. Two departures affect both flags and the lot
+      key of `impliedExchange`: the annotation C++ adds for an `apply
+      fixed` rate (textual_xacts.cc:626-638) is not parsed and sets
+      neither flag, and on a balance assignment `= AMT` both flags are
+      false and the amount has no lot, although C++ can carry the
+      target's lot or the account's single lot into the amount it
+      computes (textual_xacts.cc:843-862). Each can fail either way;
+      the docstring of `impliedExchange` gives a journal shape for each
+      direction. -/
   fixated : Bool := false
   deriving Repr
 
@@ -419,17 +438,19 @@ private partial def annotLoop (ctx : AmtCtx) (line : Nat) (a : Amount)
     (tail : String) (lot : Option (Amount × Bool)) (cost : Option Amount)
     (teach : List (String × Nat) := []) (afterCost : Bool := false)
     (costDecs : Nat := 0) (afterAssert : Bool := false)
-    (annotated : Bool := false) (fixated : Bool := false) :
+    (annotated : Bool := false) (fixated : Bool := false)
+    (ownLot : Bool := false) :
     Except String (Option (Amount × Bool) × Option Amount ×
-      List (String × Nat) × Nat × Bool × Bool) := do
-  -- `annotated` and `fixated`: an annotation met before any cost or
-  -- assertion belongs to the posting's own amount; after a cost it
-  -- annotates the cost amount, after an assertion the assertion
-  -- amount (textual_xacts.cc:756-757)
+      List (String × Nat) × Nat × Bool × Bool × Bool) := do
+  -- `annotated`, `fixated` and `ownLot`: an annotation met before any
+  -- cost or assertion belongs to the posting's own amount; after a
+  -- cost it annotates the cost amount, after an assertion the
+  -- assertion amount (textual_xacts.cc:756-757). `ownLot` says that
+  -- the lot kept was met while `own` held
   let own := !afterCost && !afterAssert
   let t := trimS tail
   if t.isEmpty || t == "." then
-    pure (lot, cost, teach, costDecs, annotated, fixated)
+    pure (lot, cost, teach, costDecs, annotated, fixated, ownLot)
   else if t.startsWith "{" then
     -- `{{total}}` and `{per-unit}` lot prices, possibly `{=fixated}`;
     -- lots parse with PARSE_NO_MIGRATE — no precision teaching
@@ -461,19 +482,20 @@ private partial def annotLoop (ctx : AmtCtx) (line : Nat) (a : Amount)
     annotLoop ctx line a (String.ofList rest) lot' cost teach afterCost costDecs
       (afterAssert := afterAssert) (annotated := annotated || own)
       (fixated := if own then lot'.any (·.2) else fixated)
+      (ownLot := if own then lot'.isSome else ownLot)
   else if t.startsWith "[" then
     match takeBalanced '[' ']' t.toList with
     | some (_, rest) =>
         annotLoop ctx line a (String.ofList rest) lot cost teach afterCost costDecs
           (afterAssert := afterAssert) (annotated := annotated || own)
-          (fixated := fixated)
+          (fixated := fixated) (ownLot := ownLot)
     | none => err line s!"unclosed lot date in '{t}'"
   else if t.startsWith "(" && !(t.startsWith "(@") then
     match takeBalanced '(' ')' t.toList with
     | some (_, rest) =>
         annotLoop ctx line a (String.ofList rest) lot cost teach afterCost costDecs
           (afterAssert := afterAssert) (annotated := annotated || own)
-          (fixated := fixated)
+          (fixated := fixated) (ownLot := ownLot)
     | none => err line s!"unclosed lot note in '{t}'"
   else if t.startsWith "(@@)" || t.startsWith "@@" then
     let off := if t.startsWith "(@@)" then 4 else 2
@@ -486,7 +508,7 @@ private partial def annotLoop (ctx : AmtCtx) (line : Nat) (a : Amount)
     let signed := if a.q < 0 then -mag else mag
     annotLoop ctx line a pr.tail lot (some ⟨pr.amount.comm, signed⟩) teach true
       (max costDecs pr.decimals) (afterAssert := afterAssert)
-      (annotated := annotated) (fixated := fixated)
+      (annotated := annotated) (fixated := fixated) (ownLot := ownLot)
   else if t.startsWith "(@)" || t.startsWith "@" then
     -- per-unit costs round at the cost literal's own precision,
     -- posting by posting (regress/1125); `@ =` fixates (1794); cost
@@ -500,20 +522,22 @@ private partial def annotLoop (ctx : AmtCtx) (line : Nat) (a : Amount)
     annotLoop ctx line a pr.tail lot
       (some ⟨pr.amount.comm, pr.amount.q * a.q⟩) teach true
       (max costDecs pr.decimals) (afterAssert := afterAssert)
-      (annotated := annotated) (fixated := fixated)
+      (annotated := annotated) (fixated := fixated) (ownLot := ownLot)
   else if t.startsWith "=" then
     -- assertion: the C++ side checks it; positive tests pass it, but
     -- the literal still teaches display precision (1699). C++ parses
     -- the assertion amount with its own annotations
     -- (textual_xacts.cc:756-757), so a later `{lot}`, `[date]` or
-    -- `(note)` sets neither flag; the lot reading above still takes a
-    -- lot written there as the posting's own, a reading that no C++
-    -- test exercises (regress/2318 writes the posting's lot first)
+    -- `(note)` sets neither flag nor `ownLot`; the lot reading above
+    -- still takes a lot written there as the posting's own for
+    -- `lotVal`, a reading that no C++ test exercises (regress/2318
+    -- writes the posting's lot first)
     let pr ← parseAmount ctx line (trimS (t.drop 1).toString)
     let teach := if pr.decimals <= 6 then
         (pr.amount.comm, pr.decimals) :: teach else teach
     annotLoop ctx line a pr.tail lot cost teach afterCost costDecs
       (afterAssert := true) (annotated := annotated) (fixated := fixated)
+      (ownLot := ownLot)
   else
     err line s!"trailing junk after amount '{t}'"
 
@@ -525,6 +549,8 @@ private structure AmountField where
   costVal : Option Amount := none
   /-- the lot price times the quantity (pass 2) -/
   lotVal : Option Amount := none
+  /-- the lot price per unit (`PostSpec.lotUnit`) -/
+  lotUnit : Option Amount := none
   assignTarget : Option Amount := none
   learned : Option (String × Bool) := none
   decimals : Nat := 0
@@ -577,9 +603,9 @@ private def parseAmountField (ctx : AmtCtx) (line : Nat) (field : String) :
     -- note, which C++ reports as more than one (annotate.cc:157, 193,
     -- 249). annotLoop reads the first as it reads an annotation on a
     -- plain amount, and of two lot prices it keeps the first.
-    let (lot, cost, teach, costDecs, annotated, fixated) ←
+    let (lot, cost, teach, costDecs, annotated, fixated, ownLot) ←
       annotLoop ctx line a r.tail preLot none (annotated := preLot.isSome)
-        (fixated := preLot.any (·.2))
+        (fixated := preLot.any (·.2)) (ownLot := preLot.isSome)
     -- xact.cc phase 4/6: a fixated lot with no cost derives the cost
     -- from the annotation; a lot WITH a cost books the rounded
     -- gain/loss (basis - cost, rounded at commodity precision plus
@@ -603,9 +629,14 @@ private def parseAmountField (ctx : AmtCtx) (line : Nat) (field : String) :
       | _, _ => cost
     let lotVal := lot.map fun (p, _) => Amount.mk p.comm (p.q * a.q)
     -- C++ keeps an annotation only on an amount with a commodity
-    -- (amount.cc:1908); the lot of a bare number still reaches lotVal
+    -- (amount.cc:1908); the lot of a bare number still reaches lotVal.
+    -- A lot written only after a balance assertion annotates the
+    -- assertion amount (textual_xacts.cc:756-757), and so it gives the
+    -- posting's amount no lot key
     let hasComm := a.comm != ""
-    pure { amount := some a, costVal, lotVal, learned := r.learned
+    pure { amount := some a, costVal, lotVal
+           lotUnit := if ownLot then lot.map (·.1) else none
+           learned := r.learned
            decimals := r.decimals, isExpr := field.startsWith "(", teach
            costDecs, gainVal, annotated := hasComm && annotated
            fixated := hasComm && fixated }
@@ -631,6 +662,7 @@ private def parsePosting (st : St) (line : Nat) (raw : String) :
         let af ← parseAmountField st.amt line f
         pure (some { line, account, kind, note, amount := af.amount
                      costVal := af.costVal, lotVal := af.lotVal
+                     lotUnit := af.lotUnit
                      assignTarget := af.assignTarget, amtDecs := af.decimals
                      costDecs := af.costDecs, gainVal := af.gainVal
                      annotated := af.annotated, fixated := af.fixated },
@@ -776,6 +808,299 @@ private def applyAutos (st : St) (xdate : Option Int) (payee : String)
         | _, _ => pure ()
     pure (cand.toList ++ extra)
 
+/-- A C++ balance key: the commodity, with the lot price (its
+    commodity, its price per unit and its fixated flag) when the amount
+    carries one. -/
+private abbrev LotKey := String × Option (String × ℚ × Bool)
+
+/-- The value that C++ accumulates as the real balance in Phase 1 of
+    `finalize` (xact.cc:333, through `add_or_set_value`,
+    value.h:1025-1031): null before the first amount, a single amount
+    while every amount has one key, and a balance of keyed entries from
+    the first amount of another key on. -/
+private inductive CppSum where
+  | null
+  | amount (k : LotKey) (q : ℚ)
+  | balance (entries : List (LotKey × ℚ))
+
+/-- Add one keyed amount as C++ does. An amount absorbs an amount of
+    its own key (value.cc:600-607); an amount of another key turns it
+    into a balance, which keeps the old entry only when it is not
+    exactly zero (value.cc:1548, balance.h:128-134). A balance ignores
+    an exactly zero amount and otherwise accumulates per key, and it
+    never erases an entry that addition brings to zero
+    (balance.cc:118-133); only subtraction erases one
+    (balance.cc:165-170). -/
+private def CppSum.add (s : CppSum) (k : LotKey) (q : ℚ) : CppSum :=
+  let addEntry := fun (es : List (LotKey × ℚ)) =>
+    if q == 0 then es
+    else match es.lookup k with
+      | some _ => es.map fun (k', v) => if k' == k then (k', v + q) else (k', v)
+      | none => es ++ [(k, q)]
+  match s with
+  | .null => .amount k q
+  | .amount k' v =>
+      if k' == k then .amount k (v + q)
+      else .balance (addEntry (if v == 0 then [] else [(k', v)]))
+  | .balance es => .balance (addEntry es)
+
+/-- What `impliedExchange` finds C++'s Phase 3 doing with a real
+    balance. -/
+private inductive Exchange where
+  /-- C++ converts, and the balance it leaves passes Phase 8 or not -/
+  | converts (passes : Bool)
+  /-- C++ makes no conversion -/
+  | declines
+  /-- C++'s verdict depends on the unspecified order of its two
+      entries -/
+  | unordered
+
+/-- The implicit exchange of C++'s `finalize`, Phase 3
+    (src/xact.cc:374-473 at 76b9dc2b2). With no null posting, a real
+    balance of exactly two entries is converted at the rate it implies:
+    with `x` the entry of the top posting's key and `y` the other,
+    every must-balance posting of the commodity of `x` takes the
+    computed cost in the commodity of `y`. The result is
+    `.converts true` when C++ makes that conversion and the balance it
+    leaves passes Phase 8, `.converts false` when C++ makes it and the
+    transaction fails, `.declines` when C++ makes no conversion, and
+    `.unordered` when the verdict depends on an order that C++ leaves
+    unspecified; the last two leave the pool to the tests of
+    `balancePool`. A failing verdict is the one C++ gives without
+    `--permissive`, whose rescue of a computed balance assignment
+    (xact.cc:941-952) the oracle does not model anywhere. `xact` is
+    every posting of the transaction once assignments are resolved, and
+    `pool` its real pool in posting order.
+
+    C++ converts only when all of these hold, each from Phase 3 unless
+    noted:
+    - no posting of any kind carries an explicit cost (`saw_cost`,
+      xact.cc:395-398); C++ computes no cost of its own before Phase 3;
+    - the real balance, accumulated in posting order as C++ accumulates
+      it (`CppSum`), is a balance of exactly two entries (xact.cc:380),
+      neither of them exactly zero (the guard of issue #1789,
+      xact.cc:413-421, test/regress/1789.test). Entries are keyed as
+      C++ keys them, by the reduced commodity with its lot price per
+      unit (`PostSpec.lotUnit`) and fixated flag (annotate.h:120-125),
+      and an amount with no commodity has no lot (amount.cc:1908). A
+      key that nets to zero before a second key arrives is dropped,
+      but one that nets to zero later remains as a zero entry, and C++
+      then makes no conversion;
+    - the top posting, the last annotated must-balance posting with an
+      amount, else the first (xact.cc:386-393), carries no fixated lot
+      price (xact.cc:401-404);
+    - `x` and `y` are not one base commodity with a lot price on `x`
+      only (xact.cc:434-449, test/regress/1029.test).
+    When the top posting's key is not an entry of the real balance, for
+    instance because its commodity nets to zero or because it is a
+    bracket-virtual posting, C++ takes the two entries in the
+    unspecified order of an unordered map (balance.h:99) and swaps them
+    when the first is not the top posting's (xact.cc:422-423). A
+    verdict is then given only when both orientations give the same
+    one, and otherwise the result is `.unordered`, for which
+    `balancePool` keeps the rule that preceded this predicate: a real
+    residual in exactly two commodities passes, whether its lots are
+    ignored or valued.
+
+    The conversion first reduces the amount of every posting
+    (xact.cc:459), which throws for a posting with no amount
+    (amount.cc:1153-1155), so that an elided bracket-virtual posting or
+    an amountless paren-virtual one makes C++ reject the transaction.
+    When `y` has no commodity and `x` has one, the rate `y/x` takes the
+    commodity of `x` (amount.cc:814-815), and so does the cost of every
+    converted posting (amount.cc:727-744), which Phase 6 then rejects
+    as a cost in its posting's own commodity (xact.cc:679-681).
+    Otherwise every must-balance posting of the key of `x`,
+    bracket-virtual ones included, leaves the real balance and its cost
+    of `|y/x|` times its quantity enters it (xact.cc:454-465). What
+    remains of `y` is zero when the two sides have opposite signs and
+    `2y` when they agree; what remains of `x` is zero unless the
+    bracket-virtual postings of its key fail to net to zero. Phase 6
+    then books a gain for each converted posting whose lot price is in
+    a commodity `z` related to `y`, rounded at the display precision of
+    `z` plus the decimals of the posting's quantity:
+    - when `y` is `z` with no lot price, the gain is the lot basis less
+      the computed cost (xact.cc:693-713), and it joins the entry of
+      `y` even when it rounds to zero at display precision, since the
+      test at xact.cc:696 is exact (amount.cc:1407);
+    - when `y` carries a lot price in `z`, the gain is the lot value of
+      the posting less the lot value of its cost (xact.cc:735-763), and
+      it is booked in `z` only when it does not show as zero at display
+      precision (xact.cc:762).
+    Every entry must then pass the zero test of Phase 8 (xact.cc:898)
+    at the display precision of its commodity. The gains are rounded
+    one posting at a time, as C++ rounds them, and their sum can differ
+    in either direction from the rounded gain of the whole.
+
+    Known departures, each with the direction in which it fails:
+    - the swap of issue #1130, which makes a COMMODITY_PRIMARY side the
+      cost side `y` (xact.cc:425-431), is not modelled, because it
+      depends on the history of price directives and earlier
+      exchanges. It changes which side is doubled and whether a lot
+      gain applies, and so can fail either way. A `C` directive, for
+      one, registers a price that marks its smaller unit primary
+      (textual_directives.cc:185-188, commodity.cc:73-75). Beside
+      `C 1 Kb = 1024 b`, C++ accepts `1024 b {$1}` against `$-1000`
+      without a gain, and it is rejected here (fail-closed); against a
+      same-sign `0.001 EUR` shown to two decimals, C++ doubles the
+      `1024 b` and rejects the transaction, while here the doubled
+      `EUR` rounds away and it is accepted (fail-open);
+    - C++ compares the top posting's commodity as written with the
+      entries as reduced (xact.cc:333, 422), so a top posting in a unit
+      that a commodity equivalence reduces matches neither entry, and
+      C++ takes as `x` whichever entry the unspecified map order puts
+      second. Here the top posting matches its reduced entry, which
+      agrees with C++ only when that entry comes second, and so this
+      can fail either way when the two orientations differ. Beside a
+      `C` directive the swap above usually decides instead, since the
+      directive marks the reduced unit primary; for the built-in units
+      of time (session.cc:80-81), which register no price, the map
+      order decides;
+    - when the top posting's key is not an entry and the two
+      orientations give different verdicts, the earlier rule that
+      `balancePool` keeps passes every real residual in two
+      commodities, and this can fail either way. The C++ builds
+      measured take as `x` the entry whose key entered the balance
+      first, but the order is unspecified (balance.h:99). After
+      `5 GOOG` and `-5 GOOG`, which net to zero before a second key
+      arrives, C++ doubles a same-sign `0.3 EUR` that follows `$0.001`,
+      shows it as `1 EUR` under `format 1,000 EUR` and rejects the
+      transaction, which is accepted here (fail-open); three postings
+      of `1 A {$1.004}` against `-1 A {$3}`, under a bracket-virtual
+      top posting of another commodity, each carry a gain of `$0.004`,
+      which shows as zero and is not booked, so C++ accepts them, while
+      here the residual is in one commodity, its lot values leave
+      `$0.012`, and the transaction is rejected (fail-closed);
+    - `[date]`, `(tag)` and `((value expression))` annotations do not
+      split keys, and this can fail either way. Two dated lots of one
+      commodity against cash are three keys to C++, which rejects
+      them, and are accepted here (fail-open); a dated amount against
+      a different quantity of plain units of its commodity is an
+      exchange to C++, which accepts it, and is rejected here
+      (fail-closed);
+    - the fixated lot price that an `apply fixed` rate gives an amount
+      (textual_xacts.cc:626-638) is not parsed, and this can fail
+      either way. A fixed rate contradicted by the other side is
+      accepted here (fail-open); a transaction of three keys that the
+      fixed rate settles together with a fixated lot is rejected here
+      (fail-closed);
+    - the lot that C++ carries into the amount of a balance assignment
+      `= AMT`, the target's own or else the account's single lot
+      (textual_xacts.cc:843-862), is not modelled, and the amount is
+      keyed with no lot; this can fail either way. With 10 `AAPL {$5}`
+      held in `Assets:Broker`, a transaction that moves 4 of them to
+      `Assets:Broker2` while `Assets:Broker = 0 AAPL` sells the other
+      6 for `$30` has two keys for C++, which accepts it, and three
+      here, where it is rejected (fail-closed); `Assets:Broker = 0
+      AAPL` against `$60` alone is a sale at a lot gain for C++, which
+      rejects it, and an exchange of plain units here, where it is
+      accepted (fail-open);
+    - a remainder that the bracket-virtual postings of the key of `x`
+      leave in the real balance is tested here at display precision,
+      but when it is not exactly zero C++ still holds two entries after
+      Phase 3, so Phase 4 derives a cost from each fixated lot price
+      that Phase 3 left without one and recomputes the balance without
+      the bracket-virtual postings (xact.cc:475-518). Under
+      `format 1 A`, `-20 B {=$2}` and `10 A {$4}` beside bracket-virtual
+      postings of `0.004 A {$4}` and `-0.003 A {$4}` leave `-0.001 A`,
+      which rounds away here, where the transaction is accepted, while
+      C++ rejects it (fail-open);
+    - a lot price written as a total, `{{T}}`, keys its amount by the
+      exact quotient of `T` by the quantity, where C++ rounds the
+      quotient (amount.cc:1909-1923). Three `A {{$100}}` and minus one
+      `A {$33.333333}` are one key for C++ and two here, so beside a
+      same-sign `0.001 B` that rounds away when doubled, C++ accepts
+      the exchange and it is rejected here (fail-closed).
+    Outside this predicate the first pass of `balancePool` is
+    lot-blind, and in the real pool the second pass values every lot,
+    where C++ values only fixated lots (Phase 4) and the lot of `x`
+    (Phase 6). Six lot shapes that C++ rejects are therefore still
+    accepted here, each fail-open: a lot against plain units of its
+    commodity, a fixated lot against plain units, a lot against a lot
+    of its commodity at another price, three or more keys settled by
+    unfixated lots, a fixated lot among other keys when it is not the
+    top posting, and a fixated lot as the top posting against an
+    unfixated lot of another commodity priced in the same commodity.
+    The bracket-virtual pool has no second pass, since C++ values no
+    lot there, but its lot-blind first pass still accepts the first
+    three shapes there, whose quantities net to zero when lots are
+    ignored. -/
+private def impliedExchange (st : St) (xact pool : List PostSpec) : Exchange :=
+  let keyOf := fun (p : PostSpec) (a : Amount) => ((a.comm,
+    if a.comm == "" then none else
+      p.lotUnit.map fun lu => (lu.comm, lu.q, p.fixated)) : LotKey)
+  let bal := pool.foldl (init := CppSum.null) fun s p =>
+    match p.amount with
+    | some a => s.add (keyOf p a) a.q
+    | none => s
+  let mustBal := xact.filter fun p => p.kind != .virtualUnbal && p.amount.isSome
+  let top? := (mustBal.filter (·.annotated)).getLast? <|> mustBal.head?
+  -- the verdict with `x` on the top posting's side
+  let verdict := fun (x y : LotKey × ℚ) =>
+    let ((cx, lx), qx) := x
+    let ((cy, ly), qy) := y
+    -- no conversion: one base, a lot price on `x` only (xact.cc:449,
+    -- regress/1029)
+    if cx == cy && lx.isSome && ly.isNone then none
+    -- the conversion reduces the amount of every posting first, and an
+    -- amountless posting throws (xact.cc:459, amount.cc:1153-1155)
+    else if xact.any (·.amount.isNone) then some false
+    -- a rate `y/x` with no commodity in `y` takes the commodity of `x`
+    -- (amount.cc:814-815), as do the costs (amount.cc:727-744), and
+    -- Phase 6 throws for a cost in its posting's own commodity
+    -- (xact.cc:679-681)
+    else if cy == "" && cx != "" then some false
+    else
+      -- every must-balance posting of the key of `x`, bracket-virtual
+      -- ones included, moves into the real balance at the rate
+      -- `|y/x|` in the commodity of `y` (xact.cc:454-465)
+      let conv := mustBal.filterMap fun p => p.amount.bind fun a =>
+        if keyOf p a == x.1 then some (p.amtDecs, a.q) else none
+      let ratio := qy / qx
+      let rate := if ratio < 0 then -ratio else ratio
+      let moved := (conv.map (·.2)).sum
+      let xLeft := qx - moved
+      let yLeft := qy + rate * moved
+      -- Phase 6: each converted posting's gain per unit `g` in `z`,
+      -- rounded at the display precision of `z` plus the posting's
+      -- decimals (xact.cc:708-711, 756-759); `dropShownZero` drops a
+      -- rounded gain that shows as zero (xact.cc:762)
+      let gains := fun (z : String) (g : ℚ) (dropShownZero : Bool) =>
+        conv.foldl (init := (0 : ℚ)) fun s (d, q) =>
+          let r := roundAt ((st.precisions.lookup z).getD 0 + d) (g * q)
+          if dropShownZero && roundsToZero st z r then s else s + r
+      -- Phase 8 tests every entry at its display precision (xact.cc:898)
+      some (roundsToZero st cx xLeft && match lx, ly with
+        | some (z, px, _), none =>
+            -- a gain against a plain basis joins the entry of `y`; the
+            -- test at xact.cc:696 is exact (amount.cc:1407)
+            if cy == z then
+              roundsToZero st cy (yLeft + gains z (px - rate) false)
+            else roundsToZero st cy yLeft
+        | some (z, px, _), some (zy, py, _) =>
+            -- a gain between two lots priced in `z` (xact.cc:735-763)
+            roundsToZero st cy yLeft
+              && (zy != z || roundsToZero st z (gains z (px - py * rate) true))
+        | none, _ => roundsToZero st cy yLeft)
+  let ofVerdict := fun (v : Option Bool) => match v with
+    | some b => Exchange.converts b
+    | none => .declines
+  if xact.any (·.costVal.isSome) then .declines
+  else match bal, top? with
+    | .balance [x, y], some top =>
+        if x.2 == 0 || y.2 == 0 || top.fixated then .declines
+        else
+          let tk := top.amount.map (keyOf top)
+          if tk == some x.1 then ofVerdict (verdict x y)
+          else if tk == some y.1 then ofVerdict (verdict y x)
+          -- the order of the two entries decides (xact.cc:422-423,
+          -- balance.h:99); only a verdict that both orders give is C++'s
+          else match verdict x y, verdict y x with
+            | some a, some b => if a == b then .converts a else .unordered
+            | none, none => .declines
+            | _, _ => .unordered
+    | _, _ => .declines
+
 /-- Finalize a pending transaction into flows. -/
 private def finalizeXact (st : St) (hline : Nat) (_header : String)
     (rawPosts : List (Nat × String)) : Except String St := do
@@ -820,11 +1145,22 @@ private def finalizeXact (st : St) (hline : Nat) (_header : String)
     | none => pure ()
     match p? with
     | some p =>
-        -- canonicalize amounts through commodity equivalences
+        -- canonicalize amounts through commodity equivalences. C++
+        -- parses the amount unreduced (textual_xacts.cc:583) and reduces
+        -- it in Phase 1 (xact.cc:333), dividing its lot price by the
+        -- factor that scales the quantity (amount.cc:1153-1176, #512),
+        -- and so the lot price per unit is divided here
+        let scale := match p.amount with
+          | some a =>
+              (resolveEquiv stv.equivs ((stv.commAliases.lookup a.comm).getD a.comm)).1
+          | none => 1
         let p := { p with
           amount := p.amount.map (canonAmt stv)
           costVal := p.costVal.map (canonAmt stv)
           lotVal := p.lotVal.map (canonAmt stv)
+          lotUnit := p.lotUnit.map fun lu =>
+            let c := canonAmt stv lu
+            if scale == 0 then c else ⟨c.comm, c.q / scale⟩
           assignTarget := p.assignTarget.map (canonAmt stv) }
         posts := p :: posts
     | none => pure ()
@@ -939,21 +1275,50 @@ private def finalizeXact (st : St) (hline : Nat) (_header : String)
                         acc + 1 / (2 * ((10 ^ p.costDecs : ℕ) : ℚ))
                       else acc
                   | none => acc
-              if residualExact.length == 2 then pure pool  -- implicit exchange
-              else if residualExact.all fun (c, s) =>
-                  roundsToZero stv c s
-                    || (s ≤ costTol c && -s ≤ costTol c) then
-                pure pool
-              else
-                -- second pass: substitute lot/fixated values
-                -- (coverage-wave3 fixated, opt-base lot+cost)
-                let residual2 := (sumsWith true).filter fun (_, s) => s != 0
-                if residual2.isEmpty
-                    || residual2.all (fun (c, s) => roundsToZero stv c s)
-                    || residual2.length == 2 then
+              let unbalanced : Except String (List PostSpec) :=
+                err hline s!"unbalanced transaction (residual in {residualExact.length} commodities)"
+              -- the implicit exchange of Phase 3, which converts only
+              -- the real balance (xact.cc:380): `impliedExchange` gives
+              -- C++'s verdict where C++ converts; where C++ makes no
+              -- conversion, or where its verdict depends on the
+              -- unspecified order of the two entries (balance.h:99,
+              -- xact.cc:422-423), the tests below decide
+              let exch := if isReal then impliedExchange stv rposts pool else .declines
+              -- for an order-dependent verdict the oracle keeps its
+              -- earlier rule, under which a residual in exactly two
+              -- commodities passes in either pass; the docstring of
+              -- `impliedExchange` gives a journal on which this departs
+              -- from C++ in each direction
+              let unordered := match exch with
+                | .unordered => true
+                | _ => false
+              match exch with
+              | .converts true => pure pool
+              | .converts false => unbalanced
+              | _ =>
+                if (unordered && residualExact.length == 2)
+                    || residualExact.all fun (c, s) =>
+                      roundsToZero stv c s
+                        || (s ≤ costTol c && -s ≤ costTol c) then
                   pure pool
+                -- C++ values no lot in a bracket-virtual pool: Phase 1
+                -- sums it once, Phase 4's recompute skips its postings,
+                -- and Phase 8 tests it as it stands (xact.cc:505-516,
+                -- 973-979)
+                else if !isReal then unbalanced
                 else
-                  err hline s!"unbalanced transaction (residual in {residualExact.length} commodities)"
+                  -- second pass: substitute lot/fixated values
+                  -- (coverage-wave3 fixated, opt-base lot+cost). The
+                  -- lot-valued residual must itself round to zero: C++
+                  -- prices fixated lots in Phase 4, after Phase 3, and
+                  -- infers no exchange from what they leave
+                  -- (xact.cc:475-518, regress/1029)
+                  let residual2 := (sumsWith true).filter fun (_, s) => s != 0
+                  if residual2.isEmpty
+                      || residual2.all (fun (c, s) => roundsToZero stv c s)
+                      || (unordered && residual2.length == 2) then
+                    pure pool
+                  else unbalanced
     | [e] =>
         -- COST_PREC tagging: only when the inferred value fits the
         -- recovered price precision (set_cost_prec_if_needed, 2174)
