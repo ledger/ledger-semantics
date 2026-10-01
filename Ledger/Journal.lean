@@ -36,6 +36,12 @@ outputs (the `SemanticBisimulation` ctest is the standing check):
 - **UUID dedup**: a transaction whose note carries an already-seen
   `UUID:` is dropped whole (C++ `journal.cc` semantics) — the one
   documented non-flow-inert label.
+- **Periodic templates** `~`: finalized as a transaction without a
+  date against the state before them, booking no lot gain and with no
+  UUID de-duplication. As C++ `parse_posts` reads the postings, a line
+  beginning with `;` is dropped and a line beginning with `assert `,
+  `check ` or `expr ` is a posting. The result is discarded, and an
+  error is reported with the prefix `periodic transaction: `.
 - **Flow-inert directives** are consumed with a justification in
   `handleDirective`; unknown constructs remain named errors.
 -/
@@ -156,6 +162,8 @@ private inductive Pending where
   | none
   | xact (line : Nat) (header : String) (posts : List (Nat × String))
   | auto (rule : List (Nat × String))     -- predicate handled at open
+  -- a `~` template: balance-checked by `flushPending`, flows discarded
+  | periodic (line : Nat) (header : String) (posts : List (Nat × String))
   | acctBlock (frames : List (Nat × String))
   | commBlock (comm : String)
   | ignoreBlock
@@ -545,7 +553,8 @@ private partial def annotLoop (ctx : AmtCtx) (line : Nat) (a : Amount)
 private structure AmountField where
   amount : Option Amount := none
   /-- the `@`/`@@` cost, adjusted by the rounded gain of a lot priced
-      in the cost's commodity (pass 1) -/
+      in the cost's commodity (pass 1); in a periodic template the cost
+      as written -/
   costVal : Option Amount := none
   /-- the lot price times the quantity (pass 2) -/
   lotVal : Option Amount := none
@@ -557,14 +566,20 @@ private structure AmountField where
   isExpr : Bool := false
   teach : List (String × Nat) := []
   costDecs : Nat := 0
+  /-- the rounded gain of a lot priced in the cost's commodity, bound
+      as `capital_gain` in automated-transaction expressions
+      (`applyAutos`). It is computed in a periodic template too, where
+      it reaches only the flows that `flushPending` discards. -/
   gainVal : Option Amount := none
   annotated : Bool := false
   fixated : Bool := false
 
 /-- Parse the amount field of a posting (everything after the
-    account): amount, lot annotations, cost, assertion/assignment. -/
-private def parseAmountField (ctx : AmtCtx) (line : Nat) (field : String) :
-    Except String AmountField := do
+    account): amount, lot annotations, cost, assertion/assignment.
+    `periodic` marks a posting of a periodic template, whose cost
+    books no lot gain. -/
+private def parseAmountField (ctx : AmtCtx) (line : Nat) (field : String)
+    (periodic : Bool := false) : Except String AmountField := do
   let field := trimS field
   if field.isEmpty then
     pure {}
@@ -609,7 +624,11 @@ private def parseAmountField (ctx : AmtCtx) (line : Nat) (field : String) :
     -- xact.cc phase 4/6: a fixated lot with no cost derives the cost
     -- from the annotation; a lot WITH a cost books the rounded
     -- gain/loss (basis - cost, rounded at commodity precision plus
-    -- the amount's decimals) into the effective cost
+    -- the amount's decimals) into the effective cost. Phase 6 runs
+    -- only for a transaction with a date (`if (has_date())`,
+    -- xact.cc:522, item.h:262), and a periodic template never sets
+    -- the `_date` it inherits from item_t (xact.h:434, item.h:161),
+    -- so a template keeps the cost as written
     let gainVal := match lot, cost with
       | some (p, _), some c =>
           if p.comm == c.comm then
@@ -620,7 +639,8 @@ private def parseAmountField (ctx : AmtCtx) (line : Nat) (field : String) :
       | _, _ => none
     let costVal := match lot, cost with
       | some (p, _), some c =>
-          if p.comm == c.comm then
+          if periodic then some c
+          else if p.comm == c.comm then
             let basis := p.q * a.q
             let gl := basis - c.q
             let glR := roundAt ((ctx.precs.lookup c.comm).getD 0 + r.decimals) gl
@@ -641,16 +661,22 @@ private def parseAmountField (ctx : AmtCtx) (line : Nat) (field : String) :
            costDecs, gainVal, annotated := hasComm && annotated
            fixated := hasComm && fixated }
 
-private def parsePosting (st : St) (line : Nat) (raw : String) :
+private def parsePosting (st : St) (line : Nat) (raw : String)
+    (periodic : Bool := false) :
     Except String (Option PostSpec × Option (String × Bool) ×
       Option String × Nat × Bool × List (String × Nat)) := do
   let (content, note) := splitNote raw
   let content := stripStatus (trimS content)
   if content.isEmpty then
     pure (none, none, none, 0, false, [])
-  else if content.startsWith "assert " || content.startsWith "check "
-      || content.startsWith "expr " then
-    -- inline expression check/eval: verified/discarded by the C++ side
+  else if !periodic && (content.startsWith "assert "
+      || content.startsWith "check " || content.startsWith "expr ") then
+    -- inline expression check/eval: verified/discarded by the C++ side.
+    -- Only a dated transaction has this branch (parse_xact,
+    -- textual_xacts.cc:1107-1125). C++ collects the postings of a
+    -- periodic template with parse_posts, which hands every line not
+    -- beginning with `;` to parse_post (textual_xacts.cc:951-952), so
+    -- in a template such a line is a posting to the account it names
     pure (none, none, none, 0, false, [])
   else do
     let (acctField, amtField) := splitField content
@@ -659,7 +685,7 @@ private def parsePosting (st : St) (line : Nat) (raw : String) :
     match amtField with
     | none => pure (some { line, account, kind, note }, none, none, 0, false, [])
     | some f => do
-        let af ← parseAmountField st.amt line f
+        let af ← parseAmountField st.amt line f periodic
         pure (some { line, account, kind, note, amount := af.amount
                      costVal := af.costVal, lotVal := af.lotVal
                      lotUnit := af.lotUnit
@@ -930,7 +956,11 @@ private inductive Exchange where
     Every entry must then pass the zero test of Phase 8 (xact.cc:898)
     at the display precision of its commodity. The gains are rounded
     one posting at a time, as C++ rounds them, and their sum can differ
-    in either direction from the rounded gain of the whole.
+    in either direction from the rounded gain of the whole. Phase 6
+    runs only for a transaction with a date (`if (has_date())`,
+    xact.cc:522), so for a periodic template, which has none
+    (`periodic`), no gain is booked and Phase 8 tests the balance that
+    the conversion leaves.
 
     Known departures, each with the direction in which it fails:
     - the swap of issue #1130, which makes a COMMODITY_PRIMARY side the
@@ -1025,7 +1055,8 @@ private inductive Exchange where
     lot there, but its lot-blind first pass still accepts the first
     three shapes there, whose quantities net to zero when lots are
     ignored. -/
-private def impliedExchange (st : St) (xact pool : List PostSpec) : Exchange :=
+private def impliedExchange (st : St) (xact pool : List PostSpec)
+    (periodic : Bool := false) : Exchange :=
   let keyOf := fun (p : PostSpec) (a : Amount) => ((a.comm,
     if a.comm == "" then none else
       p.lotUnit.map fun lu => (lu.comm, lu.q, p.fixated)) : LotKey)
@@ -1048,7 +1079,10 @@ private def impliedExchange (st : St) (xact pool : List PostSpec) : Exchange :=
     -- a rate `y/x` with no commodity in `y` takes the commodity of `x`
     -- (amount.cc:814-815), as do the costs (amount.cc:727-744), and
     -- Phase 6 throws for a cost in its posting's own commodity
-    -- (xact.cc:679-681)
+    -- (xact.cc:679-681); in a periodic template, where Phase 6 does
+    -- not run (xact.cc:522), the conversion leaves the entry of `y` in
+    -- the balance and the zero test of Phase 8 rejects it (xact.cc:898,
+    -- 960-965)
     else if cy == "" && cx != "" then some false
     else
       -- every must-balance posting of the key of `x`, bracket-virtual
@@ -1064,8 +1098,11 @@ private def impliedExchange (st : St) (xact pool : List PostSpec) : Exchange :=
       -- Phase 6: each converted posting's gain per unit `g` in `z`,
       -- rounded at the display precision of `z` plus the posting's
       -- decimals (xact.cc:708-711, 756-759); `dropShownZero` drops a
-      -- rounded gain that shows as zero (xact.cc:762)
+      -- rounded gain that shows as zero (xact.cc:762). A periodic
+      -- template books no gain, since Phase 6 runs only for a
+      -- transaction with a date (`if (has_date())`, xact.cc:522)
       let gains := fun (z : String) (g : ℚ) (dropShownZero : Bool) =>
+        if periodic then (0 : ℚ) else
         conv.foldl (init := (0 : ℚ)) fun s (d, q) =>
           let r := roundAt ((st.precisions.lookup z).getD 0 + d) (g * q)
           if dropShownZero && roundsToZero st z r then s else s + r
@@ -1101,11 +1138,21 @@ private def impliedExchange (st : St) (xact pool : List PostSpec) : Exchange :=
             | _, _ => .unordered
     | _, _ => .declines
 
-/-- Finalize a pending transaction into flows. -/
+/-- Finalize a pending transaction into flows. With `periodic` the
+    postings are those of a periodic template `~`: its UUID is not
+    de-duplicated, its postings book no lot gain, a line beginning with
+    `assert `, `check ` or `expr ` is a posting (`parsePosting`), and
+    `flushPending` keeps only the verdict, discarding the state
+    returned. -/
 private def finalizeXact (st : St) (hline : Nat) (_header : String)
-    (rawPosts : List (Nat × String)) : Except String St := do
-  -- UUID dedup: scan raw text (notes ride the raw lines)
-  let uuid? := rawPosts.findSome? fun (_, r) => uuidOf r
+    (rawPosts : List (Nat × String)) (periodic : Bool := false) :
+    Except String St := do
+  -- UUID dedup: scan raw text (notes ride the raw lines); a periodic
+  -- template is never registered by UUID (journal.cc:594-595, in
+  -- add_xact, which the `~` directive never calls,
+  -- textual_xacts.cc:316-318), so it is always checked
+  let uuid? := if periodic then none else
+    rawPosts.findSome? fun (_, r) => uuidOf r
   match uuid? with
   | some u =>
       if st.uuids.contains u then
@@ -1130,7 +1177,8 @@ private def finalizeXact (st : St) (hline : Nat) (_header : String)
             :: rest
       | [] => leadNotes := leadNotes ++ [(rawT.drop 1).toString]
       continue
-    let (p?, learned, comm?, decs, isExpr, teach) ← parsePosting stv ln raw
+    let (p?, learned, comm?, decs, isExpr, teach) ←
+      parsePosting stv ln raw periodic
     for (c, d) in teach do
       stv := bumpPrecision stv c d
     match learned with
@@ -1235,8 +1283,14 @@ private def finalizeXact (st : St) (hline : Nat) (_header : String)
       pool.foldl (init := ([] : List (String × ℚ))) fun acc p =>
         match p.amount with
         | some a =>
+            -- in a periodic template a posting with a cost keeps it in
+            -- both passes: Phase 1 sums the cost (xact.cc:325), Phase 4
+            -- prices only a posting without one (xact.cc:486), and no
+            -- Phase 6 turns it into the lot value (xact.cc:522)
             let v :=
-              if useLot then (p.lotVal.getD (p.costVal.getD a))
+              if useLot then
+                if periodic then p.costVal.getD (p.lotVal.getD a)
+                else p.lotVal.getD (p.costVal.getD a)
               else p.costVal.getD a
             match acc.lookup v.comm with
             | some _ => acc.map fun (c, s) => if c = v.comm then (c, s + v.q) else (c, s)
@@ -1283,7 +1337,9 @@ private def finalizeXact (st : St) (hline : Nat) (_header : String)
               -- conversion, or where its verdict depends on the
               -- unspecified order of the two entries (balance.h:99,
               -- xact.cc:422-423), the tests below decide
-              let exch := if isReal then impliedExchange stv rposts pool else .declines
+              let exch :=
+                if isReal then impliedExchange stv rposts pool periodic
+                else .declines
               -- for an order-dependent verdict the oracle keeps its
               -- earlier rule, under which a residual in exactly two
               -- commodities passes in either pass; the docstring of
@@ -1964,6 +2020,57 @@ private def flushPending (st : St) : Except String St := do
   match st.pending with
   | .xact ln h posts => finalizeXact { st with pending := .none } ln h posts.reverse
   | .auto posts => finalizeAuto { st with pending := .none } posts.reverse
+  | .periodic ln h posts =>
+      -- a `~` template must balance as a transaction without a date
+      -- does: C++ finalizes it on parse (textual_xacts.cc:316) and
+      -- throws from xact.cc:960-965 or 973-979, or from xact.cc:336-346
+      -- for a second null posting. Witnesses, all rejected by C++:
+      -- DDB54BB8, cov6-txact-period-unbalanced,
+      -- cov9d-period-xact-unbalanced, coverage-periodic-unbalanced,
+      -- coverage-textual-periodic-unbalanced, 5D92A5EB. Lot matching
+      -- and the lot gains of Phases 5 and 6 run only for a transaction
+      -- with a date (`if (has_date())`, xact.cc:522), so the postings
+      -- of a template book no gain: `~ Monthly` over
+      -- `Assets:Broker 10 AAPL {$10}` and `Assets:Cash $-150` balances,
+      -- as does `-10 AAPL {$10} @ $15` against `$150`. The template is
+      -- finalized against the state before it and its result is
+      -- discarded: it contributes no flows to the balance report, since
+      -- C++ keeps a template in `period_xacts` (textual_xacts.cc:318)
+      -- and reports walk `xacts` (iterators.cc:53-54), and it teaches
+      -- the oracle nothing. A template inherits the departures of a
+      -- dated transaction, among them those that `impliedExchange` and
+      -- `balancePool` record, value expressions that the reader cannot
+      -- evaluate, such as `(abs($-10))`, and an empty or
+      -- whitespace-only line among the postings, at which C++ ends them
+      -- (textual_xacts.cc:945, 949-950), so that it finds the postings
+      -- before the line unbalanced or refuses the indented line after
+      -- it (textual.cc:289), while the reader skips the blank line
+      -- (fail-open). Besides these, the following departures are
+      -- known. C++ learns display precision and amount styles
+      -- from template amounts, which govern the rows printed, the
+      -- balancing tolerance and the reading of later amounts, so this
+      -- departure fails in either direction: after a template of
+      -- `$500.1`, C++ prints the balances of a later `(1/3 $)` as
+      -- `$0.3`, which round away here; after one of `$1.000` it rejects
+      -- a later `A 3 X @ $0.333` against `B $-1.00`, and after one of
+      -- `10,50 EUR` a later `5.25 EUR`, both accepted here (fail-open);
+      -- after one of `EUR 10,50` it accepts a later `EUR 1,500` against
+      -- `EUR -1,5`, reading 1.5 in each, which is rejected here
+      -- (fail-closed). Each of the following is rejected by C++ and
+      -- accepted here (fail-open): a balance assertion or assignment
+      -- `=` in a template, which C++ reads with no transaction
+      -- (textual_xacts.cc:952), so that the `=` is never taken as one
+      -- (textual_xacts.cc:743) and is refused as an unexpected
+      -- character; an automated transaction whose postings unbalance a
+      -- template, which C++ applies and checks again
+      -- (textual_xacts.cc:317, xact.cc:1683-1684); and a period
+      -- expression that C++ cannot read, or a note after it, which C++
+      -- rejects (textual_xacts.cc:303, baseline/cmd-source.test) and
+      -- which is not read here
+      match finalizeXact { st with pending := .none } ln h posts.reverse
+          (periodic := true) with
+      | .ok _ => pure { st with pending := .none }
+      | .error e => .error s!"periodic transaction: {e}"
   | _ => pure { st with pending := .none }
 
 /-- Run the engine over (include-spliced) journal text. -/
@@ -2012,6 +2119,14 @@ def run (input0 : String) (dcDefault : Bool := false)
             st := { st with pending := .xact ln h ((n, body) :: posts) }
           else
             st := { st with pending := .xact ln h ((n, t) :: posts) }
+      | .periodic ln h posts =>
+          let body := trimS t
+          if body.isEmpty then continue
+          -- a comment line in a template is dropped, not kept as a
+          -- note: C++ collects its postings with parse_posts, which
+          -- skips a line that begins with `;` (textual_xacts.cc:951)
+          if body.front == ';' then continue
+          st := { st with pending := .periodic ln h ((n, t) :: posts) }
       | .auto posts =>
           let body := trimS t
           if body.isEmpty then continue
@@ -2190,8 +2305,9 @@ def run (input0 : String) (dcDefault : Bool := false)
           autoPred := (branches, ruleName) :: st.autoPred
           pending := .auto [] }
       else if t.startsWith "~" then
-        -- periodic entries generate no postings in plain reports
-        st := { st with pending := .ignoreBlock }
+        -- periodic entries generate no postings in plain reports, but
+        -- are balance-checked when the block closes (flushPending)
+        st := { st with pending := .periodic n t [] }
       else if t == "comment" || t == "test" || t.startsWith "test "
           || t.startsWith "test\t" then
         -- `test` opens a comment block ended by `end test`
