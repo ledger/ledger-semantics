@@ -2098,6 +2098,18 @@ private def handleDirective (st : St) (n : Nat) (t : String) :
       -- stack (coverage-wave3-apply-directives)
       pure { st with bucket := some (resolveAccount st restS) }
   | "A" => pure { st with bucket := some (resolveAccount st restS) }
+  | "include" =>
+      -- `splice` in Driver.lean reads each include line outside a
+      -- comment or test block (`opensCommentBlock`), splices each one
+      -- it resolves, and leaves the rest here as a bare `include` (no
+      -- argument) or `include ARG` (no file matched but the including
+      -- one). C++ rejects a missing file (textual_directives.cc:458-459,
+      -- regress/1670, coverage-error-include-not-found) and an include
+      -- without an argument (textual_directives.cc:1034-1038,
+      -- coverage-directive-no-arg). The reason names the argument as
+      -- written, where C++ names the resolved path.
+      if restS.isEmpty then err n "directive 'include' requires an argument"
+      else err n s!"file to include was not found: {restS}"
   | "define" => defineDirective st restS
   | "def" => defineDirective st restS
   | "P" =>
@@ -2300,6 +2312,66 @@ private def flushPending (st : St) : Except String St := do
       | .error e => .error s!"periodic transaction: {e}"
   | _ => pure { st with pending := .none }
 
+/-- A code point that C++ `read_line` drops from the end of a line
+    once the trailing ASCII whitespace is gone (`is_unicode_whitespace`,
+    textual.cc:136-163, applied at 203-226). -/
+def isUnicodeWs (c : Char) : Bool :=
+  [0x85, 0xA0, 0x1680, 0x2028, 0x2029, 0x202F, 0x205F, 0x3000].contains c.toNat
+    || (0x2000 ≤ c.toNat && c.toNat ≤ 0x200A)
+
+/-- A line as C++ `read_line` leaves it before any directive sees it
+    (textual.cc:198-226): the trailing characters that `std::isspace`
+    accepts (space, tab, line feed, vertical tab, form feed and carriage
+    return) dropped, then the trailing Unicode whitespace (`isUnicodeWs`),
+    and no ASCII whitespace after that. The engine's own view of a line
+    in `run` keeps a trailing vertical tab, form feed or Unicode
+    whitespace, so the tests that decide which lines C++ executes apply
+    this first. -/
+def readLineTrim (t : String) : String :=
+  let ascii := t.toList.reverse.dropWhile fun c =>
+    c == ' ' || c == '\t' || c == '\n' || c == '\x0B' || c == '\x0C' || c == '\r'
+  String.ofList (ascii.dropWhile isUnicodeWs).reverse
+
+/-- The directive word of a line and the argument after it, as C++
+    finds them in `general_directive`: the first word, split at a space
+    or a tab (`next_element`, utils.h:623-640), with at most two `@` or
+    `!` prefixes dropped (textual.cc:321-324, textual_directives.cc:1031),
+    and the rest of the line after the spaces and tabs that follow the
+    word (`skip_ws`, utils.h:598-602). An indented line has an empty
+    word. `t` is expected to have passed through `readLineTrim`. -/
+def directiveWord (t : String) : String × String :=
+  let isSep := fun (c : Char) => c == ' ' || c == '\t'
+  let word := String.ofList (t.toList.takeWhile (!isSep ·))
+  let arg := String.ofList ((t.toList.dropWhile (!isSep ·)).dropWhile isSep)
+  let unprefix := fun (w : String) =>
+    if w.startsWith "@" || w.startsWith "!" then (w.drop 1).toString else w
+  (unprefix (unprefix word), arg)
+
+/-- A line that opens a `comment` or `test` block, which the engine
+    skips through the line that `closesCommentBlock` accepts. `t` is
+    the engine's view of a line in `run` (the text before any carriage
+    return, its trailing spaces and tabs dropped), which this test
+    first trims as C++ `read_line` does (`readLineTrim`), so that a
+    word followed by a form feed or by a no-break space opens a block
+    as it does in C++. C++ opens a block
+    on the directive word (`directiveWord`) `comment` or `test`
+    whatever argument follows it (textual_directives.cc:1035-1036,
+    1071-1072, 1124-1125), reads the block with `comment_directive`,
+    and never executes a line inside it. An indented line has an empty
+    word, so it opens nothing. `splice` in Driver.lean asks the same
+    two questions, so that it resolves no include inside a block. -/
+def opensCommentBlock (t : String) : Bool :=
+  let w := (directiveWord (readLineTrim t)).1
+  w == "comment" || w == "test"
+
+/-- The line that ends a block opened by `opensCommentBlock`. C++
+    `comment_directive` ends either kind of block at the first line
+    that begins with `end comment` or `end test`, so leading whitespace
+    keeps a line inside the block and text after the two words does not
+    (textual_directives.cc:941-949). -/
+def closesCommentBlock (t : String) : Bool :=
+  t.startsWith "end comment" || t.startsWith "end test"
+
 /-- Run the engine over (include-spliced) journal text. -/
 def run (input0 : String) (dcDefault : Bool := false)
     (nowSecs : Option ℚ := none) (recAliases : Bool := false)
@@ -2322,7 +2394,7 @@ def run (input0 : String) (dcDefault : Bool := false)
     let line := (line0.splitOn "\r").headD ""
     let t := line.trimAsciiEnd.toString
     if st.inComment then
-      if trimS t == "end comment" || trimS t == "end test" then
+      if closesCommentBlock t then
         st := { st with inComment := false }
       continue
     if t.isEmpty
@@ -2535,9 +2607,7 @@ def run (input0 : String) (dcDefault : Bool := false)
         -- periodic entries generate no postings in plain reports, but
         -- are balance-checked when the block closes (flushPending)
         st := { st with pending := .periodic n t [] }
-      else if t == "comment" || t == "test" || t.startsWith "test "
-          || t.startsWith "test\t" then
-        -- `test` opens a comment block ended by `end test`
+      else if opensCommentBlock t then
         st := { st with inComment := true }
       else if t == "h" || t.startsWith "h " || t == "b"
           || t.startsWith "b " then
