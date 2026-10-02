@@ -35,11 +35,12 @@ chosen so the reported balances land exactly on the commodity's
 two-decimal display precision: unit counts are integers, prices carry
 two decimals, and the postings a multiplier can match carry whole
 currency units. A value that fell exactly halfway between two
-displayable cents would be resolved by C++'s MPFR round-to-nearest on
-a binary approximation and by the oracle's exact half-away-from-zero
-rule, and those two rules disagree; the generator does not manufacture
-such ties, because a sweep corpus is meant to grow *construct*
-coverage, not to smuggle in a known display-rounding gap.
+displayable cents would be decided by the binary approximation through
+which C++ prints an amount (`stream_out_mpq`, src/amount.cc:208-245),
+which the oracle reproduces in `Parse.cppRoundAt`; the generator still
+does not manufacture such ties, because a sweep corpus is meant to
+grow *construct* coverage, and a tie exercises the rounding of the
+display rather than any construct of the journal.
 
 The generator never authors expectations, only journals.
 

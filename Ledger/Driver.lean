@@ -64,7 +64,12 @@ abbrev roundAt := Parse.roundAt
 /-- Display a base-commodity total in the largest fitting equivalent
     unit (built-in time chain and `C` directives alike), rounded at
     the unit's learned precision (default 2 for converted units, the
-    learned/0 precision for the base itself). -/
+    learned/0 precision for the base itself) as C++ prints an amount,
+    through `stream_out_mpq` (src/amount.cc:2055 and 208-245 at
+    76b9dc2b2, `cppRoundAt`): a total exactly half-way between two
+    displayable values rounds as its binary expansion decides, so that
+    at precision 1 a total of `0.35` shows as `0.3` and one of `0.45`
+    as `0.5`. -/
 def displayAmount (equivs : List (String × ℚ × String))
     (precisions : List (String × Nat)) (comm : String) (q : ℚ) :
     String × ℚ :=
@@ -77,12 +82,12 @@ def displayAmount (equivs : List (String × ℚ × String))
   match units.find? fun (_, f) => a ≥ f && f != 1 with
   | some (u, f) =>
       let p := max ((precisions.lookup u).getD 2) 2
-      (u, roundAt p (q / f))
+      (u, cppRoundAt p (q / f))
   | none =>
       if comm == "" then (comm, q)   -- bare amounts: full precision
       else
         let p := (precisions.lookup comm).getD 0
-        (comm, roundAt p q)
+        (comm, cppRoundAt p q)
 
 /-- The generator specification of an evaluated journal. -/
 def specFor (arr : Array (List (Account × ℚ))) : GenSpec where
@@ -130,12 +135,17 @@ def balancesOf (decimalComma : Bool) (nowSecs : Option ℚ)
     let (dispComm, dispQ) := displayAmount res.equivs res.precisions a.commodity v
     -- a lone inferred balance renders at its recovered precision when
     -- the commodity has none, or when it would otherwise show as zero
-    -- (BIGINT_COST_PREC, issues #1692/#1773); sums drop the widening
+    -- (BIGINT_COST_PREC, issues #1692/#1773); sums drop the widening.
+    -- C++ asks whether it shows as zero with `in_place_roundto`, which
+    -- rounds half away from zero as `roundAt` does, not as the row is
+    -- printed (src/amount.cc:2041-2053, 1072-1100): `A 1 FOO @ $0.005`
+    -- against an elided `B`, with `$` shown at two places, is not
+    -- widened, prints as zero, and leaves no row
     let (tot, inf) := statFor a.name a.commodity
+    let prec := (res.precisions.lookup a.commodity).getD 0
     if tot == 1 && inf == 1 && dispComm == a.commodity
         && a.commodity != ""
-        && (((res.precisions.lookup a.commodity).getD 0) == 0
-            || dispQ == 0) then
+        && (prec == 0 || roundAt prec v == 0) then
       if v = 0 then none
       else some s!"{a.commodity}|{ratToCanonical v}|{a.name}"
     else

@@ -278,6 +278,58 @@ def roundAt (p : Nat) (q : ℚ) : ℚ :=
     else -((-scaled + 1/2).floor)
   (n : ℚ) / f
 
+/-- The magnitude `n / d` (`d > 0`) rounded to nearest, ties to even,
+    at the binary precision at which C++ `stream_out_mpq` divides `n`
+    by `d`: the bit length of `n` plus that of `d` plus `2 * 64 * 6`
+    bits, where 6 is `amount_t::extend_by_digits` (src/amount.cc:224-243
+    at 76b9dc2b2, src/amount.h:121; `mpz_sizeinbase` counts one bit for
+    zero). The result `(m, k)` stands for `m / 2 ^ k`. -/
+private def binRound (n d : Nat) : Nat × Nat :=
+  let nb := n.log2 + 1
+  let db := d.log2 + 1
+  -- for `n > 0`, `n / d` lies in (2 ^ (nb - db - 1), 2 ^ (nb - db + 1)),
+  -- and `k` puts the leading bit of `n * 2 ^ k / d` at bit
+  -- `nb + db + 767`, which takes one place less of `k` once `n / d`
+  -- reaches `2 ^ (nb - db)`; for `n = 0` either `k` gives `m = 0`
+  let k := if n * 2 ^ db ≥ d * 2 ^ nb then 2 * db + 767 else 2 * db + 768
+  let x := n * 2 ^ k
+  let m := x / d
+  let r := x % d
+  (if 2 * r > d ∨ (2 * r = d ∧ m % 2 = 1) then m + 1 else m, k)
+
+/-- Round `q` at `p` decimals as C++ prints an amount, and as
+    `amount_t::is_zero` prints one to test it for zero, through
+    `stream_out_mpq` (src/amount.cc:208-245 at 76b9dc2b2): the quotient
+    of numerator and denominator is formed in binary at the precision
+    of `binRound`, and `mpfr_asprintf` prints that binary value at `p`
+    places, rounded to nearest with ties to even. Away from an exact
+    decimal tie the binary value rounds as `q` does: it lies within
+    `|q| / 2 ^ P` of `q`, `P` being its precision, while a value that is
+    not a tie lies at least `1 / (2 * den * 10 ^ p)` from every tie,
+    and the first distance is the smaller for every `p` up to 231,
+    since `10 ^ 231 < 2 ^ 768`. The exact comparison decides there, and
+    the binary value is formed only at an exact tie or beyond 231
+    places. At a tie the binary expansion decides: at precision 1,
+    `0.35` prints `0.3` and `0.45` prints `0.5`, while `0.25`, which
+    binary represents exactly, prints `0.2` by the even rule; at
+    precision 7 a residual of half a unit, `0.00000005`, prints
+    `0.0000001`, so C++ does not read it as zero. -/
+def cppRoundAt (p : Nat) (q : ℚ) : ℚ :=
+  let f : ℚ := ((10 ^ p : ℕ) : ℚ)
+  let s := (if q < 0 then -q else q) * f
+  let n := s.floor
+  let m : Int :=
+    if p ≤ 231 ∧ s - n ≠ 1/2 then
+      if s - n < 1/2 then n else n + 1
+    else
+      let (b, k) := binRound q.num.natAbs q.den
+      let x := b * 10 ^ p
+      let t := x / 2 ^ k
+      let r := x % 2 ^ k
+      let t' := if 2 * r > 2 ^ k ∨ (2 * r = 2 ^ k ∧ t % 2 = 1) then t + 1 else t
+      (t' : Int)
+  (if q < 0 then -(m : ℚ) else (m : ℚ)) / f
+
 /-! ## Commodities -/
 
 def isForbiddenComm (c : Char) : Bool :=

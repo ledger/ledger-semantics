@@ -41,14 +41,15 @@ outputs (the `SemanticBisimulation` ctest is the standing check):
     verdicts, the order-dependent rule passes a real residual in
     exactly two commodities.
   - *Zero test and allowance*: the zero test rounds at display
-    precision, widened in the real pool for a cost commodity shown
-    without decimals (regress/1114), and asks for exact zero in the
-    null commodity. A residual left to these tests passes when its
-    part in each commodity passes the zero test or lies within the sum
-    of half a unit in the last place of each cost written with
-    decimals in that commodity. In either pool that allowance stands
-    in for the per-unit cost rounding that C++ adjusts in the real
-    pool alone (regress/1125, `costTol`).
+    precision as C++ prints an amount (`Parse.cppRoundAt`), widened in
+    the real pool for a cost commodity shown without decimals
+    (regress/1114), and asks for exact zero in the null commodity. A
+    residual left to these tests passes when its part in each
+    commodity passes the zero test or lies within the sum of half a
+    unit in the last place of each cost written with decimals in that
+    commodity. In either pool that allowance stands in for the
+    per-unit cost rounding that C++ adjusts in the real pool alone
+    (regress/1125, `costTol`).
   - *Second pass*: only a real residual that still fails reaches a
     second pass (regress/coverage-wave3-fixated-price), which weighs
     each lot at its price `{P}`×qty, in place of its cost except in a
@@ -417,10 +418,15 @@ private def bumpPrecision (st : St) (comm : String) (d : Nat) : St :=
       | none => { st with precisions := (comm, d) :: st.precisions }
     { st' with amt := { st'.amt with precs := st'.precisions } }
 
-/-- Does `q` round to zero at `p` decimals? -/
+/-- Does `q` round to zero at `p` decimals? C++ `amount_t::is_zero`
+    prints the quantity at the precision in question through
+    `stream_out_mpq` and finds no nonzero digit (src/amount.cc:1417-1425
+    at 76b9dc2b2), so the test rounds as a printed amount does
+    (`cppRoundAt`): at precision 6 a residual of half a unit,
+    `0.0000005`, is zero, and at precision 7 the residual `0.00000005`
+    is not. -/
 private def roundsToZeroAt (p : Nat) (q : ℚ) : Bool :=
-  let scaled := (if q < 0 then -q else q) * (10 ^ p : ℕ)
-  scaled * 2 ≤ 1
+  cppRoundAt p q == 0
 
 /-- Display-precision-tolerant zero test: does the residual round to
     zero at the commodity's learned precision? (Cost amounts never
@@ -2312,14 +2318,22 @@ private def finalizeXact (st : St) (hline : Nat) (_header : String)
           -- xact.cc:211-226), keeps the tag in the difference unless an
           -- earlier posting of the transaction in that commodity is
           -- subtracted from it, since a sum drops it (amount.cc:634-642,
-          -- 677-681), and C++ then takes it as zero only when it is exactly
-          -- zero (amount.cc:1384-1402, issue #1692); the account's flows
-          -- are counted as `Driver` counts them for a lone inferred balance
-          -- (`flowStats`). After `$1.00` in `Assets:C` and
-          -- `Assets:B  1 FOO @ $0.0004` against an elided `Assets:A` (the
-          -- cost shape), `Assets:A  = 0` posts `$0.0004` and so zeroes the
-          -- account, and with `Assets:B  1 BAR @ 0.0004 EUR` beside the
-          -- `FOO`, it is rejected by C++ and here. The commodities
+          -- 677-681). C++ then takes it as zero only when it is exactly
+          -- zero if the display precision is 0 or if the amount rounds to
+          -- zero there with `in_place_roundto`, half away from zero as
+          -- `roundAt` rounds, and otherwise tests it at display precision
+          -- as it tests any amount (amount.cc:1384-1402, 1072-1100, issue
+          -- #1692); the account's flows are counted as `Driver` counts
+          -- them for a lone inferred balance (`flowStats`). After `$1.00`
+          -- in `Assets:C` and `Assets:B  1 FOO @ $0.0004` against an
+          -- elided `Assets:A` (the cost shape), `Assets:A  = 0` posts
+          -- `$0.0004` and so zeroes the account, and with
+          -- `Assets:B  1 BAR @ 0.0004 EUR` beside the `FOO`, it is rejected
+          -- by C++ and here. With `@ $0.005` in the cost shape, the
+          -- difference of exactly half a unit is zero, since its binary
+          -- expansion rounds down (`cppRoundAt`), so that `Assets:A  = 0`
+          -- posts a zero and a later `Assets:A  $0.01` leaves the account
+          -- at `$0.005`, which shows as zero in C++ and here. The commodities
           -- considered are those of the account's balance and of its
           -- earlier postings in this transaction. Six departures are
           -- known, in the precision or the commodities of the difference.
@@ -2383,7 +2397,9 @@ private def finalizeXact (st : St) (hline : Nat) (_header : String)
             stv.flowStats.lookup (p.account, c) == some (1, 1)
               && (intra.lookup (p.account, c, realOnly)).isNone
           let shownZero := fun ((c, d) : String × ℚ) =>
-            c != "" && !tagged c && roundsToZero stv c d
+            let prec := (stv.precisions.lookup c).getD 0
+            c != "" && roundsToZero stv c d
+              && (!tagged c || (prec != 0 && roundAt prec d != 0))
           if left.length > 1 && !left.all shownZero then
             err p.line (s!"balance assignment without a commodity leaves " ++
               s!"a balance in {left.length} commodities")
