@@ -88,8 +88,10 @@ outputs (the `SemanticBisimulation` ctest is the standing check):
   date against the state before them, booking no lot gain and with no
   UUID de-duplication. As C++ `parse_posts` reads the postings, a line
   beginning with `;` is dropped and a line beginning with `assert `,
-  `check ` or `expr ` is a posting. The result is discarded, and an
-  error is reported with the prefix `periodic transaction: `.
+  `check ` or `expr ` is a posting. The result is discarded, together
+  with the display precisions and amount styles that its amounts teach
+  C++, a departure that `flushPending` records; an error in the
+  template is reported with the prefix `periodic transaction: `.
 - **Flow-inert directives** are consumed with a justification in
   `handleDirective`; unknown constructs remain named errors.
 -/
@@ -408,9 +410,9 @@ private def roundsToZero (st : St) (comm : String) (q : ℚ) : Bool :=
       token.cc:555), and from an `apply fixed` rate
       (textual_directives.cc:534-535). Where C++ holds a positive
       precision from one of these it widens nothing, so after
-      `= /^NEVER/` with `(Y) 0.50 EUR`, `~ Monthly` with `X 0.50 EUR`,
-      `define x = 0.50 EUR`, `; X:: 0.50 EUR` or
-      `apply fixed FOO 0.50 EUR`, the transaction `1.0001 FOO @ 1 EUR`
+      `= /^NEVER/` with `(Y) 0.50 EUR`, `~ Monthly` with `X 0.50 EUR`
+      against an elided `Y`, `define x = 0.50 EUR`, `; X:: 0.50 EUR` or
+      `apply fixed BAZ 0.50 EUR`, the transaction `1.0001 FOO @ 1 EUR`
       against `-1 BAR @ 1 EUR` is rejected here and accepted by C++
       (fail-closed). The comment on periodic templates in
       `flushPending` and the `apply fixed` entry of `impliedExchange`
@@ -710,9 +712,10 @@ private partial def annotLoop (ctx : AmtCtx) (line : Nat) (a : Amount)
       (perUnit := false) (lotLit := lotLit)
   else if t.startsWith "(@)" || t.startsWith "@" then
     -- per-unit costs round at the cost literal's own precision,
-    -- posting by posting (regress/1125); `@ =` fixates (1794); cost
-    -- literals teach display precision up to ledger's 6-digit
-    -- extension (1151 vs standard.dat's 22-digit prices)
+    -- posting by posting (regress/1125); `@ =` fixates (1794). A cost
+    -- literal teaches no display precision, since C++ parses it
+    -- without migration (textual_xacts.cc:691, 693-694): its decimals
+    -- reach only `costDecs`
     let off := if t.startsWith "(@)" then 3 else 1
     let rest0 := trimS (t.drop off).toString
     let rest0 := if rest0.startsWith "=" then trimS (rest0.drop 1).toString
@@ -1455,10 +1458,47 @@ private def finalizeXact (st : St) (hline : Nat) (_header : String)
       parsePosting stv ln raw periodic
     for (c, d) in teach do
       stv := bumpPrecision stv c d
+    -- a style learned from a posting amount reaches its commodity, as
+    -- C++ migrates it to a commodity that is not locked
+    -- (amount.cc:1836-1837). Three departures are known. First, C++
+    -- reads a bare amount with the style of the null commodity
+    -- (amount.cc:1714-1715), which only the amount of a `D` directive
+    -- changes (amount.cc:1850, textual_directives.cc:157), while a bare
+    -- posting amount teaches it here: after `X 10,50` against an elided
+    -- `Y`, C++ accepts a later bare `5.25`, which is rejected here as
+    -- ambiguous (fail-closed). Second, C++ migrates no style to a
+    -- commodity that a `D` directive or a `format` subdirective has
+    -- locked (amount.cc:1836; textual_directives.cc:165, 875), while
+    -- `lockPrecision` locks the precision alone and the style is
+    -- learned here: after `D 1,000.00 EUR` and `X 10,50 EUR`, C++
+    -- accepts a later `5.25 EUR`, which is rejected here as ambiguous
+    -- (fail-closed), and after `D $1,000.00` and `X $1,5`, or after
+    -- `commodity EUR` with `format 1,000.00 EUR` and `X 10,5 EUR`, C++
+    -- reads a later `$1,500` or `1,500 EUR` as 1500, where it is read
+    -- as 1.5 here (wrong rows). Third, an amount expression teaches no
+    -- style here, since `parseAmount` reports none for it, while C++
+    -- parses each literal of a posting expression with migration
+    -- (textual_xacts.cc:585-587, token.cc:548-555), so that the
+    -- literal's style reaches its commodity: after `X (10,50 EUR)`
+    -- against an elided `Y`, C++ rejects a later `5.25 EUR`, which is
+    -- accepted here (fail-open), and reads a later `1,500 EUR` as 1.5,
+    -- where it is read as 1500 here (wrong rows)
     match learned with
     | some (c, b) =>
         stv := { stv with amt := { stv.amt with styles := (c, b) :: stv.amt.styles } }
     | none => pure ()
+    -- the decimals of a posting amount reach its commodity, as C++
+    -- migrates them (amount.cc:1836-1849). For an amount expression
+    -- they are the largest number of decimals among its literals
+    -- (`parseExprAmount`), while C++ parses each literal as an amount
+    -- of its own, which migrates its precision to that literal's
+    -- commodity alone, and to none for a bare literal
+    -- (token.cc:540-555, amount.cc:1836), a known departure: after
+    -- `X ($1 * 1.555)` against an elided `Y`, C++ prints X as `2 $`
+    -- and no row for a later `(1/3 $)`, which show as 1.555 and 0.333
+    -- here (wrong rows), and after `X (1.234 * $2)`
+    -- against an elided `Y` it accepts a later `($1/3)` against
+    -- `$-0.33`, which is rejected here (fail-closed)
     let _ := isExpr
     match comm? with
     | some c =>
@@ -2200,7 +2240,22 @@ private def handleDirective (st : St) (n : Nat) (t : String) :
   | "P" =>
       -- price observations: plain `bal` never converts, but an
       -- unseen price commodity picks up a TENTATIVE precision from
-      -- the price literal (pool.cc: COMMODITY_PRECISION_FROM_PRICE)
+      -- the price literal (pool.cc: COMMODITY_PRECISION_FROM_PRICE).
+      -- C++ grants it when the commodity's precision is 0 and the
+      -- commodity is neither known nor locked (pool.cc:628-634), and
+      -- the source commodity of a price directive becomes known
+      -- (pool.cc:647), while this rule grants it only to a commodity
+      -- for which no precision is recorded. Both halves of the
+      -- difference are known departures. After `X $10` against an
+      -- elided `Y` has taught `$` precision 0,
+      -- `P 2024/01/01 EUR $1.2345` gives `$` four tentative places in
+      -- C++ and none here, so that C++ prints a later `(1/3 $)` as
+      -- `0.3333 $`, which rounds away here (wrong rows), and rejects a
+      -- later `($3/10)` against `$0`, which is accepted here
+      -- (fail-open). After `P 2024/01/01 EUR $1.2345` and
+      -- `P 2024/01/01 FOO 1.25 EUR`, EUR is known in C++ and keeps
+      -- precision 0, so that a later `(1/3 EUR)` prints no row there
+      -- and 0.33 here (wrong rows)
       let toks := (restS.splitOn " ").filter (!·.isEmpty)
       match toks.reverse with
       | last :: _ =>
@@ -2264,8 +2319,22 @@ private def handleDirective (st : St) (n : Nat) (t : String) :
               pure { st with equivs := (l.amount.comm, f, r.amount.comm) :: equivs }
       | _ => err n s!"malformed C directive '{restS}'"
   | "D" => do
-      -- default display format: declare and LOCK precision/style
-      -- (amount.cc: D sets COMMODITY_STYLE_NO_MIGRATE — #761/#1054)
+      -- default display format: declare the precision and the style,
+      -- and LOCK the precision, as COMMODITY_STYLE_NO_MIGRATE does in
+      -- C++ (textual_directives.cc:165; #761/#1054). C++ parses the
+      -- directive's amount with migration and only then locks the
+      -- commodity (textual_directives.cc:149-166), so that a higher
+      -- precision learned earlier survives the directive
+      -- (amount.cc:1847-1848), while `lockPrecision` sets the
+      -- directive's own decimals. This known departure governs the rows
+      -- printed and the zero test: after `A $500.12345` against an
+      -- elided `B` and then `D $1,000.00`, C++ prints A as `$500.12345`
+      -- and a later `($1/3)` as `$0.33333`, which show as 500.12 and
+      -- 0.33 here (wrong rows),
+      -- and it rejects a later `$1.001` against `$-1.00`, which is
+      -- accepted here (fail-open). C++ locks the style with the same
+      -- flag, which `lockPrecision` does not model; the style rule of
+      -- `finalizeXact` records that departure
       match parseAmount st.amt n restS with
       | .ok r =>
           let st := lockPrecision st r.amount.comm r.decimals
@@ -2369,24 +2438,45 @@ private def flushPending (st : St) : Except String St := do
       -- (textual_xacts.cc:945, 949-950), so that it finds the postings
       -- before the line unbalanced or refuses the indented line after
       -- it (textual.cc:289), while the reader skips the blank line
-      -- (fail-open). Besides these, the following departures are
-      -- known. C++ learns display precision and amount styles
-      -- from template amounts, which govern the rows printed, the
-      -- balancing tolerance and the reading of later amounts, so this
-      -- departure fails in either direction: after a template of
-      -- `$500.1`, C++ prints the balances of a later `(1/3 $)` as
-      -- `$0.3`, which round away here; after one of `$1.000` it rejects
-      -- a later `A 3 X @ $0.333` against `B $-1.00`, and after one of
-      -- `10,50 EUR` a later `5.25 EUR`, both accepted here (fail-open);
-      -- after one of `EUR 10,50` it accepts a later `EUR 1,500` against
-      -- `EUR -1,5`, reading 1.5 in each, which is rejected here
-      -- (fail-closed). Each of the following is rejected by C++ and
-      -- accepted here (fail-open): a balance assertion or assignment
-      -- `=` in a template, which C++ reads with no transaction
-      -- (textual_xacts.cc:952), so that the `=` is never taken as one
-      -- (textual_xacts.cc:743) and is refused as an unexpected
-      -- character; an automated transaction whose postings unbalance a
-      -- template, which C++ applies and checks again
+      -- (fail-open). Besides these, the following departures are known.
+      -- C++ parses a template's postings before it balances them
+      -- (textual_xacts.cc:312), and each posting amount migrates its
+      -- display precision and style to its commodity there as in a
+      -- dated transaction (amount.cc:1830-1864), so that a balanced
+      -- template teaches C++ what the same amounts would teach in a
+      -- dated one. A cost or a lot price, parsed without migration
+      -- (textual_xacts.cc:691, 693-694; annotate.cc:187), teaches
+      -- nothing on either side: after a template with
+      -- `X 10 AAPL @ $1.2345` or `X 10 AAPL {$1.2345}` against an
+      -- elided `Y`, neither prints a row for a later `(1/3 $)`. The
+      -- oracle discards everything that a template teaches, since
+      -- keeping it would carry into templates the departures of this
+      -- reader's precision and style model for dated amounts, which are
+      -- recorded beside the `D` and `P` directives, the style and
+      -- precision rules of `finalizeXact` and the `alias` subdirective.
+      -- What C++ learns governs the rows printed, the balancing verdict
+      -- and the reading of later amounts, so this departure fails in
+      -- either direction. In the rows printed: after a template with
+      -- `X $500.1` against an elided `Y`, C++ prints a later `(1/3 $)`
+      -- as `0.3 $`, which rounds away here (wrong rows), and after one
+      -- with `X 1.000,50 EUR` it prints a later `1234 EUR` as
+      -- `1.234,00 EUR`, where the oracle prints the same value but
+      -- declares no `%% dc EUR` (a missing declaration). In the
+      -- balancing verdict: after one with `X $1.000`, C++ rejects a
+      -- later `A 3 X @ $0.333` against `B $-1.00`, which is accepted
+      -- here (fail-open), and
+      -- `zeroTestPrec` records a fail-closed effect on the zero test.
+      -- In the reading of later amounts: after one with `X 10,50 EUR`,
+      -- C++ rejects a later `5.25 EUR`, which is accepted here
+      -- (fail-open), and after one with `X EUR 10,50` it accepts a
+      -- later `EUR 1,500` against `EUR -1,5`, reading 1.5 in each,
+      -- which is rejected here (fail-closed). Each of the following is
+      -- rejected by C++ and accepted here (fail-open): a balance
+      -- assertion or assignment `=` in a template, which C++ reads with
+      -- no transaction (textual_xacts.cc:952), so that the `=` is never
+      -- taken as one (textual_xacts.cc:743) and is refused as an
+      -- unexpected character; an automated transaction whose postings
+      -- unbalance a template, which C++ applies and checks again
       -- (textual_xacts.cc:317, xact.cc:1683-1684); and a period
       -- expression that C++ cannot read, or a note after it, which C++
       -- rejects (textual_xacts.cc:303, baseline/cmd-source.test) and
@@ -2552,6 +2642,18 @@ def run (input0 : String) (dcDefault : Bool := false)
       | .commBlock comm =>
           let body := trimS t
           if body.startsWith "alias " then
+            -- the alias name now denotes the block's commodity
+            -- (textual_directives.cc:844-849). Where the name already
+            -- denoted a commodity of its own, C++ retires that
+            -- commodity with the style it learned (pool.cc:150-173), so
+            -- that a later amount written under the name reads with the
+            -- style of the block's commodity, while the style learned
+            -- under the name is kept here, a known departure: after
+            -- `X 10,50 E` against an elided `Y` and then
+            -- `commodity EUR` with `alias E`, C++ reads a later
+            -- `1,500 E` as 1500 EUR, where it is read as 1.5 here
+            -- (wrong rows), and accepts a later `5.25 E`, which is
+            -- rejected here as ambiguous (fail-closed)
             let al := trimS (body.drop "alias ".length).toString
             let al := (unquote al).getD al
             st := { st with commAliases := (al, comm) :: st.commAliases }
