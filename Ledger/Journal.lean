@@ -77,7 +77,15 @@ outputs (the `SemanticBisimulation` ctest is the standing check):
 - **Auto-xacts** `= /regex/`: template postings (fixed amounts or
   bare multipliers × the matched posting's amount) are appended per
   matching real posting of each later transaction — after balancing,
-  as `extend_xact` does; templates may be virtual.
+  as `extend_xact` does; templates may be virtual. C++ also matches
+  virtual and deferred postings, a departure recorded at `applyAutos`.
+  After each rule that adds a posting that must balance, C++ checks
+  the extended transaction once more (`verify()`, xact.cc:1040-1110,
+  1683-1684), weighing a generated posting at the cost that its
+  template writes or, when the matched posting has a cost, at the cost
+  that C++ derives from the lot price of the generated amount, the
+  template amount's own or the one copied from the matched posting;
+  `verifyExtended` makes that check and lists its departures.
 - **Timeclock** `i`/`o`: time postings (duration in canonical
   seconds), with the opposite amount posted to the bucket account
   when one is declared (regress/1607); no balance check.
@@ -162,6 +170,16 @@ structure PostSpec where
       transaction of `10 AAA {{$50}} @ $5`, where this field is not set
       (fail-open). -/
   lotTotal : Bool := false
+  /-- the factor by which a commodity equivalence reduced the amount,
+      and by which `lotUnit` was divided, or 1 when none applies. C++
+      parses the amount unreduced (textual_xacts.cc:583) and reduces it
+      at the end of `finalize` for a transaction, but not for a
+      periodic template (xact.cc:987-996), nor for a posting that an
+      automated transaction generates afterwards. Where the amount stays
+      unreduced, its price per unit, which C++ takes as the whole cost
+      derived from a lot marked as a total (xact.cc:1617-1621), is
+      `lotUnit` times this factor. -/
+  lotScale : ℚ := 1
   assignTarget : Option Amount := none
   /-- the amount itself is annotated (`{lot}`, `[date]` or `(note)`
       before any cost or balance assertion): C++'s
@@ -213,6 +231,23 @@ structure AutoPost where
   fixed : Option Amount
   mult : ℚ
   exprSrc : Option String := none
+  /-- the cost written on a fixed template amount, `@ P` times the
+      amount or `@@ T`, which C++ copies to every posting generated from
+      the template (xact.cc:1611-1612) -/
+  cost : Option Amount := none
+  /-- the precision of `cost`, counted as `PostSpec.costPrec` counts it
+      for a posting whose cost Phase 6 does not change -/
+  costPrec : Nat := 0
+  /-- the lot price per unit of a fixed template amount with a
+      commodity, written before any cost, counted as `PostSpec.lotUnit`
+      counts it. C++ keeps the annotation on the template amount
+      (amount.cc:1908) and so on every posting generated from it, and
+      derives that posting's cost from it when the matched posting has
+      a cost and the template posting none (xact.cc:1613-1627) -/
+  lotUnit : Option Amount := none
+  /-- the lot price of `lotUnit` is written as a total, `{{T}}` or
+      `{{=T}}`, as `PostSpec.lotTotal` records it -/
+  lotTotal : Bool := false
   deriving Repr
 
 inductive DateCmp where
@@ -367,8 +402,10 @@ private def roundsToZero (st : St) (comm : String) (q : ℚ) : Bool :=
     pool (amount.cc:1378, 1429); `finalizeXact` does the same, apart
     from the regress/1125 tolerance beside `costTol`, and never asks
     this function about the null commodity. `posts` are the
-    transaction's postings in order, before automated postings are
-    added.
+    transaction's postings in order: for the final zero test of
+    `finalizeXact`, before automated postings are added, and for
+    `verifyExtended`, followed by the postings generated so far, whose
+    copied template costs `verify()` reads as well (xact.cc:1076-1091).
 
     `parseAmountField` approximates the precision of an amount
     expression and of a lot price, compares the commodities of a lot
@@ -1017,7 +1054,23 @@ private def parsePosting (st : St) (line : Nat) (raw : String)
     matched posting has one, written, computed by Phase 3 in the
     orientation taken, or derived by Phase 4 from a fixated lot price,
     so the full condition depends on the orientation of the pool and
-    on Phase 4 (the comment in the loop gives the C++ lines). -/
+    on Phase 4 (the comment in the loop gives the C++ lines). A
+    generated posting carries the cost written on its template posting
+    (`AutoPost.cost`), which C++ copies to it before it would derive
+    one (xact.cc:1611-1612), and the lot price of a fixed template
+    amount (`AutoPost.lotUnit`), from which C++ derives one under the
+    same condition on the matched posting (xact.cc:1613-1627).
+
+    Only real postings are matched here, while C++ matches every
+    posting that an automated transaction did not generate, virtual and
+    deferred ones included (xact.cc:1438-1447). Under `= /Food/` with
+    `Assets:X 0.1`, C++ rejects `[Expenses:Food] 10.00 USD` against
+    `[Assets:Cash]`, `(Expenses:Food) 10.00 USD` alone, and
+    `<Expenses:Food> 10.00 USD` against an elided `Assets:Cash`, since
+    the generated `Assets:X 1.00 USD` must balance; all three are
+    accepted here (fail-open). With `Assets:Y -0.1` added, both C++ and
+    the oracle accept the first and the third, and the balances of C++
+    hold the two generated postings that these omit. -/
 private def applyAutos (st : St) (xdate : Option Int) (payee : String)
     (code : String) (dateStr : String)
     (xactNotes : String) (posts : List PostSpec) :
@@ -1134,8 +1187,21 @@ private def applyAutos (st : St) (xdate : Option Int) (payee : String)
         let acct := sub "$account" p.account acct
         let acct := sub "%(account)" p.account acct
         let acct := sub "%(payee)" payee acct
+        -- the factor of a commodity equivalence, by which `canonAmt`
+        -- reduces the generated amount and by which the template's lot
+        -- price per unit is divided, as `finalizeXact` divides that of a
+        -- written posting (amount.cc:1153-1176)
+        let scale :=
+          (resolveEquiv st.equivs ((st.commAliases.lookup amt.comm).getD amt.comm)).1
+        let scale := if scale == 0 then 1 else scale
         { line := p.line, account := acct, kind := ap.kind
-          amount := some (canonAmt st amt) : PostSpec }
+          amount := some (canonAmt st amt)
+          costVal := ap.cost.map (canonAmt st), costPrec := ap.costPrec
+          lotUnit := ap.lotUnit.map fun lu =>
+            let c := canonAmt st lu
+            ⟨c.comm, c.q / scale⟩
+          lotTotal := ap.lotTotal, lotScale := scale
+          : PostSpec }
   Id.run do
     let mut cand := posts.toArray
     let mut extra : List PostSpec := []
@@ -1147,6 +1213,8 @@ private def applyAutos (st : St) (xdate : Option Int) (payee : String)
       let mut batch : List (PostSpec × PostSpec × Bool) := []
       for i in [0:cand.size] do
         let p : PostSpec := cand[i]!
+        -- real postings only, neither virtual nor deferred ones, a
+        -- departure that the docstring records
         match p.kind, p.amount with
         | PostKind.real, some a =>
             let cur := cand.toList ++ extra
@@ -1192,6 +1260,14 @@ private def applyAutos (st : St) (xdate : Option Int) (payee : String)
     commodity, its price per unit and its fixated flag) when the amount
     carries one. -/
 private abbrev LotKey := String × Option (String × ℚ × Bool)
+
+/-- The key under which C++ balances a posting's amount `a`: its
+    commodity, with the posting's own lot price per unit
+    (`PostSpec.lotUnit`) and fixated flag (annotate.h:120-125), and with
+    no lot for an amount without a commodity (amount.cc:1908). -/
+private def lotKeyOf (p : PostSpec) (a : Amount) : LotKey :=
+  (a.comm, if a.comm == "" then none else
+    p.lotUnit.map fun lu => (lu.comm, lu.q, p.fixated))
 
 /-- The value that C++ accumulates as the real balance in Phase 1 of
     `finalize` (xact.cc:333, through `add_or_set_value`,
@@ -1256,8 +1332,11 @@ private inductive Verdict where
     balance. -/
 private inductive Exchange where
   /-- C++ converts, and the balance it leaves passes Phase 8 in every
-      order that C++ can take: one candidate per orientation -/
-  | converts (cands : List PoolCandidate)
+      order that C++ can take: one candidate per orientation, and
+      beside them the candidate of the orientation that only the swap
+      of issue #1130 takes, when that orientation converts and passes
+      (`PoolResult.swapped`) -/
+  | converts (cands : List PoolCandidate) (swapped : List PoolCandidate)
   /-- C++ converts, and the transaction fails -/
   | fails
   /-- C++ makes no conversion -/
@@ -1329,6 +1408,18 @@ private structure PoolResult where
       `1 B {$1}` and `-1 B {$1}` is rejected by C++ with the lot first
       and accepted with the plain units first. -/
   orderDependent : Bool := false
+  /-- the candidate of the orientation opposite to the one that the top
+      posting's key decides, when the implicit exchange accepts the pool
+      in that one, the two entries are of different commodities, and
+      the opposite orientation converts and passes as well. C++ takes it
+      when the swap of issue #1130 applies, that is when the top
+      posting's commodity is COMMODITY_PRIMARY and the other is not
+      (xact.cc:425-431), which depends on the price directives and the
+      exchanges that precede the transaction, a history that the oracle
+      does not record. Balancing does not read it, as the docstring of
+      `impliedExchange` records; `verifyExtended` weighs the generated
+      postings under it as under the orientations of `candidates`. -/
+  swapped : List PoolCandidate := []
 
 /-- The implicit exchange of C++'s `finalize`, Phase 3
     (src/xact.cc:374-473 at 76b9dc2b2). With no null posting, a real
@@ -1428,21 +1519,30 @@ private structure PoolResult where
     decides, or, when that key is not an entry and both orientations
     pass, the candidates of both, the second with `x` and `y` swapped;
     `.unordered` carries the candidates of the orientations, converting
-    or not, under which C++ accepts the pool, possibly none.
+    or not, under which C++ accepts the pool, possibly none. When the
+    top posting's key decides an orientation that converts and passes,
+    and the two entries are of different commodities, `.converts` also
+    carries the candidate of the opposite orientation if that one
+    converts and passes, the orientation that the swap of issue #1130
+    below would take.
 
     Known departures, each with the direction in which it fails:
     - the swap of issue #1130, which makes a COMMODITY_PRIMARY side the
       cost side `y` (xact.cc:425-431), is not modelled, because it
       depends on the history of price directives and earlier
-      exchanges. It changes which side is doubled and whether a lot
-      gain applies, and so can fail either way. A `C` directive, for
-      one, registers a price that marks its smaller unit primary
-      (textual_directives.cc:185-188, commodity.cc:73-75). Beside
-      `C 1 Kb = 1024 b`, C++ accepts `1024 b {$1}` against `$-1000`
-      without a gain, and it is rejected here (fail-closed); against a
-      same-sign `0.001 EUR` shown to two decimals, C++ doubles the
-      `1024 b` and rejects the transaction, while here the doubled
-      `EUR` rounds away and it is accepted (fail-open);
+      exchanges. The verdict here is that of the orientation that the
+      top posting's key decides, and `verifyExtended` refuses a
+      transaction whose verdict after an automated transaction depends
+      on the orientation. The swap changes which side is doubled and
+      whether a lot gain applies, and so the balancing verdict can fail
+      either way. A `C` directive, for one, registers a price that marks
+      its smaller unit primary (textual_directives.cc:185-188,
+      commodity.cc:73-75). Beside `C 1 Kb = 1024 b`, C++ accepts
+      `1024 b {$1}` against `$-1000` without a gain, and it is rejected
+      here (fail-closed); against a same-sign `0.001 EUR` shown to two
+      decimals, C++ doubles the `1024 b` and rejects the transaction,
+      while here the doubled `EUR` rounds away and it is accepted
+      (fail-open);
     - C++ compares the top posting's commodity as written with the
       entries as reduced (xact.cc:333, 422), so a top posting in a unit
       that a commodity equivalence reduces matches neither entry, and
@@ -1553,12 +1653,9 @@ private structure PoolResult where
     further departure, which the comment beside `costVal` records. -/
 private def impliedExchange (st : St) (xact pool : List PostSpec)
     (periodic : Bool := false) : Exchange :=
-  let keyOf := fun (p : PostSpec) (a : Amount) => ((a.comm,
-    if a.comm == "" then none else
-      p.lotUnit.map fun lu => (lu.comm, lu.q, p.fixated)) : LotKey)
   let bal := pool.foldl (init := CppSum.null) fun s p =>
     match p.amount with
-    | some a => s.add (keyOf p a) a.q
+    | some a => s.add (lotKeyOf p a) a.q
     | none => s
   let mustBal := xact.filter fun p => p.kind != .virtualUnbal && p.amount.isSome
   let top? := (mustBal.filter (·.annotated)).getLast? <|> mustBal.head?
@@ -1607,7 +1704,7 @@ private def impliedExchange (st : St) (xact pool : List PostSpec)
       -- ones included, moves into the real balance at the rate
       -- `|y/x|` in the commodity of `y` (xact.cc:454-465)
       let conv := mustBal.filterMap fun p => p.amount.bind fun a =>
-        if keyOf p a == x.1 then some (p.amtDecs, a.q) else none
+        if lotKeyOf p a == x.1 then some (p.amtDecs, a.q) else none
       let ratio := qy / qx
       let rate := if ratio < 0 then -ratio else ratio
       let moved := (conv.map (·.2)).sum
@@ -1646,9 +1743,16 @@ private def impliedExchange (st : St) (xact pool : List PostSpec)
     | _ => []
   -- the exchange of the orientation that the top posting's key decides;
   -- a declining one leaves the pool, and its candidate, to `balancePool`
-  -- (`PoolResult.candidates`)
+  -- (`PoolResult.candidates`). A converting one carries beside its
+  -- candidate that of the opposite orientation, which the swap of issue
+  -- #1130 takes for two entries of different commodities
+  -- (xact.cc:425-431), when that orientation converts and passes too
+  -- (`PoolResult.swapped`)
   let ofVerdict := fun (x y : LotKey × ℚ) (v : Verdict) => match v with
     | .passes _ => Exchange.converts (candidate x y v)
+        (if x.1.1 == y.1.1 then [] else match verdict y x with
+          | .passes r => [{ exchange := some (y, x), residual := r }]
+          | _ => [])
     | .fails => .fails
     | .declines _ => .declines
   if xact.any (·.costVal.isSome) then .declines
@@ -1656,7 +1760,7 @@ private def impliedExchange (st : St) (xact pool : List PostSpec)
     | .balance [x, y], some top =>
         if x.2 == 0 || y.2 == 0 || top.fixated then .declines
         else
-          let tk := top.amount.map (keyOf top)
+          let tk := top.amount.map (lotKeyOf top)
           if tk == some x.1 then ofVerdict x y (verdict x y)
           else if tk == some y.1 then ofVerdict y x (verdict y x)
           -- the order of the two entries decides (xact.cc:422-423,
@@ -1667,11 +1771,247 @@ private def impliedExchange (st : St) (xact pool : List PostSpec)
             let v' := verdict y x
             let both := candidate x y v ++ candidate y x v'
             match v, v' with
-            | .passes _, .passes _ => .converts both
+            | .passes _, .passes _ => .converts both []
             | .fails, .fails => .fails
             | .declines _, .declines _ => .declines
             | _, _ => .unordered both
     | _, _ => .declines
+
+/-- The check that C++ makes once more after an automated transaction.
+    `auto_xact_t::extend_xact` runs one rule at a time and, after a
+    rule that generated a posting that must balance, calls `verify()`
+    (src/xact.cc:1677-1684 and 1040-1110 at 76b9dc2b2). That sums the
+    real and bracket-virtual postings of the extended transaction into
+    one balance, each at its cost if it has one and else at its amount,
+    with no implicit exchange and without the allowance that Phase 8
+    makes for rounded per-unit costs (xact.cc:898-929), and tests the
+    balance at display precision. As Phase 8 does (xact.cc:879-896), it
+    first widens a cost commodity of display precision 0 to the
+    precision of the first cost in it whose precision is positive, a
+    derived cost excepted (xact.cc:1076-1091; `zeroTestPrec`). C++ also
+    extends and checks a periodic template (textual_xacts.cc:316-317).
+    Witness: under `= /Food/` with `Assets:Savings 0.1`, C++ rejects
+    `Expenses:Food 10.00 USD` against an elided `Assets:Cash`, printing
+    "Transaction does not balance" after "While applying automated
+    transaction".
+
+    `posts` are the transaction's postings before the extension,
+    `real` and `bracket` what `balancePool` made of its two pools, and
+    `batches` the triples of `applyAutos`, one list per rule. The
+    balance before the extension is the residual of a candidate of the
+    real pool, which is also what Phase 8 tests, together with the
+    residual of the bracket-virtual pool. A generated posting weighs
+    the cost written on its template posting, which C++ copies to it
+    (xact.cc:1611-1612; regress/2268 and
+    regress/coverage-auto-xact-post-cost are accepted only through it).
+    Otherwise, when the matched posting has a cost, written or computed
+    by Phase 3 in the orientation taken, and the generated amount
+    carries a lot price, it weighs the cost that C++ derives from that
+    price (xact.cc:1613-1627): the price per unit times the generated
+    quantity, or, for a lot written `{{T}}`, the price per unit
+    unscaled and negated for a negative quantity, since the annotation
+    keeps ANNOTATION_PRICE_NOT_PER_UNIT after amount parsing divides
+    the total by the quantity (amount.cc:1909-1923, `PostSpec.lotTotal`).
+    The lot price is:
+    - the template amount's own (`AutoPost.lotUnit`). C++ never reduces
+      that amount, so the price per unit of a `{{T}}` lot is `lotUnit`
+      times `lotScale`. Under `= /Food/` with `Assets:X 1 AAA {$5}` and
+      `Assets:Y $-5`, C++ accepts `Expenses:Food 10 EUR @ $1.10` against
+      an elided posting, deriving `$5` for `Assets:X`, and with
+      `Assets:Y -1 AAA` it rejects the transaction;
+    - else, when the generated amount copies the matched posting's
+      annotation (the flag of `applyAutos`), the lot price that the
+      matched posting writes. `finalize` reduces the matched amount at
+      its end (xact.cc:987-996), so the price per unit of a `{{T}}` lot
+      is `lotUnit` itself; a periodic template is not reduced, and
+      there it is `lotUnit` times `lotScale`. Beside `C 1 Kb = 1024 b`,
+      under `= /Food/` with `Assets:X 1` and `Assets:Y $-5`, C++ rejects
+      `Expenses:Food 2 Kb {{$10}} @ $5` against an elided posting,
+      deriving `$0.0048828125` for `Assets:X`, and accepts the same
+      postings in a periodic template, deriving `$5`;
+    - else, under the same flag in a transaction with a date, the
+      per-unit cost with which Phase 6 annotates the matched amount
+      (xact.cc:802-811, pool.cc:437, 508-522): the matched posting's
+      written cost per unit, or the rate `|y/x|` of Phase 3 when the
+      orientation converts that posting (xact.cc:454-465). A periodic
+      template has no Phase 6 (xact.cc:522), and its matched amounts
+      carry no such annotation.
+    Otherwise it weighs its amount. Paren-virtual postings are exempt.
+    A rule whose predicate matches only virtual or deferred postings
+    generates nothing here and so is not checked, a departure that the
+    docstring of `applyAutos` records.
+
+    The check runs in each orientation that `real.candidates` admits and
+    in the one of `real.swapped`, rule by rule over the weights of the
+    generated postings so far. A transaction that passes in every
+    orientation continues; one that fails in every orientation is
+    rejected with a reason that begins, as the other balance rejections
+    of `finalizeXact` do, `unbalanced transaction`; one whose verdict
+    depends on the orientation is refused as out of scope. The oracle
+    records neither which commodities are COMMODITY_PRIMARY (the #1130
+    entry of `impliedExchange`) nor the order in which C++ takes two
+    balance entries when neither is the top posting's key (balance.h:99,
+    xact.cc:422-423), and each of these decides the orientation.
+    Because the first is not recorded, the refusal also falls on a
+    transaction before which no price directive, `C` directive or
+    earlier exchange has marked any commodity primary, where C++ takes
+    the orientation that the top posting's key decides. Under
+    `= /Brokerage/` with `Expenses:Fees 0.01` and `Assets:Cash $-15.00`,
+    C++ accepts `Assets:Brokerage 10 AAPL {$150.00}` against
+    `Assets:Cash $-1500.00` as the first transaction of a journal, the
+    generated `0.1 AAPL {$150.00}` deriving the cost `$15.00`; that
+    orientation passes here and the opposite one fails, so the
+    transaction is refused. A record of the commodities that C++ marks
+    primary would narrow the refusal. A pool with no admissible
+    orientation, which C++ rejects in every order while `balancePool`
+    accepts it, is not checked again.
+
+    Known departures, each with the direction in which it fails:
+    - `verify()` keys every amount and cost as C++ keys it
+      (annotate.h:120-125), an amount annotated with a lot price, a date
+      or a note apart from plain units of its commodity, while the
+      weights here merge by commodity. Under `= /Assets:A/` with
+      `Assets:X 1` and `Assets:Y -10 AAA`, C++ rejects `10 AAA {$5}`
+      against `-10 AAA {$5}`, and under `= /Food/` with
+      `Assets:X 1 AAA {$5}` and `Assets:Y -1 AAA` it rejects
+      `Expenses:Food $10.00` against an elided posting, as it does with
+      `1 AAA [2026/01/01]` or `1 AAA (note)` in place of `1 AAA {$5}`;
+      all of these are accepted here (fail-open). Under
+      `format 1.00 AAA`, with `Assets:Y 0.004 AAA`, it accepts
+      `0.004 AAA {$1}` against `-0.004 AAA {$1}`, which is rejected here
+      (fail-closed);
+    - Phase 4, which gives every posting that must balance with a
+      fixated lot price and no cost a cost while two or more entries
+      remain after Phase 3 (xact.cc:475-518), is not modelled, so such
+      a matched posting has no cost here and derives none for the
+      postings generated from it. Under `= /Assets:A/`, C++ accepts
+      `10 AAA {=$5}` against `$-50` with `Assets:X 0.5` and
+      `Assets:Y $-25`, which is rejected here (fail-closed), and rejects
+      it with `Assets:X 1` and `Assets:Y -10 AAA`, which is accepted
+      here (fail-open);
+    - Phase 6 rounds the per-unit cost of its annotation at the amount's
+      precision, the cost commodity's display precision and six places
+      more (pool.cc:460-468), where this keeps the exact quotient.
+      Under `= /Expenses:Food/` with `Assets:X 3000000`, C++ rejects
+      `3 FOO @@ $1.00` against an elided posting when
+      `Assets:Y $-3000000.00` is added, which is accepted here
+      (fail-open), and accepts it with `Assets:Y $-2999999.97`, which is
+      rejected here (fail-closed). The per-unit price of a `{{T}}` lot is
+      rounded in the same way (amount.cc:1909-1923) and enters a derived
+      cost unscaled, so the two differ by less than a unit in the sixth
+      place beyond the display precision that its commodity had when
+      the lot was read; this could fail either way, and no journal is
+      known on which it changes the verdict;
+    - the flag of `applyAutos` also covers an amount expression whose
+      value is in the matched commodity, which C++ annotates only when
+      that value carries the annotation (xact.cc:1546-1549). Under
+      `= /Energy/` with `Assets:Rebate (100 kWh)`, C++ rejects
+      `100 kWh @@ 72.00 EUR` against an elided posting when
+      `Income:Rebate -72.00 EUR` is added, which is accepted here
+      (fail-open), and accepts it with `Income:Rebate -100 kWh`, which
+      is rejected here (fail-closed);
+    - the residual of a candidate is the balance that Phase 8 tests,
+      while `verify()` sums the costs that Phase 6 leaves, and these
+      differ for an exchange of two lots priced in one commodity: the
+      shape that the docstring of `PoolResult.candidates` gives is
+      accepted here and rejected by C++ (fail-open);
+    - `PostSpec.lotTotal` stands in for the mark that C++ keeps on the
+      interned commodity, and its docstring gives a journal on which
+      this departs in each direction;
+    - the display precision read here omits what the amounts of an
+      automated transaction teach C++ (`zeroTestPrec`), and this can
+      fail either way. Under `= /Food/` with `Assets:Savings $0.001`,
+      C++ rejects `Expenses:Food $10.00` against an elided posting,
+      which is accepted here (fail-open). Under `= /Food/` with
+      `Assets:X 0.1` and `Assets:Y -0.33 XYZ`, C++ accepts
+      `Expenses:Food 10 EUR @ 0.333 XYZ` against an elided posting,
+      since `-0.33 XYZ` gives `XYZ` a display precision of 2 and so
+      `verify()` widens nothing, while here the written cost widens
+      `XYZ` to three places and the remainder `0.003 XYZ` rejects it
+      (fail-closed);
+    - `verify()` also rejects a posting whose cost is in the commodity
+      of its own amount (xact.cc:1064-1070), which is not checked here
+      (fail-open). Under `= /Food/` with `Assets:X 1 USD @ 1 USD` and
+      `Assets:Y -1 USD`, C++ rejects `Expenses:Food 10.00 USD` against
+      an elided posting. A template amount without a commodity, such as
+      `1 @ $1`, meets the same rejection beside a matched amount in `$`
+      through the multiplication that the template parser does not
+      model (`finalizeAuto`). Phase 6 makes the same check on a written
+      posting with a cost (xact.cc:679-681), and `finalizeXact` does
+      not make it either, so `A $10 @ $1` against `B` is accepted here
+      (fail-open). -/
+private def verifyExtended (st : St) (hline : Nat) (posts : List PostSpec)
+    (real bracket : PoolResult)
+    (batches : List (List (PostSpec × PostSpec × Bool)))
+    (periodic : Bool) : Except String Unit :=
+  let absQ := fun (q : ℚ) => if q < 0 then -q else q
+  -- the weight of a generated posting `g` under the orientation `o`,
+  -- `m` being the posting it was generated from and `d` the flag of
+  -- `applyAutos`
+  let weight := fun (o : PoolCandidate) (t : PostSpec × PostSpec × Bool) =>
+    let (m, g, d) := t
+    g.amount.map fun ga =>
+      -- the cost derived from the lot price `lu` per unit; for a lot
+      -- marked as a total, the price per unit of the amount as C++
+      -- holds it is `lu` times `scale`
+      let ofLot := fun (lu : Amount) (total : Bool) (scale : ℚ) =>
+        (lu.comm, if !total then lu.q * ga.q
+          else if ga.q < (0 : ℚ) then -(lu.q * scale) else lu.q * scale)
+      let derived : Option (String × ℚ) := do
+        let ma ← m.amount
+        -- the matched posting has a cost: written, or computed by
+        -- Phase 3 in this orientation
+        let converted := match o.exchange with
+          | some ((kx, _), _) => lotKeyOf m ma == kx
+          | none => false
+        guard (m.costVal.isSome || converted)
+        match g.lotUnit with
+        | some lu => pure (ofLot lu g.lotTotal g.lotScale)
+        | none =>
+          guard (d && ma.comm != "")
+          match m.lotUnit, m.costVal, o.exchange with
+          | some lu, _, _ =>
+              pure (ofLot lu m.lotTotal (if periodic then m.lotScale else 1))
+          | none, some cv, _ =>
+              guard (!periodic)
+              pure (cv.comm, absQ (cv.q / ma.q) * ga.q)
+          | none, none, some ((_, qx), ((cy, _), qy)) =>
+              guard (!periodic)
+              pure (cy, absQ (qy / qx) * ga.q)
+          | none, none, none => none
+      ((g.costVal.map fun c => (c.comm, c.q)) <|> derived).getD (ga.comm, ga.q)
+  let merge := fun (es : List (String × ℚ)) =>
+    es.foldl (init := ([] : List (String × ℚ))) fun acc (c, q) =>
+      if acc.any (·.1 == c) then
+        acc.map fun (c', s) => (c', if c' == c then s + q else s)
+      else acc ++ [(c, q)]
+  let virt := (bracket.candidates.head?.map (·.residual)).getD []
+  -- under `o`, the remainder of the first check that fails, if one does;
+  -- the widening reads the costs of the postings generated so far
+  let failure := fun (o : PoolCandidate) => Id.run do
+    let mut gens : List PostSpec := []
+    let mut ws : List (String × ℚ) := []
+    for batch in batches do
+      gens := gens ++ batch.map (·.2.1)
+      let mb := batch.filter fun (_, g, _) => g.kind != .virtualUnbal
+      if mb.isEmpty then continue
+      ws := ws ++ mb.filterMap (weight o)
+      let r := (merge (o.residual ++ virt ++ ws)).filter fun (_, s) => s != 0
+      unless r.all (fun (c, s) => if c == "" then s == 0
+          else roundsToZeroAt (zeroTestPrec st (posts ++ gens) c) s) do
+        return some r
+    return none
+  let failures := (real.candidates ++ real.swapped).map failure
+  match failures.filterMap id with
+  | [] => pure ()
+  | r :: _ =>
+      if failures.all (·.isSome) then
+        err hline (s!"unbalanced transaction after automated transaction " ++
+          s!"(residual in {r.length} commodities)")
+      else
+        err hline ("out-of-scope automated posting weighed through an implicit " ++
+          "exchange whose orientation depends on commodity primacy (#1130) or on " ++
+          "the order of the balance entries")
 
 /-- Finalize a pending transaction into flows. With `periodic` the
     postings are those of a periodic template `~`: its UUID is not
@@ -1781,6 +2121,7 @@ private def finalizeXact (st : St) (hline : Nat) (_header : String)
           lotUnit := p.lotUnit.map fun lu =>
             let c := canonAmt stv lu
             if scale == 0 then c else ⟨c.comm, c.q / scale⟩
+          lotScale := if scale == 0 then 1 else scale
           assignTarget := p.assignTarget.map (canonAmt stv) }
         posts := p :: posts
     | none => pure ()
@@ -1856,8 +2197,9 @@ private def finalizeXact (st : St) (hline : Nat) (_header : String)
   -- per-unit costs, and it widens by the cost of every posting of the
   -- extended transaction (xact.cc:1076-1091), the cost that a generated
   -- posting copies from its template posting included
-  -- (xact.cc:1611-1612), while `zeroTestPrec` here reads only the
-  -- postings from before the extension
+  -- (xact.cc:1611-1612). This test reads only the postings from before
+  -- the extension, and `verifyExtended` reads the generated postings
+  -- as well
   let settlesWide := fun (c : String) (s : ℚ) =>
     if c == "" then s == 0
     else roundsToZeroAt (zeroTestPrec stv rposts c) s
@@ -1992,7 +2334,8 @@ private def finalizeXact (st : St) (hline : Nat) (_header : String)
                          | _ => [{ residual :=
                              if alone1 then residualExact else residual2 }] }
               match exch with
-              | .converts cs => pure { posts := pool, candidates := cs }
+              | .converts cs sw =>
+                  pure { posts := pool, candidates := cs, swapped := sw }
               | .fails => unbalanced
               | _ =>
                 if (unordered && residualExact.length == 2) || alone1 then
@@ -2054,9 +2397,10 @@ private def finalizeXact (st : St) (hline : Nat) (_header : String)
     c != ' ' && c != '=')
   let headerNote := (splitNote _header).2
   let xactNotes := headerNote ++ ";" ++ String.intercalate ";" leadNotes
-  let (finalPosts, _autoBatches) :=
+  let (finalPosts, autoBatches) :=
     applyAutos stv (headerDateF stv.dfmt stv.defaultYear _header)
       hpayee hcode dateTok xactNotes completed
+  verifyExtended stv hline rposts realDone virtDone autoBatches periodic
   -- account payee-rules: an xact whose payee matches maps postings to
   -- the declared account's Unknown slot (cov4-directive-account-payee)
   let payee := hpayee
@@ -2406,13 +2750,24 @@ private def finalizeAuto (st : St) (rawPosts : List (Nat × String)) :
         let (kind, name) ← accountKind ln acctField
         match amtField with
         | none =>
-            -- amountless template mirrors the matched posting
-            posts := ⟨name, kind, none, 1, none⟩ :: posts
+            -- amountless template mirrors the matched posting. C++ instead
+            -- rejects a matched template posting with neither an amount
+            -- nor an amount expression, "Automated transaction's posting
+            -- has no amount" (xact.cc:1529-1531, regress/716,
+            -- regress/coverage-xact-auto-noamount). Those two files were
+            -- accepted here; `verifyExtended` now rejects them as
+            -- unbalanced, a different reason, since the mirrored posting
+            -- must balance. Under `= /Food/` with `Assets:X` and
+            -- `Assets:Y -1`, C++ rejects `Expenses:Food 10.00 USD` against
+            -- an elided posting, and the generated postings balance here,
+            -- so it is accepted (fail-open)
+            posts := { account := name, kind, fixed := none, mult := 1 } :: posts
         | some f =>
             let f := trimS f
             if f.startsWith "(" then
               -- expression template, evaluated per matched posting
-              posts := ⟨name, kind, none, 1, some f⟩ :: posts
+              posts := { account := name, kind, fixed := none, mult := 1
+                         exprSrc := some f } :: posts
             else
             -- bare number = multiplier; otherwise fixed amount. C++
             -- multiplies by every template amount without a commodity
@@ -2431,14 +2786,26 @@ private def finalizeAuto (st : St) (rawPosts : List (Nat × String)) :
               match readNumToken (some false) (cs.takeWhile fun c =>
                   c.isDigit || c == '.' || c == ',') with
               | some (q, _, _) =>
-                  posts := ⟨name, kind, none, if neg then -q else q, none⟩ :: posts
+                  posts := { account := name, kind, fixed := none
+                             mult := if neg then -q else q } :: posts
               | none => err ln s!"malformed multiplier '{f}'"
             else do
               let r ← parseAmount st.amt ln f
-              -- cost/lot annotations on template amounts parse and
-              -- drop: extended posts flow at face value (2268)
-              let _ ← annotLoop st.amt ln r.amount r.tail none none
-              posts := ⟨name, kind, some r.amount, 1, none⟩ :: posts
+              -- extended posts flow at face value (2268). The cost of a
+              -- template amount is kept, as C++ keeps it on the template
+              -- posting (textual_xacts.cc:699-710), and so is its own lot
+              -- price, which C++ keeps on an amount with a commodity
+              -- (amount.cc:1908). `verifyExtended` weighs a generated
+              -- posting by the cost (regress/2268) or by the cost that
+              -- C++ derives from the lot price (xact.cc:1613-1627)
+              let ann ← annotLoop st.amt ln r.amount r.tail none none
+              let ownLot := ann.ownLot && r.amount.comm != ""
+              posts := { account := name, kind, fixed := some r.amount, mult := 1
+                         cost := ann.cost
+                         costPrec := if ann.perUnit then ann.costDecs + r.decimals
+                           else ann.costDecs
+                         lotUnit := if ownLot then ann.lot.map (·.1) else none
+                         lotTotal := ownLot && ann.lotLit.any (·.2) } :: posts
       pure { st with
         autos := st.autos ++ [⟨branches, posts.reverse, nm, true, noteTag⟩]
         autoPred := rest }
@@ -2767,12 +3134,14 @@ private def flushPending (st : St) : Except String St := do
       -- assertion or assignment `=` in a template, which C++ reads with
       -- no transaction (textual_xacts.cc:952), so that the `=` is never
       -- taken as one (textual_xacts.cc:743) and is refused as an
-      -- unexpected character; an automated transaction whose postings
-      -- unbalance a template, which C++ applies and checks again
-      -- (textual_xacts.cc:317, xact.cc:1683-1684); and a period
-      -- expression that C++ cannot read, or a note after it, which C++
-      -- rejects (textual_xacts.cc:303, baseline/cmd-source.test) and
-      -- which is not read here
+      -- unexpected character; and a period expression that C++ cannot
+      -- read, or a note after it, which C++ rejects
+      -- (textual_xacts.cc:303, baseline/cmd-source.test) and which is
+      -- not read here. C++ applies the automated transactions to a
+      -- template and checks it again (textual_xacts.cc:316-317,
+      -- xact.cc:1683-1684), and `verifyExtended` does the same, with no
+      -- lot price from Phase 6 on a matched posting, since Phase 6 runs
+      -- only for a transaction with a date (xact.cc:522)
       match finalizeXact { st with pending := .none } ln h posts.reverse
           (periodic := true) with
       | .ok _ => pure { st with pending := .none }
