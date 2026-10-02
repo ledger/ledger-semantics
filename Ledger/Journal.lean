@@ -71,9 +71,17 @@ outputs (the `SemanticBisimulation` ctest is the standing check):
     Equity:Opening Balances (baseline/cmd-equity).
 - **Assignments** `= AMT` on an amountless posting: computed
   sequentially against the running account balance including earlier
-  postings of the same transaction (regress/1005). With an amount
-  present it is an assertion: positive tests pass their assertions by
-  definition, so it is checked *by the C++ side* and dropped here.
+  postings of the same transaction (regress/1005). A real assignment
+  leaves out the virtual postings when its account has a real posting
+  in an earlier transaction, in any commodity (#543, #1699). A target
+  without a commodity is measured against every commodity that the
+  account holds or that its earlier postings in the transaction bring;
+  as in C++, a difference left in more than one commodity rejects the
+  journal unless every amount left rounds to zero (balance.h:473-480),
+  and otherwise the single amount left is posted, or a zero when what
+  is left rounds to zero. With an amount present it is an assertion:
+  positive tests pass their assertions by definition, so it is checked
+  *by the C++ side* and dropped here.
 - **Auto-xacts** `= /regex/`: template postings (fixed amounts or
   bare multipliers × the matched posting's amount) are appended per
   matching real posting of each later transaction — after balancing,
@@ -300,6 +308,32 @@ private inductive Pending where
   | commBlock (comm : String)
   | ignoreBlock
 
+/-- The kind of a posting recorded in `St.datedEvents`, as a balance
+    assignment reads it (compute_balance_diff, textual_xacts.cc:398-438).
+    A timelog posting (POST_IS_TIMELOG, timelog.cc:67, 86) never makes
+    an account's balance real-only, yet stays in the real-only balance,
+    from which C++ leaves out only virtual postings. A deferred posting
+    is recorded as a virtual one, and a deferred assignment, or a
+    deferred earlier posting of the assignment's transaction, is read as
+    virtual as well. This departs from C++ in three ways. C++ holds a
+    deferred posting back from its account until the whole journal is
+    read (xact.cc:1001-1003, textual.cc:413), so that no assignment
+    reads one from an earlier transaction; it reads a deferred
+    assignment as a real one in choosing the real-only balance
+    (textual_xacts.cc:399); and it subtracts an earlier deferred posting
+    of the transaction from that balance (textual_xacts.cc:467-469).
+    With `<Assets:A>  $10` before, `Assets:A  = 0` against `Assets:B`
+    posts a zero in C++ and moves the `$10` to `Assets:B` here, and so
+    does `Assets:A  = $0`; with `Assets:A  $5` and `(Assets:A)  $10`
+    before, C++ posts `$-5` for `<Assets:A>  = 0`, and `$-15` is posted
+    here (wrong rows); with `Assets:A  $10` before, `<Assets:A>  5 EUR`
+    followed by `Assets:A  = 0` in one transaction is rejected by C++
+    and accepted here (fail-open), and `<Assets:A>  $3` followed by
+    `Assets:A  = 0` posts `$-13` in C++ and `$-10` here (wrong rows). -/
+private inductive EvKind where
+  | real | virt | timelog
+  deriving DecidableEq
+
 structure St where
   amt : AmtCtx := {}
   /-- commodity aliases (from `commodity` block `alias` subs) -/
@@ -319,7 +353,7 @@ structure St where
   defaultYear : Option Int := none
   uuids : List String := []
   balances : List ((String × String) × ℚ) := []
-  datedEvents : List ((String × String) × Int × ℚ × Bool) := []
+  datedEvents : List ((String × String) × Int × ℚ × EvKind) := []
   gens : List (List (Account × ℚ)) := []   -- reversed
   pending : Pending := .none
   clockIn : List (ℚ × String) := []
@@ -2140,41 +2174,164 @@ private def finalizeXact (st : St) (hline : Nat) (_header : String)
     let l := upd l (k.1, k.2, false)
     if isReal then upd l (k.1, k.2, true) else l
   let xd := (headerDateF stv.dfmt stv.defaultYear _header).getD 0
+  -- the account's balance as of this transaction's date (#1092,
+  -- textual_xacts.cc:430-438). The real-only balance leaves out only
+  -- the virtual postings, so a timelog posting stays in it
+  -- (textual_xacts.cc:435, and account.cc:868 in file order). C++
+  -- compares the date of each earlier posting itself (`post_t::date`,
+  -- post.cc:143-174), which a posting note `; [DATE]` sets, while every
+  -- event here carries the date of its transaction, a known departure:
+  -- with `20 EUR` and `$10  ; [2024/12/01]` posted to `Assets:A` on
+  -- 2024/01/01, C++ reads only the euros for `Assets:A  = 0` on
+  -- 2024/06/01 and posts `-20 EUR`, which is rejected here
+  -- (fail-closed), and for `Assets:A  = $0` it posts a zero, where the
+  -- dollars are moved out here (wrong rows). An assignment also reads
+  -- its account as written, while C++ reads it after a payee rule has
+  -- mapped an `Unknown` account (journal_t::register_account,
+  -- journal.cc:179-188), and the balances here are kept under the mapped
+  -- name (`acctFor` below), a further departure: under
+  -- `account Expenses:Food` with `payee Grocer`, after `$10` and `20 EUR`
+  -- posted to `Expenses:Unknown` by the payee `Grocer`, C++ rejects
+  -- `Expenses:Unknown  = 0` in a later transaction of that payee, which
+  -- is accepted here (fail-open)
   let balAsOf := fun (acct comm : String) (realOnly : Bool) =>
-    stv.datedEvents.foldl (init := (0 : ℚ)) fun acc ((a, c), d, q, isReal) =>
-      if a == acct && c == comm && d <= xd && (!realOnly || isReal)
+    stv.datedEvents.foldl (init := (0 : ℚ)) fun acc ((a, c), d, q, k) =>
+      if a == acct && c == comm && d <= xd && (!realOnly || k != .virt)
       then acc + q else acc
-  let hasRealPost := fun (acct comm : String) =>
-    stv.datedEvents.any fun ((a, c), _, _, isReal) =>
-      a == acct && c == comm && isReal
   for p in ordered do
     match p.assignTarget with
     | some target =>
-        -- a REAL assignment measures the real-only balance when the
-        -- account has prior real postings, else the combined balance
-        -- (#543/#1699, compute_balance_diff); virtual assignments
-        -- always measure the combined balance
-        let realOnly := fun (c : String) =>
-          p.kind == .real && hasRealPost p.account c
-        if target.comm == "" && target.q == 0 then
-          -- bare `=0`: zero the account across every commodity it
-          -- holds (regress/1587)
-          let comms := (stv.balances.filterMap fun ((acct, c), _) =>
-            if acct == p.account then some c else none).eraseDups
-          for c in comms do
-            let key := (p.account, c)
-            let cur := balAsOf p.account c (realOnly c)
-              + ((intra.lookup (key.1, key.2, realOnly c)).getD 0)
-            if cur != 0 then
-              let q := -cur
-              intra := addIntra intra key (p.kind == .real) q
-              resolved := { p with amount := some ⟨c, q⟩
-                                   assignTarget := none } :: resolved
+        -- a REAL assignment measures the real-only balance when the account
+        -- has a prior real posting, else the combined balance (#543/#1699);
+        -- virtual assignments always measure the combined balance. C++
+        -- makes this choice once for the account, from its postings in
+        -- every commodity and on every date, whether or not they have an
+        -- amount (an elided posting that the balancing leaves without one
+        -- is recorded below), and a timelog posting does not count as real
+        -- in it (compute_balance_diff, textual_xacts.cc:398-409): with
+        -- `$10` in `Assets:A` and `(Assets:A)  20 EUR` before,
+        -- `Assets:A  = 0` measures `$10` and no euros, and posts `$-10`.
+        -- A deferred assignment always measures the combined balance here,
+        -- a departure recorded at `EvKind`
+        let realOnly := p.kind == .real && stv.datedEvents.any
+          fun ((a, _), _, _, k) => a == p.account && k == .real
+        let curOf := fun (c : String) => balAsOf p.account c realOnly
+          + ((intra.lookup (p.account, c, realOnly)).getD 0)
+        if target.comm == "" then
+          -- a target without a commodity (textual_xacts.cc:817-871). C++
+          -- subtracts from the target the account's balance and the
+          -- account's earlier postings in this transaction, with lot
+          -- annotations stripped, so that the lots of one commodity count
+          -- as one (compute_balance_diff, textual_xacts.cc:390-479), and
+          -- every exact zero leaves the difference (balance.cc:162-170).
+          -- When every amount left rounds to zero at its display precision
+          -- (textual_xacts.cc:842; an amount without a commodity only when
+          -- it is exactly zero, amount.cc:1374-1430), C++ posts a zero
+          -- without a commodity and leaves the account as it is
+          -- (textual_xacts.cc:866). Otherwise it posts the difference
+          -- converted to an amount by `balance_t::to_amount`, which throws
+          -- "Cannot convert a balance with multiple commodities to an
+          -- amount" when more than one commodity is left
+          -- (textual_xacts.cc:851-858, balance.h:473-480). With `$10` and
+          -- `20 EUR` in `Assets:A`, `Assets:A  = 0` against an elided
+          -- `Assets:B` is rejected by C++ and here, and so are
+          -- `Assets:A  = 5` when `Assets:A` holds `$10` alone, and
+          -- `Assets:A  = 0` after `Assets:A  5 EUR` in the same transaction
+          -- when it holds `$10` before. With `5` and `$10` in `Assets:A`,
+          -- `Assets:A  = 5` posts `$-10`. Over a single commodity,
+          -- `Assets:A  = 0` posts the negated balance and so zeroes the
+          -- account (regress/1587), but over `($1 / 3)` alone, which shows
+          -- as `$0`, it posts a zero, so that a later `($1 / 3)` makes the
+          -- account show `$1`. An amount that the account holds in a
+          -- commodity as a single inferred amount, one that C++ tags with
+          -- the precision of the cost that it balances (BIGINT_COST_PREC,
+          -- xact.cc:211-226), keeps the tag in the difference unless an
+          -- earlier posting of the transaction in that commodity is
+          -- subtracted from it, since a sum drops it (amount.cc:634-642,
+          -- 677-681), and C++ then takes it as zero only when it is exactly
+          -- zero (amount.cc:1384-1402, issue #1692); the account's flows
+          -- are counted as `Driver` counts them for a lone inferred balance
+          -- (`flowStats`). After `$1.00` in `Assets:C` and
+          -- `Assets:B  1 FOO @ $0.0004` against an elided `Assets:A` (the
+          -- cost shape), `Assets:A  = 0` posts `$0.0004` and so zeroes the
+          -- account, and with `Assets:B  1 BAR @ 0.0004 EUR` beside the
+          -- `FOO`, it is rejected by C++ and here. The commodities
+          -- considered are those of the account's balance and of its
+          -- earlier postings in this transaction. Six departures are
+          -- known, in the precision or the commodities of the difference.
+          -- First, the display precision is the one learned from every
+          -- posting of the transaction, while C++ has learned it only from
+          -- the amounts before the assignment, so that a later posting that
+          -- widens it makes a difference that C++ takes as zero be rejected
+          -- here when it is left in more than one commodity (fail-closed),
+          -- and be posted here when it is left in one (wrong rows): over
+          -- `($1 / 3)` and `(1 EUR / 3)`, `Assets:A  = 0` followed by
+          -- `Assets:C  $0.0001` is accepted by C++, and over `($1 / 3)`
+          -- alone C++ leaves `$0.3333` in `Assets:A`, which is zeroed here.
+          -- Second, the precision can be narrower here, since a periodic
+          -- template and the postings of an automated transaction teach C++
+          -- the precision of their amounts and the oracle nothing (see
+          -- `flushPending`, and `zeroTestPrec` for the other sources that
+          -- the oracle does not read): after a template with
+          -- `Assets:Z  $0.001`, or after `= /^NEVER/` with
+          -- `(Assets:Z)  $0.001`, C++ rejects `Assets:A  = 0` over
+          -- `($1 / 3)` and `(1 EUR / 3)`, which is accepted here
+          -- (fail-open). Third,
+          -- C++ has not yet reduced the amounts of this transaction through
+          -- commodity equivalences (textual_xacts.cc:583-587; they are
+          -- reduced in finalize, xact.cc:996), while the reader reduces
+          -- each as it reads it (`canonAmt`), so that two units of one
+          -- equivalence are two commodities there and one here: under
+          -- `C 1 EUR = 100 CENT`, with `1 EUR` in `Assets:A` from before,
+          -- `Assets:A  1 EUR` followed by `Assets:A  = 0` in one
+          -- transaction is rejected by C++ and accepted here (fail-open).
+          -- Fourth, the flows that decide a tag are counted here on every
+          -- date and of every kind, while C++ reads only those of the
+          -- balance it measures, so that a single inferred amount beside a
+          -- later posting in its commodity, or beside a virtual one when the
+          -- real-only balance is measured, is read here at display
+          -- precision: after the cost shape, `Assets:A  (1 EUR / 3)`, and
+          -- `Assets:A  $1.00` dated after the assignment, C++ rejects
+          -- `Assets:A  = 0`, which is accepted here (fail-open). A posting of
+          -- exactly zero, which C++ neither adds to a balance nor subtracts
+          -- from one (balance.cc:122-123, 162-163), counts here as well, as
+          -- a flow or as an earlier posting of the transaction: after the
+          -- cost shape and `Assets:A  (1 EUR / 300)`, `Assets:A  $0` followed
+          -- by `Assets:A  = 0` in one transaction is rejected by C++ and
+          -- accepted here (fail-open), and so is the same `$0` posted in an
+          -- earlier transaction. Fifth, the amount that C++ posts keeps the
+          -- tag (balance.h:477-478), and the posting that balances the
+          -- assignment takes it over (xact.cc:234-237), so that after the
+          -- cost shape C++ shows `$-0.0004` in the `Assets:D` that balances
+          -- `Assets:A  = 0`, which shows as zero here (wrong rows, as before
+          -- this rule, and with a target of `$0` as well). Sixth, the price
+          -- precision that tags an amount is recovered here from the
+          -- postings of its own balancing pool alone, a departure recorded
+          -- at `pricePrec`
+          let comms := ("" :: (stv.balances.filterMap fun ((acct, c), _) =>
+              if acct == p.account then some c else none)
+            ++ intra.filterMap fun ((acct, c, _), _) =>
+              if acct == p.account then some c else none).eraseDups
+          let left := comms.filterMap fun c =>
+            let d := (if c == "" then target.q else 0) - curOf c
+            if d == 0 then none else some (c, d)
+          let tagged := fun (c : String) =>
+            stv.flowStats.lookup (p.account, c) == some (1, 1)
+              && (intra.lookup (p.account, c, realOnly)).isNone
+          let shownZero := fun ((c, d) : String × ℚ) =>
+            c != "" && !tagged c && roundsToZero stv c d
+          if left.length > 1 && !left.all shownZero then
+            err p.line (s!"balance assignment without a commodity leaves " ++
+              s!"a balance in {left.length} commodities")
+          let amt : Amount := match left with
+            | [(c, d)] => if shownZero (c, d) then ⟨"", 0⟩ else ⟨c, d⟩
+            | _ => ⟨"", 0⟩
+          intra := addIntra intra (p.account, amt.comm) (p.kind == .real) amt.q
+          resolved := { p with amount := some amt
+                               assignTarget := none } :: resolved
         else
         let key := (p.account, target.comm)
-        let cur := balAsOf p.account target.comm (realOnly target.comm)
-          + ((intra.lookup (key.1, key.2, realOnly target.comm)).getD 0)
-        let diff := target.q - cur
+        let diff := target.q - curOf target.comm
         let p := { p with amount := some ⟨target.comm, diff⟩
                           assignTarget := none }
         intra := addIntra intra key (p.kind == .real) diff
@@ -2237,23 +2394,50 @@ private def finalizeXact (st : St) (hline : Nat) (_header : String)
       else if c == "" then s == 0
       else roundsToZero stv c s
     let elided := pool.filter fun p => p.amount.isNone && p.assignTarget.isNone
+    -- COST_PREC tagging: an inferred amount is tagged only when it fits
+    -- the price precision recovered from a cost in its commodity
+    -- (set_cost_prec_if_needed, xact.cc:195-231). C++ scans every
+    -- posting of the transaction (xact.cc:210) and this scans the pool
+    -- alone, a departure: after `$1.00` in another account, with
+    -- `Assets:B  1 FOO @ $0.0004` against an elided `Assets:C`, and
+    -- `[Assets:E]  ($1 / 2500)` against an elided `[Assets:A]`, C++ shows
+    -- `$-0.0004` in `Assets:A`, which shows as zero here (wrong rows),
+    -- and with `(Assets:A)  (1 EUR / 300)` later, C++ rejects
+    -- `Assets:A  = 0`, which is accepted here (fail-open)
+    let pricePrec := fun (c : String) =>
+      pool.foldl (init := (0 : Nat)) fun acc p =>
+        match p.costVal with
+        | some cv =>
+            if cv.comm == c && p.costDecs > 0 then
+              max acc (if p.costDecs > p.amtDecs then
+                p.costDecs - p.amtDecs else p.costDecs)
+            else acc
+        | none => acc
+    let costTagged := fun (c : String) (s : ℚ) =>
+      let pp := pricePrec c
+      pp > 0 && roundAt pp s == s
     match elided with
     | [] =>
         if residualExact.isEmpty then pure { posts := pool }
         -- the `bucket` (`A`, account `default`) completes only a
         -- transaction of exactly ONE parsed posting of any kind,
-        -- counted before a bare `=0` fans out and before automated
-        -- postings; with two or more postings the residual is left to
-        -- the implicit-exchange, rounding, second-pass lot-value and
-        -- error cases below
+        -- counted before automated postings; with two or more postings
+        -- the residual is left to the implicit-exchange, rounding,
+        -- second-pass lot-value and error cases below
         -- (xact.cc:368 `posts.size() == 1 && !balance.is_null()`, the
         -- second conjunct implied by a nonzero real residual;
         -- regress/coverage-bucket-single-post)
         else match (if isReal && ordered.length == 1 then st.bucket else none) with
           | some b =>
-              -- bucket names were resolved when declared
+              -- bucket names were resolved when declared. C++ adds a null
+              -- posting to the bucket (xact.cc:368-372), which it fills as
+              -- it fills an elided one, so that it tags the amount only
+              -- under the cost rule above (xact.cc:829-837, 234-237): after
+              -- `$1.00` in `Assets:Y`, `Assets:X  ($1/1000)` alone leaves an
+              -- untagged `$-0.001` in the bucket, which shows as zero and
+              -- which a later balance assignment reads at display precision
               let comps := residualExact.map fun (c, s) =>
-                { line := hline, inferred := true
+                { line := hline, inferred := costTagged c s
                   account := b
                   kind := PostKind.real, amount := some ⟨c, -s⟩ : PostSpec }
               pure { posts := pool ++ comps }
@@ -2355,21 +2539,8 @@ private def finalizeXact (st : St) (hline : Nat) (_header : String)
                   accepted
                 else unbalanced
     | [e] =>
-        -- COST_PREC tagging: only when the inferred value fits the
-        -- recovered price precision (set_cost_prec_if_needed, 2174)
-        let pricePrec := fun (c : String) =>
-          pool.foldl (init := (0 : Nat)) fun acc p =>
-            match p.costVal with
-            | some cv =>
-                if cv.comm == c && p.costDecs > 0 then
-                  max acc (if p.costDecs > p.amtDecs then
-                    p.costDecs - p.amtDecs else p.costDecs)
-                else acc
-            | none => acc
         let comps := residualExact.map fun (c, s) =>
-          let pp := pricePrec c
-          let fits := pp > 0 && roundAt pp s == s
-          { line := e.line, inferred := fits, note := e.note
+          { line := e.line, inferred := costTagged c s, note := e.note
             account := e.account, kind := e.kind
             amount := some ⟨c, -s⟩ : PostSpec }
         let kept := pool.filter fun p => !(p.amount.isNone && p.assignTarget.isNone)
@@ -2421,8 +2592,22 @@ private def finalizeXact (st : St) (hline : Nat) (_header : String)
         stv := bumpBal stv nm a.comm a.q
         stv := bumpStat stv nm a.comm p.inferred
         stv := { stv with datedEvents :=
-          ((nm, a.comm), xd, a.q, p.kind == .real) :: stv.datedEvents }
+          ((nm, a.comm), xd, a.q, if p.kind == .real then .real else .virt)
+            :: stv.datedEvents }
     | none => pure ()
+  -- C++ adds every posting that is not deferred to its account, with or
+  -- without an amount (xact.cc:1001-1005), and so an elided real posting
+  -- that the balancing leaves at zero (xact.cc:829-842), which is dropped
+  -- here, still makes a later real assignment to its account measure the
+  -- real-only balance (textual_xacts.cc:399-406); an event of no amount,
+  -- recorded for every elided real posting, stands for it: with
+  -- `Assets:A` elided against `$10` and `$-10`, and `(Assets:A)  $10` and
+  -- `(Assets:A)  20 EUR` after, `Assets:A  = 0` reads no balance and posts
+  -- a zero
+  for p in rposts do
+    if p.kind == .real && p.amount.isNone then
+      stv := { stv with datedEvents :=
+        ((acctFor p.account, ""), xd, 0, .real) :: stv.datedEvents }
   pure { stv with gens := flows :: stv.gens }
 
 /-- Split on a separator word at paren/quote depth zero. -/
@@ -3408,11 +3593,13 @@ def run (input0 : String) (dcDefault : Bool := false)
             for (a, dq) in flows do
               st := bumpBal st a.name a.commodity dq
               st := bumpStat st a.name a.commodity false
-              -- POST_IS_TIMELOG: visible to assignments' combined
-              -- balance but never to the real-only side
+              -- POST_IS_TIMELOG (timelog.cc:67, 86): it never makes an
+              -- account's balance real-only, yet stays in the real-only
+              -- balance, from which C++ leaves out only virtual postings
+              -- (textual_xacts.cc:398-409, 435)
               st := { st with datedEvents :=
                 ((a.name, a.commodity), ((stop / 86400 : ℚ).floor : Int),
-                 dq, false) :: st.datedEvents }
+                 dq, .timelog) :: st.datedEvents }
       else if t.startsWith "= " then
         -- auto-xact: compile predicate, collect template block;
         -- also `= NAME disable` / `= NAME enable` toggles
