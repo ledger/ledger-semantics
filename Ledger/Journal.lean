@@ -344,6 +344,8 @@ structure St where
   precisions : List (String × Nat) := []
   /-- commodity = factor × base (C directives; seeded with time) -/
   equivs : List (String × ℚ × String) := [("h", 3600, "s"), ("m", 60, "s")]
+  /-- account aliases: name → target, the target named under the
+      `apply account` stack when the directive was read -/
   aliases : List (String × String) := []
   rewrites : List (Rx × String) := []
   applyStack : List (Option String) := []
@@ -356,7 +358,10 @@ structure St where
   datedEvents : List ((String × String) × Int × ℚ × EvKind) := []
   gens : List (List (Account × ℚ)) := []   -- reversed
   pending : Pending := .none
-  clockIn : List (ℚ × String) := []
+  /-- open timelog check-ins: the time, the account named under the
+      `apply account` stack before any alias expands, and the
+      check-in's description (`timelogAccount`) -/
+  clockIn : List (ℚ × String × String) := []
   nowSecs : Option ℚ := none
   recursiveAliases : Bool := false
   errFlag : Bool := false
@@ -553,14 +558,21 @@ private def bumpBal (st : St) (acct comm : String) (dq : ℚ) : St :=
           if k = key then (k, v + dq) else (k, v) }
   | none => { st with balances := (key, dq) :: st.balances }
 
-/-- Resolve an account name: exact alias, then `apply account`
-    prefixes (innermost last). -/
-private def resolveAccount (st : St) (name : String) : String :=
-  -- journal_t::expand_aliases: whole-name lookup first, else walk
-  -- single components (first only unless --recursive-aliases); each
-  -- alias expands at most once, and a component whose target already
-  -- sits colon-aligned at that position is skipped (#3132); loop to
-  -- fixpoint only under --recursive-aliases
+/-- The alias expansion of an account name, or `none` when no alias
+    fires (journal_t::expand_aliases, journal.cc:255-339). -/
+private def expandAliases (st : St) (name : String) : Option String :=
+  -- whole-name lookup first, else walk single components (first only
+  -- unless --recursive-aliases); each alias expands at most once, and a
+  -- component whose target already sits colon-aligned at that position
+  -- is skipped (#3132); loop to fixpoint only under --recursive-aliases.
+  -- Under that flag C++ rejects a cycle twice over, where the expansion
+  -- stops here, a known departure (fail-open): a whole name that would
+  -- expand a second time (journal.cc:272-274), so that with `alias A=B`
+  -- and `alias B=A` a posting to `A` is rejected by C++ and accepted
+  -- here (regress/coverage-error-circular-alias), and an expansion that
+  -- ends at the name it began with (journal.cc:341-345), so that with
+  -- the same aliases a posting to `A:X` is rejected by C++ and accepted
+  -- here (regress/coverage-journal-alias)
   let lookupAlias := fun (n : String) => st.aliases.lookup n
   let expandOnce := fun (seen : List String) (n : String) =>
     match lookupAlias n with
@@ -595,12 +607,64 @@ private def resolveAccount (st : St) (name : String) : String :=
     | 0 => n
     | fuel + 1 =>
         match expandOnce seen n with
-        | some (used, n') =>
-            if st.recursiveAliases then fix fuel (used :: seen) n' else n'
+        | some (used, n') => fix fuel (used :: seen) n'
         | none => n
-  let name := fix 10 [] name
-  let prefixes := st.applyStack.filterMap id
-  prefixes.foldl (fun acc p => s!"{p}:{acc}") name
+  (expandOnce [] name).map fun (used, n') =>
+    if st.recursiveAliases then fix 9 [used] n' else n'
+
+/-- A name under the `apply account` stack (innermost last), as
+    `top_account()->find_account` names it. -/
+private def applyPrefixes (st : St) (name : String) : String :=
+  (st.applyStack.filterMap id).foldl (fun acc p => s!"{p}:{acc}") name
+
+/-- An account name as `account_t::find_account` reads it
+    (account.cc:79-131): one trailing colon is dropped, and `none`
+    marks a name with an empty component, which C++ rejects, so that
+    `Bar:` names `Bar` while `Bar::`, `:Bar` and the empty name are
+    rejected. -/
+private def findAccountName (raw : String) : Option String :=
+  let comps := raw.splitOn ":"
+  let comps :=
+    if comps.length > 1 && comps.getLast? == some "" then comps.dropLast
+    else comps
+  if comps.any (·.isEmpty) then none else some (String.intercalate ":" comps)
+
+/-- Resolve an account name as `journal_t::register_account` does
+    (journal.cc:169-177): an alias expansion when an alias fires,
+    without a further `apply account` prefix, since the `alias`
+    directive named its target under the stack when it was read;
+    otherwise the name under the stack. With `alias Foo=Bar` and then
+    `apply account Top`, a posting to `Foo` posts to `Bar`, and a
+    posting to `Baz` to `Top:Baz`. C++ drops a trailing colon of any
+    account name and rejects an empty component (account.cc:79-131),
+    which is done here (`findAccountName`) only for an alias target and
+    an `apply account` name, a known departure: a posting to `Foo:`
+    posts to `Foo` in C++ and to `Foo:` here (wrong rows), and one to
+    `Foo::Bar` is rejected by C++ and accepted here (fail-open). -/
+private def resolveAccount (st : St) (name : String) : String :=
+  match expandAliases st name with
+  | some n => n
+  | none => applyPrefixes st name
+
+/-- The account to which `create_timelog_xact` books the hours of an
+    entry whose check-in named `name`, which `clock_in_directive` gives
+    under the `apply account` stack without expanding an alias
+    (textual_directives.cc:110). C++ registers that full name when the
+    entry is checked out (timelog.cc:76-77), so that the aliases in
+    force at the check-out expand it, and an `Unknown` result maps
+    through the account-block payee rules by the entry's payee
+    (journal.cc:179-188, regress/1211), which is the check-in's
+    description or, when that is empty, the check-out's
+    (timelog.cc:49, 133-136). With `alias Foo=Bar` and then
+    `apply account Top`, `i ... Foo` books its hours to `Top:Foo`, and
+    with `alias Foo=Bar` between `i ... Foo` and its `o`, to `Bar`. -/
+private def timelogAccount (st : St) (name payee : String) : String :=
+  let acct := (expandAliases st name).getD name
+  if acct.endsWith ":Unknown" || acct == "Unknown" then
+    match st.payeeAccountRules.find? fun (rx, _) => regexSearch rx payee with
+    | some (_, target) => target
+    | none => acct
+  else acct
 
 private def daysFromCivil (y m d : Int) : Int :=
   let y := y - (if m <= 2 then 1 else 0)
@@ -2932,6 +2996,17 @@ private def finalizeAuto (st : St) (rawPosts : List (Nat × String)) :
             || content.startsWith "note " || content.startsWith "format " then
           continue  -- checks/eval/metadata: verified or report-time only
         let (acctField, amtField) := splitField content
+        -- the template keeps its account as written. C++ registers it
+        -- when the rule is read, under the `apply account` stack and
+        -- through the aliases then in force (textual_xacts.cc:271, 571),
+        -- and registers the full name again, through the aliases in
+        -- force, when the rule is applied (xact.cc:1655-1656), a known
+        -- departure (wrong rows): with `alias Foo=Bar` and a rule
+        -- `= /Food/` posting `Foo 1` and `Cash -1`, a posting of `$10`
+        -- to `Expenses:Food` generates `$10` in `Bar` in C++ and in
+        -- `Foo` here, and the same rule read under `apply account Top`
+        -- without the alias generates them in `Top:Foo` and `Top:Cash`
+        -- in C++ and in `Foo` and `Cash` here
         let (kind, name) ← accountKind ln acctField
         match amtField with
         | none =>
@@ -3026,14 +3101,41 @@ private def defineDirective (st : St) (restS : String) :
 
 private def handleDirective (st : St) (n : Nat) (t : String) :
     Except String St := do
-  let word := trimS (String.ofList (t.toList.takeWhile (· != ' ')))
+  -- general_directive ends the directive word at the first space or tab
+  -- (next_element, textual_directives.cc:1028-1029, utils.h:623-640), as
+  -- `directiveWord` does, so that `alias<TAB>Foo=Bar` is an alias
+  let word := trimS (String.ofList
+    (t.toList.takeWhile fun c => c != ' ' && c != '\t'))
   let restS := trimS (t.drop word.length).toString
   match word with
   | "alias" =>
-      match restS.splitOn "=" with
-      | [from_, to_] =>
-          pure { st with aliases := (trimS from_, trimS to_) :: st.aliases }
-      | _ => err n s!"malformed alias '{restS}'"
+      -- alias_directive (textual_directives.cc:716-728): the name ends
+      -- at the first `=` and a line without one is ignored; the target
+      -- is named under the `apply account` stack when the directive is
+      -- read, by find_account, which rejects an empty component and
+      -- drops a trailing colon (account.cc:79-131); and
+      -- account_alias_directive rejects a name equal to that target
+      -- (textual_directives.cc:701-714, baseline/dir-alias-fail). So
+      -- `alias A=B=C` makes `A` denote `B=C`, `alias Foo=` is rejected,
+      -- and under `apply account Top`, `alias Foo=Bar` makes `Foo` denote
+      -- `Top:Bar` while `alias Top:Foo=Foo` is illegal. A bare `alias`
+      -- lacks the argument that general_directive requires
+      -- (textual_directives.cc:1034-1038,
+      -- regress/coverage-wave11-directive-noarg)
+      if restS.isEmpty then err n "directive 'alias' requires an argument"
+      else
+        match restS.splitOn "=" with
+        | [] | [_] => pure st
+        | al :: rhs =>
+            let al := trimS al
+            let raw := trimS (String.intercalate "=" rhs)
+            match findAccountName raw with
+            | none =>
+                err n s!"alias target '{raw}' has an empty sub-account name"
+            | some t =>
+                let target := applyPrefixes st t
+                if al == target then err n s!"illegal alias {al}={target}"
+                else pure { st with aliases := (al, target) :: st.aliases }
   | "account-rewrite" =>
       let (from_, to_?) := splitField restS
       match to_? with
@@ -3049,7 +3151,19 @@ private def handleDirective (st : St) (n : Nat) (t : String) :
   | "apply" =>
       if restS.startsWith "account" then
         let acct := trimS (restS.drop "account".length).toString
-        pure { st with applyStack := some acct :: st.applyStack }
+        -- apply_account_directive requires a name and finds it under
+        -- the stack with find_account (textual_directives.cc:464-487),
+        -- which drops a trailing colon and rejects an empty component
+        -- (`findAccountName`): under `apply account Top:`, a posting to
+        -- `Baz` posts to `Top:Baz`, and a bare `apply account` is
+        -- rejected (regress/coverage-wave11-apply-account-noarg)
+        if acct.isEmpty then
+          err n "directive 'apply account' requires an argument"
+        else
+          match findAccountName acct with
+          | none =>
+              err n s!"apply account '{acct}' has an empty sub-account name"
+          | some a => pure { st with applyStack := some a :: st.applyStack }
       else
         -- apply tag: labels only (uuid tags never come from `apply`)
         pure { st with applyStack := none :: st.applyStack }
@@ -3064,7 +3178,10 @@ private def handleDirective (st : St) (n : Nat) (t : String) :
       else pure st
   | "bucket" =>
       -- default_account_directive resolves against the CURRENT apply
-      -- stack (coverage-wave3-apply-directives)
+      -- stack (coverage-wave3-apply-directives) unless an alias fires,
+      -- as register_account resolves a posting's account
+      -- (textual_directives.cc:168-171): with `alias S=Suspense`,
+      -- `bucket S` under `apply account Top` makes `Suspense` the bucket
       pure { st with bucket := some (resolveAccount st restS) }
   | "A" => pure { st with bucket := some (resolveAccount st restS) }
   | "include" =>
@@ -3459,31 +3576,55 @@ def run (input0 : String) (dcDefault : Bool := false)
           -- close frames at deeper-or-equal indentation
           let frames := frames.filter fun (i, _) => i < ind
           let name := ((frames.head?).map (·.2)).getD ""
-          if body.startsWith "account " then
-            let nm := trimS (body.drop "account ".length).toString
-            let nm := (unquote nm).getD nm
-            let full := if name.isEmpty then nm else name ++ ":" ++ nm
+          -- account_directive_body reads a comment line as the account's
+          -- metadata tags (textual_directives.cc:631-635), and any other
+          -- line as a keyword that ends at the first space or tab
+          -- (next_element) and the argument after it, which every
+          -- keyword but `default` requires (textual_directives.cc:637-641,
+          -- regress/coverage-account-subdir-no-arg): a bare `alias`,
+          -- `payee` or `account` line in a block is rejected
+          let tagLine := body.startsWith ";" || body.startsWith "#"
+            || body.startsWith "*" || body.startsWith "|"
+          let kw := String.ofList
+            (body.toList.takeWhile fun c => c != ' ' && c != '\t')
+          let arg := trimS (body.drop kw.length).toString
+          if !tagLine && arg.isEmpty && kw != "default" then
+            err n s!"account directive '{kw}' requires an argument"
+          if kw == "account" then
+            let nm := (unquote arg).getD arg
+            -- a nested block registers its name under the enclosing
+            -- account, which the nested dispatch passes as the parent
+            -- (textual_directives.cc:651-655, regress/877), unless an
+            -- alias fires (textual_directives.cc:611, journal.cc:169-177):
+            -- with `alias X=Y`, `account X` nested in `account A` names
+            -- `Y`
+            let full := (expandAliases st nm).getD
+              (if name.isEmpty then nm else name ++ ":" ++ nm)
             st := { st with pending := .acctBlock ((ind, full) :: frames) }
             continue
           st := { st with pending := .acctBlock frames }
-          if body.startsWith "alias " then
-            let al := trimS (body.drop "alias ".length).toString
-            let al := (unquote al).getD al
+          if kw == "alias" then
+            let al := (unquote arg).getD arg
+            -- account_alias_directive rejects an alias equal to the
+            -- block's resolved name (textual_directives.cc:701-714,
+            -- regress/coverage-wave11-account-alias-self); under
+            -- `apply account Top`, `account Foo` with `alias Top:Foo` is
+            -- illegal
+            if al == name then err n s!"illegal alias {al}={name}"
             st := { st with aliases := (al, name) :: st.aliases }
-          else if body.startsWith "payee " then
-            match compileRegex (trimS (body.drop "payee ".length).toString) with
+          else if kw == "payee" then
+            match compileRegex arg with
             | .ok rx =>
                 st := { st with payeeAccountRules :=
                   st.payeeAccountRules ++ [(rx, name)] }
             | .error _ => pure ()
-          else if body == "default" then
+          else if kw == "default" then
+            -- account_default_directive ignores any argument
+            -- (textual_directives.cc:649-650)
             st := { st with bucket := some name }
-          else if body.startsWith "assert " || body.startsWith "check "
-              || body.startsWith "eval " || body.startsWith "note "
-              || body.startsWith "format " then
-            continue  -- verified or report-time only (953)
-          -- note/payee/check/assert/eval/format subdirectives: labels
-          -- or verified by the C++ side
+          -- tag lines and the note, value, assert, check, eval and expr
+          -- subdirectives: labels, report-time only, or verified by the
+          -- C++ side (953)
           continue
       | .commBlock comm =>
           let body := trimS t
@@ -3543,40 +3684,48 @@ def run (input0 : String) (dcDefault : Bool := false)
         let rest2 := trimS (rest1.drop timeS.length).toString
         let (acct, payee?) := splitField rest2
         let secs ← parseDateTime n dateS timeS
-        -- the account-block payee rules apply to timeclock payees too
-        -- (regress/1211): an Unknown-ish account maps by payee
-        let acct := resolveAccount st acct
-        let acct := match payee? with
-          | some pay =>
-              if acct.endsWith ":Unknown" || acct == "Unknown" then
-                match st.payeeAccountRules.find? fun (rx, _) =>
-                    regexSearch rx pay with
-                | some (_, target) => target
-                | none => acct
-              else acct
-          | none => acct
-        st := { st with clockIn := st.clockIn ++ [(secs, acct)] }
+        -- the entry keeps the account as `clock_in_directive` names it,
+        -- under the `apply account` stack, and its payee; the aliases
+        -- and the payee rules apply when it is checked out
+        -- (`timelogAccount`). time_log_t::clock_in rejects a second
+        -- check-in to an account already checked in, comparing the
+        -- accounts so named (timelog.cc:201-207,
+        -- regress/coverage-timelog-double-checkin): with `alias Foo=Bar`,
+        -- `i ... Foo` and then `i ... Bar` are two entries
+        let acct := applyPrefixes st acct
+        if st.clockIn.any fun (_, a, _) => a == acct then
+          err n "cannot double check-in to the same account"
+        st := { st with
+          clockIn := st.clockIn ++ [(secs, acct, payee?.getD "")] }
       else if t.startsWith "o " || t.startsWith "O " then
         let body := (splitNote (trimS (t.drop 2).toString)).1
         let dateS := String.ofList (body.toList.takeWhile (· != ' '))
         let rest1 := trimS (body.drop dateS.length).toString
         let timeS := String.ofList (rest1.toList.takeWhile (· != ' '))
         let rest2 := trimS (rest1.drop timeS.length).toString
-        let (named, _desc) := splitField rest2
+        let (named, desc?) := splitField rest2
         let stop ← parseDateTime n dateS timeS
         -- clock_out_from_timelog: a single open entry closes no
         -- matter what account the o line names (723); with several,
-        -- the account picks the entry
+        -- the entry is the one whose check-in named the account that
+        -- `clock_out_directive` names under the `apply account` stack,
+        -- before any alias expands (textual_directives.cc:139,
+        -- timelog.cc:112-122, regress/coverage-timelog-nomatch): with
+        -- `alias Foo=Bar` and entries for `Foo` and `Baz` open,
+        -- `o ... Bar` matches neither, and under `apply account Top`
+        -- with entries for `Foo` and `Baz`, `o ... Top:Foo` names
+        -- `Top:Top:Foo` and matches neither
         let pick? :=
           match st.clockIn with
           | [only] => some only
           | _ =>
               if named.isEmpty then none
-              else st.clockIn.find? fun (_, a) =>
-                a == named || a == resolveAccount st named
+              else st.clockIn.find? fun (_, a, _) => a == applyPrefixes st named
         match pick? with
         | none => err n "timeclock check-out without check-in"
-        | some (start, acct) =>
+        | some (start, name, pay) =>
+            let acct := timelogAccount st name
+              (if pay.isEmpty then desc?.getD "" else pay)
             -- create_timelog_xact: with a bucket account declared, C++
             -- adds a second posting of the negated duration to it, so
             -- the entry balances; with none the account's posting
@@ -3588,8 +3737,8 @@ def run (input0 : String) (dcDefault : Bool := false)
                            (Account.mk b "s", start - stop)]
               | none => [(Account.mk acct "s", stop - start)]
             st := { st with gens := flows :: st.gens
-                            clockIn := st.clockIn.filter fun (s0, a) =>
-                              !(s0 == start && a == acct) }
+                            clockIn := st.clockIn.filter fun (s0, a, _) =>
+                              !(s0 == start && a == name) }
             for (a, dq) in flows do
               st := bumpBal st a.name a.commodity dq
               st := bumpStat st a.name a.commodity false
@@ -3654,14 +3803,23 @@ def run (input0 : String) (dcDefault : Bool := false)
           || t.startsWith "b " then
         continue  -- historical timelog compatibility: ignored
       else if t.startsWith "@account " || t.startsWith "!account " then
+        -- named as `account` names it, below
         let nm := trimS (t.drop "@account ".length).toString
-        st := { st with pending := .acctBlock [(0, (unquote nm).getD nm)] }
+        let nm := resolveAccount st ((unquote nm).getD nm)
+        st := { st with pending := .acctBlock [(0, nm)] }
       else if t.startsWith "@commodity " || t.startsWith "!commodity " then
         let nm := trimS (t.drop "@commodity ".length).toString
         st := { st with pending := .commBlock ((unquote nm).getD nm) }
       else if t.startsWith "account " || t.startsWith "account\t" then
+        -- account_directive registers the block's name under the
+        -- `apply account` stack, unless an alias fires
+        -- (textual_directives.cc:602-611, journal.cc:169-177), so that
+        -- its `alias`, `payee` and `default` subdirectives name the
+        -- resolved account: under `apply account Top`, `account Suspense`
+        -- with `default` makes `Top:Suspense` the bucket
         let nm := trimS (t.drop "account ".length).toString
-        st := { st with pending := .acctBlock [(0, (unquote nm).getD nm)] }
+        let nm := resolveAccount st ((unquote nm).getD nm)
+        st := { st with pending := .acctBlock [(0, nm)] }
       else if t.startsWith "commodity " || t.startsWith "commodity\t" then
         let nm := trimS (t.drop "commodity ".length).toString
         st := { st with pending := .commBlock ((unquote nm).getD nm) }
@@ -3679,11 +3837,12 @@ def run (input0 : String) (dcDefault : Bool := false)
   match st.nowSecs with
   | some nowS =>
       -- future check-ins are dropped, not negatively closed (1689)
-      for (start, acct) in st.clockIn do
+      for (start, name, pay) in st.clockIn do
         if start ≤ nowS then
           -- time_log_t::close checks each one out through the same
           -- create_timelog_xact, bucket posting included
           -- (timelog.cc:173-195, 84-91)
+          let acct := timelogAccount st name pay
           let flows := match st.bucket with
             | some b => [(Account.mk acct "s", nowS - start),
                          (Account.mk b "s", start - nowS)]
