@@ -73,6 +73,36 @@ theorem netFlow_respects (flowsF : S.Gen → PacioliGroup)
       = netFlow (fun t => (flowsF t : Account → ℚ)) g a := by
   rw [netFlow_eq_flowAux, netFlow_eq_flowAux, flowAux_respects flowsF h]
 
+/-- **The per-commodity trial balance, computing side.** If every
+    generator's flows sum to zero over the commodity-`c` accounts of a
+    finite set `s` (for an `s` that holds every account a generator
+    touches, each generator is then a zero-row in `c`), then so do the
+    flows of every term over the same accounts.
+
+    The hypothesis is a condition on the generators, and not every
+    generator the oracle emits meets it: a priced exchange leaves a
+    nonzero column in each of its commodities, and a residual accepted
+    as an implicit exchange or within the balancing tolerance, a
+    paren-virtual posting (exempt from balancing, whether written in
+    the transaction or appended by an automated transaction), and a
+    timeclock entry (added without a balance check) can each do the
+    same, as the docstring of `free_trial_balance` records for the
+    free model. `netFlow_commodity_sum` in `Ledger/Register.lean`
+    gives the unconditional form. -/
+theorem netFlow_trial_balance (flows : S.Gen → Account → ℚ)
+    (s : Finset Account) (c : Commodity)
+    (hgen : ∀ t, ∑ a ∈ s.filter (·.commodity = c), flows t a = 0)
+    {A B : Object} (f : S.FreeMor A B) :
+    ∑ a ∈ s.filter (·.commodity = c), netFlow flows f a = 0 := by
+  induction f with
+  | gen t => simpa [netFlow] using hgen t
+  | id _ => simp [netFlow]
+  | zero _ _ => simp [netFlow]
+  | comp g f ihg ihf => simp [netFlow, Finset.sum_add_distrib, ihg, ihf]
+  | inv f ih => simp [netFlow, Finset.sum_neg_distrib, ih]
+  | tensor f g ihf ihg => simp [netFlow, Finset.sum_add_distrib, ihf, ihg]
+  | add f g ihf ihg => simp [netFlow, Finset.sum_add_distrib, ihf, ihg]
+
 end GenSpec
 
 /-! ## The demo journal (`test/semantic/demo.dat`) -/

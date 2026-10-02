@@ -82,6 +82,60 @@ theorem occurrences_foot (flows : S.Gen → Account → ℚ)
   | add f g ihf ihg =>
       simp [occurrences, netFlow, List.map_append, List.sum_append, ihf, ihg]
 
+/-- **The per-commodity sum, unconditional form.** Summed over the
+    commodity-`c` accounts of a finite set `s`, a term's net flow is
+    the sum, over its generator occurrences in presentation order, of
+    each occurrence's signed flows over the same accounts. The
+    statement has no hypothesis on the generators, so it holds
+    whatever residuals they leave: for an `s` that holds every account
+    the term's generators touch, the residual of a term in `c` is the
+    signed sum of the residuals of its occurrences. Residuals of
+    distinct occurrences can cancel, as those of a purchase and a sale
+    of the same quantity at one price do (the example below), so a
+    zero sum does not show that each generator balances.
+    `trialBalance_flowAux` in `Ledger/Pacioli.lean` is the same
+    residual formula for the free model, and `netFlow_trial_balance`
+    in `Ledger/Oracle.lean` states the case in which every generator's
+    sum is zero. -/
+theorem netFlow_commodity_sum (flows : S.Gen → Account → ℚ)
+    (s : Finset Account) (c : Commodity) {A B : Object} (f : S.FreeMor A B) :
+    ∑ a ∈ s.filter (·.commodity = c), netFlow flows f a
+      = ((occurrences f).map fun ts =>
+          ∑ a ∈ s.filter (·.commodity = c), occValue flows a ts).sum := by
+  simp_rw [← occurrences_foot]
+  induction occurrences f with
+  | nil => simp
+  | cons x xs ih => simp [Finset.sum_add_distrib, ih]
+
+/-- Two generators for the cancellation example: `true` is a purchase
+    of 10 AAPL for 50 dollars and `false` a sale of the same 10 AAPL
+    for the same 50 dollars. Endpoints play no part in `netFlow`. -/
+private def tradeSpec : GenSpec := ⟨Bool, fun _ => 0, fun _ => 0⟩
+
+/-- The two accounts the example posts to. -/
+private def tradeAccounts : Finset Account :=
+  {⟨"Assets:Broker", "AAPL"⟩, ⟨"Assets:Cash", "$"⟩}
+
+/-- Each trade recorded as its postings, a priced exchange that leaves
+    a nonzero column in each of its two commodities. -/
+private def tradeFlows (b : Bool) (a : Account) : ℚ :=
+  (if b then 1 else -1) *
+    (if a = ⟨"Assets:Broker", "AAPL"⟩ then 10
+     else if a = ⟨"Assets:Cash", "$"⟩ then -50 else 0)
+
+/-- **Residuals can cancel**, as the docstring of
+    `netFlow_commodity_sum` says: each trade leaves a nonzero residual
+    in AAPL, yet the residuals of the two occurrences in their tensor
+    sum to zero, so the zero total does not show that either trade
+    balances. -/
+example :
+    (∀ b, ∑ a ∈ tradeAccounts.filter (·.commodity = "AAPL"), tradeFlows b a ≠ 0) ∧
+    ∑ a ∈ tradeAccounts.filter (·.commodity = "AAPL"),
+      netFlow (S := tradeSpec) tradeFlows (.tensor (.gen true) (.gen false)) a = 0 := by
+  refine ⟨by decide +kernel, ?_⟩
+  rw [netFlow_commodity_sum]
+  decide +kernel
+
 /-- **Register is not `Rel`-invariant** (and must not be): `f⁻¹ ∘ f`
     and `id` are the same morphism of the quotient, but their
     registers differ — the register observes the presentation. -/
