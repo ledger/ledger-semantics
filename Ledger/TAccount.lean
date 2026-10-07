@@ -30,7 +30,9 @@ rows is inherited from the journal syntax and fixed by the output
 protocol; under the credit isomorphism every row would be negated.
 
 This is a specification leaf. No module on the oracle's run path
-imports it, and nothing in the oracle uses it.
+imports it, and nothing in the oracle uses it. The join module
+`GrossLedger` imports it to state gross totals as T-accounts, for
+proofs only.
 -/
 
 namespace Ledger
