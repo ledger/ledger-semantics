@@ -107,11 +107,13 @@ def flowsFor (arr : Array (List (Account × ℚ)))
     (i : Fin arr.size) (a : Account) : ℚ :=
   (arr[i].filter fun p => p.1 = a).foldl (fun s p => s + p.2) 0
 
-/-- Balances of an (include-spliced) journal text. -/
+/-- Balances of an (include-spliced) journal text; `spliced` says that
+    a file was spliced into it (`splice`). -/
 def balancesOf (decimalComma : Bool) (nowSecs : Option ℚ)
-    (recAliases : Bool) (dfmt : Option String) (input : String) :
+    (recAliases : Bool) (dfmt : Option String) (input : String)
+    (spliced : Bool := false) :
     Except String (List String) := do
-  let res ← Journal.run input decimalComma nowSecs recAliases dfmt
+  let res ← Journal.run input decimalComma nowSecs recAliases dfmt spliced
   let arr := res.gens.toArray
   let S := specFor arr
   let ⟨_, _, term⟩ := journalTerm S (List.finRange arr.size)
@@ -322,12 +324,15 @@ partial def globPaths (dir : System.FilePath) (pat : String) :
     engine as a bare `include` or as `include ARG`, which the engine
     rejects by name (Journal `handleDirective`). An include in a file
     that more than `maxIncludeDepth` files include throws the C++
-    error. -/
+    error. The result is the spliced text, and whether a file was
+    spliced into it, which the engine's bounds of `tag("K") == "V"`
+    read (Journal `run`). -/
 partial def splice (self : System.FilePath) (dir : System.FilePath)
-    (text : String) (parents : Nat) : IO String := do
+    (text : String) (parents : Nat) : IO (String × Bool) := do
   let text := if text.startsWith "\uFEFF" then (text.drop 1).toString else text
   let mut out : Array String := #[]
   let mut inComment := false
+  let mut spliced := false
   for line in text.splitOn "\n" do
     -- the engine's view of the line (Journal `run`)
     let t := ((line.splitOn "\r").headD "").trimAsciiEnd.toString
@@ -370,17 +375,19 @@ partial def splice (self : System.FilePath) (dir : System.FilePath)
         -- cannot open as empty; here the read error propagates, and
         -- `main` rejects the journal on one `!! ERROR` line instead
         let sub ← IO.FS.readFile path
-        out := out.push (← splice path (path.parent.getD dir) sub (parents + 1))
+        out := out.push (← splice path (path.parent.getD dir) sub (parents + 1)).1
+        spliced := true
   -- C++ reads a block no further than the end of its own file
   -- (textual_directives.cc:941-949), so the block that an included
   -- file leaves open closes where that file ends
   if inComment && parents > 0 then out := out.push "end comment"
-  return String.intercalate "\n" out.toList
+  return (String.intercalate "\n" out.toList, spliced)
 
 namespace Ledger.Driver
 
-/-- The text of the file `arg` with its includes spliced. -/
-def readSpliced (arg : String) : IO String := do
+/-- The text of the file `arg` with its includes spliced, and whether a
+    file was spliced into it. -/
+def readSpliced (arg : String) : IO (String × Bool) := do
   let txt ← IO.FS.readFile arg
   let self ← topPathname arg
   splice self (self.parent.getD "/") txt 0
@@ -418,8 +425,8 @@ def main (args : List String) : IO Unit := do
         -- ("  file: PATH"); the protocol gives a rejection one line
         let lines := ((toString e).splitOn "\n").map (·.trimAscii.toString)
         IO.println s!"!! ERROR {" ".intercalate (lines.filter (!·.isEmpty))}"
-      | .ok spliced =>
-        match Ledger.Driver.balancesOf dc now rec_ dfmt spliced with
+      | .ok (text, spliced) =>
+        match Ledger.Driver.balancesOf dc now rec_ dfmt text spliced with
         | .error e => IO.println s!"!! ERROR {e}"
         | .ok rows => for r in rows do IO.println r
       dc := false

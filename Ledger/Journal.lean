@@ -290,6 +290,9 @@ structure PredSpec where
   anyRx : Option (Rx × Bool) := none
   /-- `all(rx)`: every posting in the current set matches -/
   allRx : Option Rx := none
+  /-- `tag("K") == "V"`, the whole predicate of regress/842, read only
+      within the bounds of `tagEqScan` (`tagEqHolds`) -/
+  tagEq : Option (String × String) := none
 
 structure AutoRule where
   branches : List PredSpec
@@ -1135,6 +1138,128 @@ private def parsePosting (st : St) (line : Nat) (raw : String)
               af.learned, af.amount.map (·.comm), af.decimals, af.isExpr,
               af.teach)
 
+/-! ## The tag equality of regress/842 -/
+
+/-- A character of a tag name or value that the test `tag("K") == "V"`
+    reads: an ASCII letter or digit, `_` or `-`. -/
+private def tagEqChar (c : Char) : Bool :=
+  c.isAlphanum || c == '_' || c == '-'
+
+/-- A non-empty run of `tagEqChar`. -/
+private def tagEqWord (s : String) : Bool :=
+  !s.isEmpty && s.toList.all tagEqChar
+
+/-- One note line within the bounds of `tagEqScan`: `some none` for a
+    line without `:`, which names no tag in C++ (metadata.cc:146-147),
+    `some (some (Name, value))` for `Name: value` with blanks around
+    the two words, and `none` for any other line with a `:`. C++ takes
+    the first token of two or more characters as a name when it ends
+    in `:`, and the rest of the line, its whitespace trimmed, as the
+    value (metadata.cc:156-169, 181-197): `; Category: food` and
+    `;Category:<TAB>food` name `Category` with the value `food`, while
+    `; Category:food` names no tag. -/
+private def tagEqLine (seg : String) : Option (Option (String × String)) :=
+  if !seg.toList.contains ':' then some none
+  else
+    let isBlank := fun (c : Char) => c == ' ' || c == '\t'
+    match seg.splitOn ":" with
+    | [a, b] =>
+        let nm := String.ofList (a.toList.dropWhile isBlank)
+        let bs := b.toList
+        let v := String.ofList
+          ((bs.dropWhile isBlank).reverse.dropWhile isBlank).reverse
+        if tagEqWord nm && (bs.head?.map isBlank).getD false && tagEqWord v then
+          some (some (nm, v))
+        else none
+    | _ => none
+
+/-- The tags of a note as the engine keeps it, the same-line note
+    followed by `;` and each note line of its own (`finalizeXact`), in
+    order. `none` outside the bounds of `tagEqScan`, under which the
+    same-line note holds no `:` and `tagEqLine` reads each line. -/
+private def tagEqMeta (note : String) : Option (List (String × String)) :=
+  match note.splitOn ";" with
+  | [] => some []
+  | first :: own =>
+      if first.toList.contains ':' then none
+      else own.foldlM (fun acc seg => (tagEqLine seg).map (acc ++ ·.toList)) []
+
+/-- The value of the tag `k` that C++ reads for a posting with the tags
+    `pm` in a transaction with the tags `xm`: the posting's own, else
+    the transaction's (post.cc:96-110), each the last that a note line
+    sets, since a note line overwrites an earlier value
+    (textual_xacts.cc:1100-1103, metadata.cc:132-133). -/
+private def tagEqValue (k : String) (pm xm : List (String × String)) :
+    Option String :=
+  let last := fun (m : List (String × String)) =>
+    ((m.filter (·.1 == k)).getLast?).map (·.2)
+  last pm <|> last xm
+
+/-- Whether `tag("K") == "V"` holds for a posting with the note `note`
+    in a transaction with the notes `xactNotes`, within the bounds of
+    `tagEqScan` and `tagEqGuard`. C++ compares the value that
+    `tagEqValue` reads with `V` as a string (query.cc:412-460), so that
+    under regress/842's `; Category: food` the test holds for both
+    postings of the transaction, each of which generates a
+    `(Budget:Food)` posting, and under `; Category: Food` it holds for
+    neither. -/
+private def tagEqHolds (k v xactNotes note : String) : Bool :=
+  match tagEqMeta note, tagEqMeta xactNotes with
+  | some pm, some xm => tagEqValue k pm xm == some v
+  | _, _ => false
+
+/-- Refuse a transaction that the rule `tag("K") == "V"` tests, before
+    it is extended, where C++ reads the test or completes the
+    transaction otherwise. Within the bounds of `tagEqScan` a note line
+    is the only source of a tag, and every posting is real. C++ reads
+    `K` as a pattern that ignores case and takes the first name it
+    finds in an order that also ignores case (query.cc:446-460,
+    mask.cc:365-367, metadata.cc:47-51, 97-108), so no name other than
+    `K` that contains it may tag a posting (`posts`, as written) or its
+    transaction: with `K` `Category`, `; category: food` or
+    `; Categoryx: y` is refused.
+
+    C++ tests every posting of the balanced transaction, the postings
+    by which it completes an elided one included (xact.cc:1438-1447).
+    It completes an elided posting from the sum of the written amounts
+    (xact.cc:180-248, 829-844). While one commodity has entered the sum
+    it is a single amount, whose negation the elided posting takes,
+    zero or not; from the second commodity on it is a balance, which
+    drops the first commodity if that has netted to zero by then
+    (value.cc:600-607, balance.h:128-134) and keeps an entry for a
+    commodity that nets to zero later (balance.cc:118-133), and the
+    elided posting takes one posting per entry. A balance with no entry
+    leaves the elided posting without an amount, and C++ then rejects
+    the transaction (xact.cc:1012-1015). The engine completes an elided
+    posting with one posting for each commodity that does not net to
+    zero (`balancePool`), and `applyAutos` tests those. So a transaction
+    with an elided posting is refused when the written amounts of some
+    commodity in it net to zero, whether the test holds or not;
+    otherwise C++ and the engine test the same postings. Beside
+    `Expenses:C  3 EUR`, `Expenses:A  $5` and `Expenses:B  $-5`, C++
+    completes an elided `Assets:Cash` with `$0` and `-3 EUR`, and under
+    `; Category: food` the `$0` posting generates a `(Budget:Food)`
+    posting of `$0`, while the engine completes it with `-3 EUR` alone;
+    beside `Expenses:A  $5`, `Expenses:B  $-5` and `Expenses:C  0 EUR`,
+    C++ rejects the transaction, which the engine reads. -/
+private def tagEqGuard (hline : Nat) (k xactNotes : String)
+    (posts : List PostSpec) : Except String Unit := do
+  let refuse := fun (why : String) =>
+    err (α := Unit) hline s!"out-of-scope tag() predicate: {why}"
+  let some xm := tagEqMeta xactNotes
+    | refuse "a note outside the form `; Name: value`"
+  for p in posts do
+    let some pm := tagEqMeta p.note
+      | refuse "a note outside the form `; Name: value`"
+    if ((pm ++ xm).map (·.1)).any fun nm =>
+        nm != k && (nm.toLower.splitOn k.toLower).length > 1 then
+      refuse s!"a tag name other than {k} that contains it"
+  let written := posts.filterMap (·.amount)
+  let netsToZero := fun (c : String) =>
+    ((written.filter (·.comm == c)).map (·.q)).sum == 0
+  if posts.any (·.amount.isNone) && written.any (netsToZero ·.comm) then
+    refuse "an elided posting beside a commodity whose amounts net to zero"
+
 /-! ## Transaction finalization -/
 
 /-- Extend a balanced transaction by its automated transactions, one
@@ -1255,6 +1380,7 @@ private def applyAutos (st : St) (xdate : Option Int) (payee : String)
               (!realOnly || p'.kind == .real) && regexSearch rx p'.account)
       && (b.allRx.all fun rx =>
             cur.all fun p' => regexSearch rx p'.account)
+      && (b.tagEq.all fun (k, v) => tagEqHolds k v xactNotes p.note)
   let instantiate := fun (xactNotes : String) (p : PostSpec) (a : Amount) =>
     fun (ap : AutoPost) =>
       let amt? : Option Amount :=
@@ -2648,6 +2774,14 @@ private def finalizeXact (st : St) (hline : Nat) (_header : String)
     c != ' ' && c != '=')
   let headerNote := (splitNote _header).2
   let xactNotes := headerNote ++ ";" ++ String.intercalate ";" leadNotes
+  -- a transaction that the rule `tag("K") == "V"` tests is refused
+  -- where `tagEqGuard` finds that C++ reads the test or completes the
+  -- transaction otherwise
+  for rule in stv.autos do
+    if rule.active then
+      for b in rule.branches do
+        if let some (k, _) := b.tagEq then
+          tagEqGuard hline k xactNotes rposts
   let (finalPosts, autoBatches) :=
     applyAutos stv (headerDateF stv.dfmt stv.defaultYear _header)
       hpayee hcode dateTok xactNotes completed
@@ -3526,10 +3660,302 @@ def opensCommentBlock (t : String) : Bool :=
 def closesCommentBlock (t : String) : Bool :=
   t.startsWith "end comment" || t.startsWith "end test"
 
-/-- Run the engine over (include-spliced) journal text. -/
+/-- `tag("K") == "V"` exactly, with one space on each side of `==`,
+    double quotes, and `K` and `V` runs of `tagEqChar`: the predicate
+    of test/regress/842.test, which the engine reads, as a test of the
+    value of a tag, only within the bounds of `tagEqScan`. -/
+private def tagEqForm (predS : String) : Option (String × String) :=
+  if predS.startsWith "tag(\"" then
+    match (predS.drop 5).toString.splitOn "\") == \"" with
+    | [k, rest] =>
+        if rest.endsWith "\"" then
+          let v := String.ofList rest.toList.dropLast
+          if tagEqWord k && tagEqWord v then some (k, v) else none
+        else none
+    | _ => none
+  else none
+
+/-- Whether `s` calls `tag(`, `meta(` or `data(`, written where no ASCII
+    letter, digit or `_` precedes it, so that `has_tag(` does not. -/
+private def callsMetaFn (s : String) : Bool :=
+  let calls := ["tag(", "meta(", "data("].map String.toList
+  let rec go (afterWord : Bool) : List Char → Bool
+    | [] => false
+    | c :: rest =>
+        (!afterWord && calls.any (·.isPrefixOf (c :: rest)))
+          || go (c.isAlphanum || c == '_') rest
+  go false s.toList
+
+/-- An account name of words of `tagEqChar` joined by single spaces and
+    colons. -/
+private def tagEqAccount (acct : String) : Bool :=
+  (acct.splitOn ":").all fun part => (part.splitOn " ").all tagEqWord
+
+/-- A line that `tagEqScan` admits in the rule `tag("K") == "V"`: a
+    virtual posting `(A)`, `A` a `tagEqAccount` whose last part is not
+    `Unknown`, with an integer multiplier and nothing after it. The
+    bound on `Unknown` is precautionary: C++ moves a posting generated
+    for an account whose last part is `Unknown` to the account that an
+    `account` block's `payee` line maps the payee to
+    (xact.cc:1641-1656), and no directive lies within the bounds. -/
+private def tagEqTemplate (body : String) : Bool :=
+  match splitField body with
+  | (acct, some amt) =>
+      let inner := String.ofList (acct.toList.drop 1).dropLast
+      let ds := if amt.startsWith "-" then (amt.drop 1).toString else amt
+      acct.startsWith "(" && acct.endsWith ")" && tagEqAccount inner
+        && (inner.splitOn ":").getLast? != some "Unknown"
+        && !ds.isEmpty && ds.toList.all Char.isDigit
+  | _ => false
+
+/-- A transaction header that `tagEqScan` admits: a date `YYYY/MM/DD`
+    that C++ accepts, a year from 1400 to 9999 and a day of its month,
+    and a payee of words of `tagEqChar` joined by single spaces. -/
+private def tagEqHeader (t : String) : Bool :=
+  let num := fun (s : String) (w : Nat) =>
+    if s.length == w && s.toList.all Char.isDigit then s.toNat? else none
+  match t.splitOn " " with
+  | date :: payee =>
+      payee.all tagEqWord &&
+        match date.splitOn "/" with
+        | [y, m, d] =>
+            match num y 4, num m 2, num d 2 with
+            | some y, some m, some d =>
+                let leap := y % 4 == 0 && (y % 100 != 0 || y % 400 == 0)
+                let days := if m == 2 then (if leap then 29 else 28)
+                  else if m == 4 || m == 6 || m == 9 || m == 11 then 30
+                  else 31
+                1400 ≤ y && y ≤ 9999 && 1 ≤ m && m ≤ 12 && 1 ≤ d && d ≤ days
+            | _, _, _ => false
+        | _ => false
+  | [] => false
+
+/-- A posting amount that `tagEqScan` admits: ASCII digits with an
+    optional fraction after `.`, written after `$`, `$-` or `-$`, or
+    with an optional `-` before them and a space and a commodity of
+    uppercase ASCII letters after them. -/
+private def tagEqAmount (s : String) : Bool :=
+  let digits := fun (t : String) => !t.isEmpty && t.toList.all Char.isDigit
+  let num := fun (t : String) =>
+    match t.splitOn "." with
+    | [i] => digits i
+    | [i, f] => digits i && digits f
+    | _ => false
+  let unsign := fun (t : String) =>
+    if t.startsWith "-" then (t.drop 1).toString else t
+  if s.startsWith "$" then num (unsign (s.drop 1).toString)
+  else if s.startsWith "-$" then num (s.drop 2).toString
+  else match (unsign s).splitOn " " with
+    | [q, c] => num q && !c.isEmpty && c.toList.all Char.isUpper
+    | _ => false
+
+/-- A posting line, without its indentation, that `tagEqScan` admits: a
+    `tagEqAccount`, alone or followed by a `tagEqAmount` after two spaces
+    or a tab, whose first word is not `assert`, `check` or `expr`, which
+    begin a line that C++ evaluates (textual_xacts.cc:1107-1125). -/
+private def tagEqPosting (body : String) : Bool :=
+  let w := String.ofList (body.toList.takeWhile fun c => c != ' ' && c != '\t')
+  !["assert", "check", "expr"].contains w &&
+    match splitField body with
+    | (acct, none) => tagEqAccount acct
+    | (acct, some amt) => tagEqAccount acct && tagEqAmount amt
+
+/-- The text after `;` of a note line that `tagEqScan` admits: words of
+    `tagEqChar` and blanks, which C++ reads as neither a tag nor a date
+    (metadata.cc:146-147, item.cc:86-88), or `Name: value` (`tagEqLine`)
+    with a name other than `Value`, which C++ parses as an expression
+    (post.cc:1064-1078). -/
+private def tagEqNote (txt : String) : Bool :=
+  match tagEqLine txt with
+  | some none => txt.toList.all fun c => tagEqChar c || c == ' ' || c == '\t'
+  | some (some (nm, _)) => nm.toLower != "value"
+  | none => false
+
+/-- What an indented line continues as `tagEqScan` follows the
+    journal: no block, the rule `tag("K") == "V"`, or a transaction. -/
+private inductive TagEqBlock where
+  | closed | rule | xact
+
+/-- The bounds within which the engine reads the predicate of
+    test/regress/842.test, `= tag("K") == "V"` (`tagEqForm`). C++ lexes
+    `tag`, `meta` and `data` alike as a metadata test and reads
+    `tag(K) == V` as `tag(/K/) == "V"`, a name pattern that ignores case
+    and a value compared as a string (query.cc:262-276, 412-460,
+    628-643). The whole journal is checked before a line is read. The
+    result is `none` when no line holds the rule and no line falls
+    under (R1), and the line of the rule when the journal lies within
+    the bounds; any other journal is refused, fail-closed, as an
+    out-of-scope `tag()` predicate.
+
+    - (R1) A line outside a `comment` or `test` block that begins with
+      `=`, other than the rule, and that calls `tag(`, `meta(` or
+      `data(` (`callsMetaFn`) is refused, whether the rule is present
+      or not. The test is on the whole line as C++ reads it
+      (textual.cc:167-232), before the predicate is split and past any
+      carriage return, so that no quoting, `expr`, negation,
+      parenthesis, conjunction or carriage return escapes it:
+      `= /Expenses/ and not tag("Category") == "food"` is refused, and
+      so is `= /Expenses/<CR> and tag("Category") == "food"`, which C++
+      reads whole and the engine only up to the carriage return.
+      `has_tag(` passes (regress/872, 2268, 1182_3, 1894_1), and the
+      spellings in which no parenthesis directly follows the name, such
+      as `tag ("Category") == "food"`, `tag Category==food` and
+      `%Category==food`, keep their reading, as does
+      `%("Category") == "food"`, in which no name precedes the
+      parenthesis.
+    - (R2) When the rule is present, every line that C++ reads must be
+      blank, a comment (a line that begins with one of `;#%*|`, or a
+      `comment` or `test` block), the rule followed by its template
+      lines (`tagEqTemplate`), or a transaction after the rule: a
+      header (`tagEqHeader`) followed by postings (`tagEqPosting`) and
+      note lines (`tagEqNote`), with no `uuid:` and no carriage return
+      within a line; and no file may be spliced into the journal
+      (`spliced`). Any other journal is refused. C++ was measured to
+      read each kind below otherwise, as its shape shows; any other
+      spelling outside the admitted forms, such as a date written with
+      `-`, punctuation in a payee or an account, a thousands separator
+      or a commodity in lowercase, is refused because the bounds admit
+      only the forms whose reading was measured:
+      - another line that begins with `=`: rules read each other's
+        notes, which C++ formats, places and orders otherwise
+        (xact.cc:1497-1502, 1658-1664; journal.cc:655-667), so that
+        after `= /Groc/` with `(Budget:X)  1` and `; Category: dining`
+        C++ tags the generated posting, not the matched one;
+      - a line of the rule other than a virtual posting with an integer
+        multiplier, a note included: C++ rejects the multiplier `0.5`
+        under `--decimal-comma` (amount.cc:1732-1734), which the engine
+        reads;
+      - a directive: `apply tag Category: food` tags each transaction in
+        C++ (textual_xacts.cc:1167-1187) and none here, and
+        `account-rewrite budget:food  Budget:Other` moves the generated
+        postings in C++ alone (textual_directives.cc:791-804,
+        mask.cc:365-367);
+      - an included file: the scan reads the text that `splice` in
+        Driver.lean makes, in which a block can continue into the first
+        line of an included file or past its last, while C++ reads each
+        file with a reader of its own (textual_directives.cc:428-431)
+        and rejects an indented line that continues no block of its file
+        (textual.cc:284-290): after the template line
+        `(Budget:Food)  -1`, `include t.inc`, where t.inc holds
+        `    (Budget:Other)  1`, gives the rule a second template line
+        here and is rejected by C++;
+      - a transaction before the rule, which the rule does not test and
+        `tagEqGuard` does not check: there, `Assets:Cash` elided beside
+        `Expenses:A  $5`, `Expenses:B  $-5` and `Expenses:C  0 EUR` makes
+        C++ reject the journal (xact.cc:1012-1015), which the engine
+        reads;
+      - a header with an auxiliary date, a state, a code or a note, or
+        with a date that C++ rejects: `2024/01/01 Shop ; Category: food`
+        leaves the note in the payee in C++ (textual_xacts.cc:1038-1066),
+        while the engine keeps it as the transaction's note, and C++
+        alone rejects `2024/02/30 Shop`;
+      - a posting with a note, a cost, a lot, a balance assertion or
+        assignment, or an expression, or a line that begins with
+        `assert`, `check` or `expr`: `expr ACategory = "dining"` under a
+        posting tags it in C++ (textual_xacts.cc:1107-1125,
+        item.cc:280-292), and the test then reads that name in place of
+        `Category`, while the engine drops the line;
+        `Assets:A  10 AAA @ $1.005` gives an elided posting the cost's
+        precision in C++ (xact.cc:195-238), which a posting generated
+        from it keeps there and not here; and `Budget:Food  = $0` reads
+        the generated postings, which C++ dates by the matched posting
+        and rounds at display precision (xact.cc:1603-1610;
+        textual_xacts.cc:430-438, 842-866);
+      - a note line other than words or `Name: value`, or one that names
+        `Value`: `; [2024/05/01]` dates the posting in C++
+        (item.cc:86-104), which here keeps the date of its transaction,
+        and C++ alone rejects `; Value: x--`;
+      - a line that holds `uuid:`: with `; UUID: abc` under a posting of
+        each of two transactions, C++ keeps both, since the tag is not
+        the transaction's (journal.cc:593-596), and `uuidOf` drops the
+        second;
+      - an indented line that continues no block: after a blank line,
+        C++ rejects `    ; Category: food` (textual.cc:284-290), which
+        the engine adds to the notes of the transaction above;
+      - a carriage return within a line: C++ reads the value `food<CR>x`
+        in `; Category: food<CR>x` (textual.cc:167-232), and the engine,
+        which ends the line at the carriage return, `food`.
+
+    In a journal within these bounds the rule tests every transaction,
+    and `tagEqGuard` then checks each of them. -/
+private def tagEqScan (input : String) (spliced : Bool) :
+    Except String (Option Nat) := do
+  let mut inComment := false
+  let mut block := TagEqBlock.closed
+  let mut rule : Option Nat := none
+  let mut fault : Option (Nat × String) := none
+  let mut n : Nat := 0
+  for line0 in input.splitOn "\n" do
+    n := n + 1
+    let line := (line0.splitOn "\r").headD ""
+    let t := line.trimAsciiEnd.toString
+    if inComment then
+      if closesCommentBlock t then inComment := false
+      continue
+    let mut why : Option String :=
+      if line0.toList.dropLast.contains '\r' then
+        some "a carriage return within a line"
+      else if containsUUID t then some "a line that holds `uuid:`"
+      else none
+    if t.toList.all fun c => c == ' ' || c == '\t' then
+      block := .closed
+    else if line.front == ' ' || line.front == '\t' then
+      let body := trimS t
+      match block with
+      | .closed =>
+          why := why <|> some "an indented line that continues no block"
+      | .rule =>
+          unless tagEqTemplate body do
+            why := why <|> some "a line of the rule other than `(A)  N`"
+      | .xact =>
+          if body.startsWith ";" then
+            unless tagEqNote (body.drop 1).toString do
+              why := why <|>
+                some "a note other than words or `Name: value`, or `Value`"
+          else
+            unless tagEqPosting body do
+              why := why <|> some "a posting other than `A  AMOUNT` or `A`"
+    else
+      block := .closed
+      if line.front == '=' then
+        let predS := trimS (t.drop 1).toString
+        if t.startsWith "= " && (tagEqForm predS).isSome then
+          if rule.isNone then
+            rule := some n
+            block := .rule
+          else why := why <|> some "another automated transaction"
+        else if callsMetaFn (readLineTrim line0) then
+          let raw := (readLineTrim line0).map fun c =>
+            if c == '\r' then ' ' else c
+          let shown := (trimS (raw.drop 1).toString).take 40
+          err n s!"out-of-scope tag() predicate '{shown}'"
+        else why := why <|> some "another automated transaction"
+      else if isCommentStart line.front then pure ()
+      else if opensCommentBlock t then inComment := true
+      else if line.front.isDigit then
+        block := .xact
+        unless tagEqHeader t do
+          why := why <|> some "a header other than `YYYY/MM/DD PAYEE`"
+        if rule.isNone then
+          why := why <|> some "a transaction before the rule"
+      else why := why <|> some "a directive"
+    if let some w := why then
+      fault := fault <|> some (n, w)
+  match rule, fault with
+  | some ln, some (m, w) =>
+      err ln s!"out-of-scope tag() predicate: {w} at line {m}"
+  | some ln, none =>
+      if spliced then err ln "out-of-scope tag() predicate: an included file"
+      else pure (some ln)
+  | none, _ => pure none
+
+/-- Run the engine over (include-spliced) journal text; `spliced` is
+    set when `splice` in Driver.lean spliced a file into it, which only
+    the bounds of `tagEqScan` read. -/
 def run (input0 : String) (dcDefault : Bool := false)
     (nowSecs : Option ℚ := none) (recAliases : Bool := false)
-    (dfmtS : Option String := none) : Except String Result := do
+    (dfmtS : Option String := none) (spliced : Bool := false) :
+    Except String Result := do
   let dfmt := dfmtS.bind fun f =>
     let order := f.toList.filterMap fun c =>
       if c == 'Y' || c == 'y' then some 'y'
@@ -3540,6 +3966,8 @@ def run (input0 : String) (dcDefault : Bool := false)
   -- a leading BOM is transparent to the reader
   let input := if input0.startsWith "\uFEFF" then
       (input0.drop 1).toString else input0
+  -- the bounds of `tag("K") == "V"` (regress/842), before any line
+  let tagEqRule ← tagEqScan input spliced
   let mut st : St := { amt := { dcDefault }, nowSecs, dfmt
                        recursiveAliases := recAliases }
   let mut n : Nat := 0
@@ -3805,7 +4233,13 @@ def run (input0 : String) (dcDefault : Bool := false)
               let nm := trimS nm
               (some (unquoteAny nm), trimS rest)
           | _ => (none, predS)
-        let branches ← compilePred st n predS
+        -- test/regress/842.test: `tag("K") == "V"` is read within the
+        -- bounds of `tagEqScan`, which approved this line
+        let branches ← match tagEqForm predS with
+          | some kv =>
+              if tagEqRule == some n then pure [{ tagEq := some kv }]
+              else err n "out-of-scope tag() predicate"
+          | none => compilePred st n predS
         st := { st with
           autoPred := (branches, ruleName) :: st.autoPred
           pending := .auto [] }
