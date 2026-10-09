@@ -106,9 +106,12 @@ outputs (the `SemanticBisimulation` ctest is the standing check):
 - **Timeclock** `i`/`o`: time postings (duration in canonical
   seconds), with the opposite amount posted to the bucket account
   when one is declared (regress/1607); no balance check.
-- **UUID dedup**: a transaction whose note carries an already-seen
-  `UUID:` is dropped whole (C++ `journal.cc` semantics) — the one
-  documented non-flow-inert label.
+- **UUID dedup**: a transaction in whose body `uuidOf` finds a UUID
+  already seen is dropped whole but for the prices that its costs
+  record, since C++ finalizes it before it drops it (C++ `journal.cc`
+  semantics); it is the one documented non-flow-inert label. C++ reads
+  the transaction's own `UUID` tag instead, a departure in the rows that
+  the docstring of `uuidOf` records.
 - **Periodic templates** `~`: finalized as a transaction without a
   date against the state before them, booking no lot gain and with no
   UUID de-duplication. As C++ `parse_posts` reads the postings, a line
@@ -295,6 +298,49 @@ structure PostSpec where
       (`PoolResult.splitComms`); `applyAutos` reads it, and so does
       `finalizeXact`, for `St.lotFanout` -/
   splitRisk : Bool := false
+  /-- the cost as Phase 6 of `finalize` hands it to the exchange of the
+      commodity pool (xact.cc:688-690): a per-unit `@ P` times the
+      amount, or a total `@@ T` signed as the amount
+      (textual_xacts.cc:699-710), before any lot gain is added to it
+      (`costVal`). `finalizeXact` reduces it through the commodity
+      equivalences, as C++ reduces a cost when it parses it
+      (textual_xacts.cc:691, amount.cc:1905-1906). `none` without a
+      cost; `costPrice` derives from it the price that the exchange
+      records -/
+  rawCost : Option Amount := none
+  /-- the precision of `rawCost` as `costPrec` counts it before the raise
+      that Phase 6 makes after the exchange: the cost literal's decimals,
+      plus the amount's precision for a per-unit `@`, with the
+      departures for an expression that the docstring of `zeroTestPrec`
+      records (`costPrice`) -/
+  rawCostPrec : Nat := 0
+  /-- the cost is virtual, `(@)` or `(@@)` (POST_COST_VIRTUAL,
+      textual_xacts.cc:657-660), and so records no price (`costPrice`) -/
+  costVirtual : Bool := false
+  /-- the commodity of a lot price that annotates the cost itself, one
+      written after the cost and before any balance assertion on a cost
+      with a commodity, when that price has a commodity (`costPrice`) -/
+  costLotComm : Option String := none
+  /-- the precision that C++ gives the amount: its literal's decimals,
+      or for an amount expression the approximation of
+      `parseAmountField` (`costPrice`) -/
+  amtPrec : Nat := 0
+  /-- the amount as written, before `finalizeXact` reduces it through
+      the commodity equivalences, its commodity named through the
+      commodity aliases: C++ parses a posting amount unreduced
+      (textual_xacts.cc:583) and exchanges it so (`costPrice`) -/
+  rawAmount : Option Amount := none
+  /-- the amount has a commodity and no annotation of its own, and an
+      `apply fixed` or `apply rate` directive in force names that
+      commodity (`St.fixatedComms`), so that C++ annotates the amount
+      with the fixated price of the directive (textual_xacts.cc:626-638).
+      `costPrice` reads it alone: the engine keeps no such annotation, a
+      departure that the docstring of `impliedExchange` records -/
+  rateFixed : Bool := false
+  /-- the date that a note of the posting gives it, the last of its note
+      lines that gives one (`noteDateOf`): `some (some d)` for the day
+      `d`, and `some none` for a date that this reader does not read -/
+  noteDate : Option (Option Int) := none
   deriving Repr
 
 instance : Inhabited PostSpec :=
@@ -413,8 +459,9 @@ private inductive EvKind where
     either direction (`commodity_history_impl_t`, history.cc:114-120,
     351-369; history.h:77). Its instants are local times without a zone,
     read here as written. `St.priceLog` holds the points that the
-    directives read so far write, `priceTable` resolves them into the
-    table, and `pricesAt` reads the table as of an instant. -/
+    directives and the costs read so far write, `priceTable` resolves
+    them into the table, and `pricesAt` reads the table as of an
+    instant. -/
 structure PricePoint where
   secs : Int
   comm : String
@@ -472,7 +519,28 @@ structure St where
       `apply account` stack when the directive was read -/
   aliases : List (String × String) := []
   rewrites : List (Rx × String) := []
+  /-- one entry for each `apply` directive in force, the innermost first:
+      the account of an `apply account` directive, and `none` for an
+      `apply` of another kind. `pushApply` and `popApply` alone change it,
+      and they change `fixatedComms` and `applyTags` with it, so that the
+      three lists stay in step -/
   applyStack : List (Option String) := []
+  /-- one entry for each entry of `applyStack`, the innermost first: the
+      commodity of an `apply fixed` or `apply rate` directive, named
+      through the commodity aliases, and `none` for an `apply` of another
+      kind. C++ annotates a posting amount in that commodity that has no
+      annotation of its own with the fixated price of the directive
+      (textual_xacts.cc:626-638), which `PostSpec.rateFixed` records -/
+  fixatedComms : List (Option String) := []
+  /-- one entry for each entry of `applyStack`, the innermost first: the
+      text of an `apply tag` directive as C++ keeps it, trimmed and, when
+      it holds no `:`, wrapped in colons (textual_directives.cc:493-501,
+      527), and `none` for an `apply` of another kind. C++ reads each
+      such text into every transaction under it as it reads a note of
+      the transaction (textual_xacts.cc:1167-1188), and so takes from it
+      the date of the transaction, which dates the prices of its costs
+      (`noteDateOf`, `finalizeXact`) -/
+  applyTags : List (Option String) := []
   bucket : Option String := none
   autos : List AutoRule := []
   autoPred : List (List PredSpec × Option String) := []
@@ -506,18 +574,22 @@ structure St where
       gives its meaning, where it is set in excess and where it is
       missed -/
   lotFanout : Bool := false
-  /-- every point that the price directives read so far write, the most
-      recent first, which `priceTable` resolves into the dated price
-      table when the journal has been read (`priceDirective`) -/
+  /-- every point that the price directives and the costs of the
+      transactions read so far write, the most recent first, which
+      `priceTable` resolves into the dated price table when the journal
+      has been read (`priceDirective`, `costPrice`, `recordCostPoints`) -/
   priceLog : List PricePoint := []
-  /-- the commodities that the price directives read so far mark
-      primary, as far as this reader records them (`priceDirective`),
-      kept for valuation: balancing does not read them. The list is
-      partial; `Result.primary` names what it leaves out -/
+  /-- the commodities that the price directives and the costs read so
+      far mark primary, as far as this reader records them
+      (`priceDirective`, `recordCostPoints`), kept for valuation:
+      balancing does not read them. The list is partial; `Result.primary`
+      names what it leaves out -/
   primary : List String := []
-  /-- the price directives whose point the table does not hold, each as
-      an issue and the commodity that it prices, empty where that is not
-      read (`priceDirective`), the most recent first -/
+  /-- the price directives and the costs whose point the table does not
+      hold, or holds at a date that a note or an `apply tag` gives, each
+      as an issue and the commodity that it prices, empty where that is
+      not read (`priceDirective`, `recordCostPoints`, `finalizeXact`), the
+      most recent first -/
   priceIssues : List (String × String) := []
   /-- set by an in-file `--now` line, after which the current time of
       C++ is not known here: the option takes a time with its date
@@ -532,7 +604,10 @@ structure St where
       files are spliced, since C++ restores its year where an included
       file ends (textual_directives.cc:424-446), and at an `apply year`
       directive, which sets that year (textual_directives.cc:464-476,
-      543-559) where `defaultYear` stays as it was (`priceDirective`) -/
+      543-559) where `defaultYear` stays as it was. `priceDay` then reads
+      no such date, whether it is the date of a price directive
+      (`priceDirective`), of a transaction with a cost
+      (`recordCostPoints`) or of a note (`noteDateOf`) -/
   yearUnsure : Bool := false
   /-- set where an input date format is given, by `--input-date-format`
       or an in-file line of it: C++ then tries that format before its
@@ -689,19 +764,41 @@ private def roundsToZero (st : St) (comm : String) (q : ℚ) : Bool :=
     - the display precision read here omits what C++ learns from the
       amounts of an automated transaction's postings
       (textual_xacts.cc:271) and of a periodic template
-      (textual_xacts.cc:952), from a `define` and a typed metadata
-      value, which it evaluates as expressions whose amounts migrate
-      their precision (textual_directives.cc:1081, metadata.cc:194,
-      token.cc:555), and from an `apply fixed` rate
-      (textual_directives.cc:534-535). Where C++ holds a positive
+      (textual_xacts.cc:952), from an `apply fixed` rate
+      (textual_directives.cc:534-535), and from the amount literals of
+      the value expressions that it parses with migration, each of
+      which but a literal in braces teaches its commodity its decimals
+      as C++ reads it (token.cc:317-322, 542-555). These are all the
+      value expressions but those of a cost and of a balance assertion
+      or assignment, which C++ parses with PARSE_NO_MIGRATE
+      (textual_xacts.cc:691-694, 756-760), and that of a posting
+      amount, whose literals this reader approximates (the precision
+      rule of `finalizeXact`). Among them are a `define`
+      (textual_directives.cc:1081), a typed metadata value
+      (metadata.cc:194), a `Value:` tag (post.cc:1064-1076), a line of a
+      transaction that begins with `assert`, `check` or `expr`, before
+      or after its postings (textual_xacts.cc:1107-1125), the `eval`,
+      `expr`, `assert`, `check` and `value` directives
+      (textual_directives.cc:911-937), the predicate of an automated
+      transaction (textual_xacts.cc:221), the `assert`, `check`, `eval`,
+      `expr` and `value` subdirectives of `account`
+      (textual_directives.cc:647-681, 739-740), the `assert` and `check`
+      subdirectives of `tag` (textual_directives.cc:901-904) and the
+      `value` subdirective of `commodity`
+      (textual_directives.cc:852-853). Where C++ holds a positive
       precision from one of these it widens nothing, so after
       `= /^NEVER/` with `(Y) 0.50 EUR`, `~ Monthly` with `X 0.50 EUR`
       against an elided `Y`, `define x = 0.50 EUR`, `; X:: 0.50 EUR` or
       `apply fixed BAZ 0.50 EUR`, the transaction `1.0001 FOO @ 1 EUR`
       against `-1 BAR @ 1 EUR` is rejected here and accepted by C++
-      (fail-closed). The comment on periodic templates in
+      (fail-closed). The same gaps reach the rows: after a transaction
+      of `Assets:Cash  $10` against an elided `Equity` with the line
+      `check amount < $0.001`, C++ prints a later `($1/3)` against an
+      elided `Equity` as `$0.333`, where this reader prints no row for
+      it (wrong rows). The comment on periodic templates in
       `flushPending` and the `apply fixed` entry of `impliedExchange`
-      record what the same gaps do to the other tests. -/
+      record what the same gaps do to the other tests, and `costPrice`
+      what they do to the prices of costs. -/
 private def zeroTestPrec (st : St) (posts : List PostSpec) (comm : String) :
     Nat :=
   match (st.precisions.lookup comm).getD 0 with
@@ -955,6 +1052,27 @@ def containsTag (notes tag : String) : Bool :=
 private def containsUUID (s : String) : Bool :=
   (s.toLower.splitOn "uuid:").length > 1
 
+/-- The UUID that this reader finds in the line `s` of the body of a
+    transaction, any of its posting lines and note lines: the text after
+    the first `uuid:`, in any case, up to a `,` or a `;`, trimmed and in
+    lower case, and the first line that gives one prevails. C++ reads
+    the `UUID` tag of the transaction alone (journal.cc:593), which the
+    note of its header, its note lines before the first posting and an
+    `apply tag` in force give it, matching the name of the tag in any
+    case (metadata.cc:117) and keeping its value as written, a known
+    departure that leaves the rows wrong both ways, measured on both C++
+    binaries. Two transactions that post `$5` to `Assets:uuid:x`, or
+    `$5` with `; UUID: abc` on the posting, against an elided `Equity`,
+    or that buy `1 AAPL [2024/01/01] @ $5` with `; UUID: abc` on a note
+    line after a posting, or with `; UUID: abc` on a note line before the
+    postings of the one and `; UUID: ABC` on such a line of the other,
+    are both kept by C++ and one of them is dropped here; and two that
+    buy `1 AAPL {$4} @ $5` with `; UUID: abc` in the note of the header,
+    or `1 AAPL [2024/01/01] @ $5` under `apply tag UUID: abc`, are
+    reduced to one by C++ and both kept here.
+    The prices that their costs record are the same in either reading,
+    since C++ records them for a duplicate as well (the comment on `dup`
+    in `finalizeXact`). -/
 private def uuidOf (s : String) : Option String :=
   match s.toLower.splitOn "uuid:" with
   | _ :: rest :: _ =>
@@ -1014,6 +1132,10 @@ private structure AnnotTail where
   lotLit : Option (Nat × Bool)
   /-- `PostSpec.costAnnotated` -/
   costAnnotated : Bool
+  /-- `PostSpec.costLotComm` -/
+  costLot : Option String
+  /-- `PostSpec.costVirtual` -/
+  costVirtual : Bool
 
 /-- Consume the annotation/cost/assertion tail of an amount:
     `{lot} [date] (note) @ P / @@ T / = ASSERT` in any order. -/
@@ -1023,7 +1145,8 @@ private partial def annotLoop (ctx : AmtCtx) (line : Nat) (a : Amount)
     (costDecs : Nat := 0) (afterAssert : Bool := false)
     (annotated : Bool := false) (fixated : Bool := false)
     (ownLot : Bool := false) (perUnit : Bool := false)
-    (lotLit : Option (Nat × Bool) := none) (costAnnotated : Bool := false) :
+    (lotLit : Option (Nat × Bool) := none) (costAnnotated : Bool := false)
+    (costLot : Option String := none) (costVirtual : Bool := false) :
     Except String AnnotTail := do
   -- `annotated`, `fixated` and `ownLot`: an annotation met before any
   -- cost or assertion belongs to the posting's own amount; after a
@@ -1038,7 +1161,7 @@ private partial def annotLoop (ctx : AmtCtx) (line : Nat) (a : Amount)
   let t := trimS tail
   if t.isEmpty || t == "." then
     pure { lot, cost, teach, costDecs, annotated, fixated, ownLot, perUnit,
-           lotLit, costAnnotated }
+           lotLit, costAnnotated, costLot, costVirtual }
   else if t.startsWith "{" then
     -- `{{total}}` and `{per-unit}` lot prices, possibly `{=fixated}`;
     -- lots parse with PARSE_NO_MIGRATE — no precision teaching
@@ -1068,12 +1191,19 @@ private partial def annotLoop (ctx : AmtCtx) (line : Nat) (a : Amount)
         | none => some (lotAmt, fix)
     let lotLit' := if afterCost || lot.isSome then lotLit
       else some (pr.decimals, total)
+    -- the lot price that annotates the cost itself, whose commodity
+    -- `costPrice` compares with the amount's (regress/1217): the first,
+    -- on a cost with a commodity, where the price has one
+    let costLot' := if onCost && costLot.isNone && pr.amount.comm != "" then
+        some pr.amount.comm
+      else costLot
     -- while `own` holds, every lot taken so far is the posting's own
     annotLoop ctx line a (String.ofList rest) lot' cost teach afterCost costDecs
       (afterAssert := afterAssert) (annotated := annotated || own)
       (fixated := if own then lot'.any (·.2) else fixated)
       (ownLot := if own then lot'.isSome else ownLot) (perUnit := perUnit)
       (lotLit := lotLit') (costAnnotated := costAnnotated || onCost)
+      (costLot := costLot') (costVirtual := costVirtual)
   else if t.startsWith "[" then
     match takeBalanced '[' ']' t.toList with
     | some (_, rest) =>
@@ -1081,6 +1211,7 @@ private partial def annotLoop (ctx : AmtCtx) (line : Nat) (a : Amount)
           (afterAssert := afterAssert) (annotated := annotated || own)
           (fixated := fixated) (ownLot := ownLot) (perUnit := perUnit)
           (lotLit := lotLit) (costAnnotated := costAnnotated || onCost)
+          (costLot := costLot) (costVirtual := costVirtual)
     | none => err line s!"unclosed lot date in '{t}'"
   else if t.startsWith "(" && !(t.startsWith "(@") then
     match takeBalanced '(' ')' t.toList with
@@ -1089,6 +1220,7 @@ private partial def annotLoop (ctx : AmtCtx) (line : Nat) (a : Amount)
           (afterAssert := afterAssert) (annotated := annotated || own)
           (fixated := fixated) (ownLot := ownLot) (perUnit := perUnit)
           (lotLit := lotLit) (costAnnotated := costAnnotated || onCost)
+          (costLot := costLot) (costVirtual := costVirtual)
     | none => err line s!"unclosed lot note in '{t}'"
   else if t.startsWith "(@@)" || t.startsWith "@@" then
     let off := if t.startsWith "(@@)" then 4 else 2
@@ -1103,6 +1235,7 @@ private partial def annotLoop (ctx : AmtCtx) (line : Nat) (a : Amount)
       (max costDecs pr.decimals) (afterAssert := afterAssert)
       (annotated := annotated) (fixated := fixated) (ownLot := ownLot)
       (perUnit := false) (lotLit := lotLit) (costAnnotated := costAnnotated)
+      (costLot := costLot) (costVirtual := t.startsWith "(@@)")
   else if t.startsWith "(@)" || t.startsWith "@" then
     -- per-unit costs round at the cost literal's own precision,
     -- posting by posting (regress/1125); `@ =` fixates (1794). A cost
@@ -1119,6 +1252,7 @@ private partial def annotLoop (ctx : AmtCtx) (line : Nat) (a : Amount)
       (max costDecs pr.decimals) (afterAssert := afterAssert)
       (annotated := annotated) (fixated := fixated) (ownLot := ownLot)
       (perUnit := true) (lotLit := lotLit) (costAnnotated := costAnnotated)
+      (costLot := costLot) (costVirtual := t.startsWith "(@)")
   else if t.startsWith "=" then
     -- assertion: the C++ side checks it; positive tests pass it, but
     -- the literal still teaches display precision (1699). C++ parses
@@ -1127,14 +1261,26 @@ private partial def annotLoop (ctx : AmtCtx) (line : Nat) (a : Amount)
     -- `(note)` sets neither flag nor `ownLot`; the lot reading above
     -- still takes a lot written there as the posting's own for
     -- `lotVal`, a reading that no C++ test exercises (regress/2318
-    -- writes the posting's lot first)
+    -- writes the posting's lot first). C++ parses a literal with
+    -- migration, which teaches its commodity its decimals however many
+    -- they are, and an expression with PARSE_NO_MIGRATE, which teaches
+    -- nothing (textual_xacts.cc:756-760), while here the amount teaches
+    -- its decimals, a literal's or the approximation of an expression's
+    -- (`parseAmount`), up to six alone, a known departure both ways:
+    -- after `Assets:Cash  $1.00` against an elided `Equity` and
+    -- `Assets:Cash  $0 = $1.0000000` against another, C++ prints a later
+    -- `($1/3)` against an elided `Equity` as `$0.3333333`, and after
+    -- `Assets:Cash  $1` and `Assets:Cash  $0 = ($1.00 * 1)` it prints no
+    -- row for it, where it shows as 0.33 here after either (wrong rows).
+    -- The assignment rule of `parseAmountField` shares both
     let pr ← parseAmount ctx line (trimS (t.drop 1).toString)
     let teach := if pr.decimals <= 6 then
         (pr.amount.comm, pr.decimals) :: teach else teach
     annotLoop ctx line a pr.tail lot cost teach afterCost costDecs
       (afterAssert := true) (annotated := annotated) (fixated := fixated)
       (ownLot := ownLot) (perUnit := perUnit) (lotLit := lotLit)
-      (costAnnotated := costAnnotated)
+      (costAnnotated := costAnnotated) (costLot := costLot)
+      (costVirtual := costVirtual)
   else
     err line s!"trailing junk after amount '{t}'"
 
@@ -1168,6 +1314,17 @@ private structure AmountField where
   costPrec : Nat := 0
   /-- `PostSpec.costAnnotated` -/
   costAnnotated : Bool := false
+  /-- `PostSpec.rawCost`, the cost in the commodity in which it is
+      written -/
+  rawCost : Option Amount := none
+  /-- `PostSpec.rawCostPrec` -/
+  rawCostPrec : Nat := 0
+  /-- `PostSpec.costVirtual` -/
+  costVirtual : Bool := false
+  /-- `PostSpec.costLotComm` -/
+  costLotComm : Option String := none
+  /-- `PostSpec.amtPrec` -/
+  amtPrec : Nat := 0
 
 /-- Parse the amount field of a posting (everything after the
     account): amount, lot annotations, cost, assertion/assignment.
@@ -1181,7 +1338,12 @@ private def parseAmountField (ctx : AmtCtx) (line : Nat) (field : String)
   else if field.startsWith "=" then
     -- balance assignment (amountless posting); lot annotations on the
     -- target are parsed and dropped (1603), and the flags stay false
-    -- (the departure recorded at `PostSpec.fixated`)
+    -- (the departure recorded at `PostSpec.fixated`). Its amount teaches
+    -- as an assertion's does, with the departures recorded at the `=`
+    -- branch of `annotLoop`: after `Assets:Cash  $1.00` against an elided
+    -- `Equity` and `Assets:Cash  = $1.0000000` against another, C++
+    -- prints a later `($1/3)` against an elided `Equity` as `$0.3333333`,
+    -- where it shows as 0.33 here (wrong rows)
     let r ← parseAmount ctx line (trimS (field.drop 1).toString)
     let _ ← annotLoop ctx line r.amount r.tail none none
     pure { assignTarget := some r.amount, learned := r.learned
@@ -1214,7 +1376,7 @@ private def parseAmountField (ctx : AmtCtx) (line : Nat) (field : String)
     -- 249). annotLoop reads the first as it reads an annotation on a
     -- plain amount, and of two lot prices it keeps the first.
     let { lot, cost, teach, costDecs, annotated, fixated, ownLot, perUnit,
-          lotLit, costAnnotated } ←
+          lotLit, costAnnotated, costLot, costVirtual } ←
       annotLoop ctx line a r.tail preLot none (annotated := preLot.isSome)
         (fixated := preLot.any (·.2)) (ownLot := preLot.isSome)
     -- the precision of the cost amount, for the widened zero test of
@@ -1236,6 +1398,9 @@ private def parseAmountField (ctx : AmtCtx) (line : Nat) (field : String)
         r.decimals + 6
       else r.decimals
     let costPrec := if perUnit then costDecs + amtPrec else costDecs
+    -- the precision of the cost when Phase 6 exchanges it, before the
+    -- raise below (`PostSpec.rawCostPrec`)
+    let rawCostPrec := costPrec
     -- Phase 6 raises it (xact.cc:693-729): when the posting's own lot
     -- price is in the cost's commodity and the basis, the lot price
     -- times the amount kept unrounded (pool.cc:502), differs from the
@@ -1337,7 +1502,9 @@ private def parseAmountField (ctx : AmtCtx) (line : Nat) (field : String)
            learned := r.learned
            decimals := r.decimals, isExpr := field.startsWith "(", teach
            costDecs, gainVal, annotated := hasComm && annotated
-           fixated := hasComm && fixated, costPrec, costAnnotated }
+           fixated := hasComm && fixated, costPrec, costAnnotated
+           rawCost := cost, rawCostPrec, costVirtual, costLotComm := costLot
+           amtPrec }
 
 private def parsePosting (st : St) (line : Nat) (raw : String)
     (periodic : Bool := false) :
@@ -1370,7 +1537,10 @@ private def parsePosting (st : St) (line : Nat) (raw : String)
                      assignTarget := af.assignTarget, amtDecs := af.decimals
                      costDecs := af.costDecs, gainVal := af.gainVal
                      annotated := af.annotated, fixated := af.fixated
-                     costPrec := af.costPrec, costAnnotated := af.costAnnotated },
+                     costPrec := af.costPrec, costAnnotated := af.costAnnotated
+                     rawCost := af.rawCost, rawCostPrec := af.rawCostPrec
+                     costVirtual := af.costVirtual
+                     costLotComm := af.costLotComm, amtPrec := af.amtPrec },
               af.learned, af.amount.map (·.comm), af.decimals, af.isExpr,
               af.teach)
 
@@ -1495,6 +1665,321 @@ private def tagEqGuard (hline : Nat) (k xactNotes : String)
     ((written.filter (·.comm == c)).map (·.q)).sum == 0
   if posts.any (·.amount.isNone) && written.any (netsToZero ·.comm) then
     refuse "an elided posting beside a commodity whose amounts net to zero"
+
+/-! ## The dates of prices -/
+
+/-- The fields of the date `s` of a price directive, each as its number
+    and its count of digits, where `s` is fields of digits joined by
+    single characters among `/`, `-` and `.`, and `none` otherwise. C++
+    reads `.` and `-` in a date as `/`: `parse_datetime` always, for a
+    date with a time (times.cc:429-432), and the readers of a date
+    without a time unless an input date format is given
+    (times.cc:239-243, `St.inputDateFormat`). -/
+private def priceDateFields (s : String) : Option (List (Int × Nat)) :=
+  (((s.splitOn "/").flatMap (·.splitOn "-")).flatMap (·.splitOn ".")).mapM
+    fun p =>
+      if !p.isEmpty && p.toList.all Char.isDigit then
+        p.toNat?.map fun v => ((v : Int), p.length)
+      else none
+
+/-- Whether the year `y`, the month `m` and the day `d` name a day that
+    C++ can hold: the gregorian dates of boost, which `ptime_from_tm` and
+    `date_from_tm` build (times.cc:154-155, 181-182), span the years 1400
+    to 9999 and refuse a day that the month lacks, so that
+    `P 1399/12/31 EUR $1` and `P 2024/02/30 EUR $1` reject the journal on
+    both C++ binaries. -/
+private def priceDayValid (y m d : Int) : Bool :=
+  let leap := (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
+  let days := if m == 2 then (if leap then 29 else 28)
+    else if m == 4 || m == 6 || m == 9 || m == 11 then 30 else 31
+  1400 ≤ y && y ≤ 9999 && 1 ≤ m && m ≤ 12 && 1 ≤ d && d ≤ days
+
+/-- The day, counted as `daysFromCivil` counts it, of the date `dateS` of
+    a price directive without a time, read as `parse_date` reads it,
+    through readers that C++ tries in turn until one reads the date
+    (pool.cc:565-567; times.cc:229-327, 2539-2544), with a year of four
+    digits and a month and a day of one or two: `Y/M/D`
+    (test/baseline/cmd-pricemap.test, test/baseline/opt-historical.test,
+    test/regress/7C44010B.test), `Y/M`, which is the first day of the
+    month (times.cc:2541), and `M/D` in the year of a `Y` or `year`
+    directive (times.cc:175-182, 277-281;
+    test/regress/coverage-wave2-textual.test). Any other date is `none`,
+    and so is every date where an input date format is given
+    (`St.inputDateFormat`), and `M/D` in two more cases. Where no year
+    directive has been read, C++ takes the year of its current time and,
+    for a month after the current one, the year before
+    (times.cc:283-301). Where `St.yearUnsure` is set, C++ takes the year
+    of an `apply year` directive, or in a journal with included files
+    the year that it restores where an included file ends
+    (textual_directives.cc:424-446, 464-476), neither of which
+    `defaultYear` follows. `recordCostPoints` reads the date of a
+    transaction with it, and `noteDateOf` the date that a note gives, for
+    the prices of costs, since C++ reads both with `parse_date` as well
+    (textual_xacts.cc:984-990, item.cc:96-102). -/
+private def priceDay (st : St) (dateS : String) : Option Int := do
+  guard !st.inputDateFormat
+  match ← priceDateFields dateS with
+  | [(y, 4), (m, lm), (d, ld)] =>
+      if lm ≤ 2 && ld ≤ 2 && priceDayValid y m d then
+        some (daysFromCivil y m d)
+      else none
+  | [(y, 4), (m, lm)] =>
+      if lm ≤ 2 && priceDayValid y m 1 then some (daysFromCivil y m 1)
+      else none
+  | [(m, lm), (d, ld)] =>
+      let y ← st.defaultYear
+      if lm ≤ 2 && ld ≤ 2 && !st.yearUnsure && priceDayValid y m d then
+        some (daysFromCivil y m d)
+      else none
+  | _ => none
+
+/-- The date that the note line `note` gives the item that it annotates,
+    read as `item_t::parse_tags` reads one (item.cc:66-104): after the
+    blanks, tabs and `;` that begin the line, its first `[`, when a digit
+    or `=` follows it, no `:` precedes it and a `]` closes it within 255
+    characters, holds a date, an auxiliary date after `=`, or both, and
+    C++ reads the date as `parse_date` reads the date of a price
+    directive, as `priceDay` does. `none` where the line gives no date,
+    or an auxiliary date alone, which dates no price; `some (some d)` for
+    the day `d`; and `some none` for a date that this reader does not
+    read. A note of a posting dates the posting, and one of its
+    transaction dates the transaction, whose date a posting without one
+    takes (`post_t::date`, post.cc:143-174), and of the note lines of an
+    item the last that gives a date prevails. C++ reads the text of each
+    `apply tag` in force into a transaction in the same way, after its
+    notes (`St.applyTags`). -/
+private def noteDateOf (st : St) (note : String) : Option (Option Int) := do
+  let d := note.toList.dropWhile fun c => c == ' ' || c == '\t' || c == ';'
+  let i ← d.findIdx? (· == '[')
+  let inner := d.drop (i + 1)
+  guard (inner.head?.any fun c => c.isDigit || c == '=')
+  guard !((d.take i).contains ':')
+  let j ← inner.findIdx? (· == ']')
+  guard (j < 256)
+  let primary := (inner.take j).takeWhile (· != '=')
+  guard !primary.isEmpty
+  pure (priceDay st (String.ofList primary))
+
+/-- The date and the note of the header line `header` of a transaction,
+    as `parse_xact` reads them (textual_xacts.cc:984-1074). The date is
+    the first field, which ends at a blank or a tab (`next_element`,
+    utils.h:623-631), up to the `=` of an auxiliary date. Past the blanks
+    and tabs after it, C++ passes over a state mark, `*` or `!`, a code in
+    parentheses and, when no mark precedes the code, a state mark after it
+    (textual_xacts.cc:1019-1036), each with the blanks and tabs that
+    follow it, and then reads the payee, which ends at the first
+    `;` that a run of blanks and tabs holding a tab or two blanks
+    precedes; the note is the text after that `;`, and there is none
+    without it. A `;` that no such run precedes belongs to the payee, and
+    so does one where the payee begins: under `2024/01/05 Buy ; [2024/01/09]`,
+    `2024/01/05 ; [2024/01/09]` or `2024/01/05 *  ; [2024/01/09]`, both
+    C++ binaries list the price of `1 AAPL @ $101` at 2024/01/05, and
+    under `2024/01/05 Buy  ; [2024/01/09]` at 2024/01/09. `priceDay` reads
+    the day of this date and `noteDateOf` the date that this note gives,
+    for the prices of costs alone (`recordCostPoints`); the rest of the
+    reader keeps the readings of `headerDateF` and `splitNote`, whose date
+    ends at a blank or an `=` and whose note begins at the first `;` after
+    a blank or a tab. -/
+private def xactHeaderParts (header : String) : String × Option String :=
+  let blank := fun (c : Char) => c == ' ' || c == '\t'
+  let cs := header.toList
+  let field := cs.takeWhile fun c => !blank c
+  let date := String.ofList (field.takeWhile (· != '='))
+  let mark := fun (l : List Char) => match l with
+    | c :: r => if c == '*' || c == '!' then some (r.dropWhile blank) else none
+    | [] => none
+  let rec payee (spaces tabs : Nat) : List Char → Option String
+    | [] => none
+    | ' ' :: r => payee (spaces + 1) tabs r
+    | '\t' :: r => payee spaces (tabs + 1) r
+    | ';' :: r =>
+        if tabs > 0 || spaces > 1 then some (String.ofList r) else payee 0 0 r
+    | _ :: r => payee 0 0 r
+  match cs.drop field.length with
+  | [] => (date, none)
+  | _ :: rest =>
+      let next := rest.dropWhile blank
+      let marked := mark next
+      let next := marked.getD next
+      -- C++ steps past the `(` of a code whether or not a `)` closes it
+      let next := match next with
+        | '(' :: r =>
+            match r.findIdx? (· == ')') with
+            | some i => (r.drop (i + 1)).dropWhile blank
+            | none => r
+        | _ => next
+      let next := if marked.isSome then next else (mark next).getD next
+      (date, payee 0 0 next)
+
+/-! ## The prices that costs record -/
+
+/-- The price that Phase 6 of `finalize` records for the cost of the
+    posting `p` in a transaction with a date, as the commodity that it
+    prices and its price per unit, or `none` where it records none.
+    `st` holds the display precisions as this reader has learned them
+    once the postings of the transaction are read, which is when C++
+    reads them in Phase 6; where that learning departs from C++, the
+    price departs with it, as the account of departures below records.
+
+    Phase 6 hands each posting with a cost, of whatever kind, to
+    `commodity_pool_t::exchange` (xact.cc:669-690), which takes the
+    absolute value of the cost divided by the amount and records it as
+    the price of the amount's commodity, its annotation set aside, at
+    00:00 of the posting's date (pool.cc:390-397, 437, 488-493;
+    xact.cc:688-690). A divided price in a commodity is rounded half away
+    from zero at the precision of the amount, plus the display precision
+    of the price's commodity, plus six (pool.cc:445-468, issue #2975):
+    `12.00 EUR @@ 15.80 USD` records 1.31666667 USD where USD has no
+    display precision yet (test/baseline/cmd-pricedb.test), and
+    `3 AAPL @@ $100` records $33.33333333 once `$1.00` has taught `$` two
+    places, of which `pricedb` prints six. A per-unit `@ P` is divided as
+    well, since the cost is `P` times the amount by then
+    (textual_xacts.cc:701-707), and so records `P` unless `P` has more
+    places than that precision: `1 AAPL @ $0.12345678` records $0.123457.
+    Where the amount is zero at the display precision of its commodity
+    (`amount_t::is_zero`, amount.cc:1374-1430), the price is the cost
+    itself, rounded at its own precision (`PostSpec.rawCostPrec`) or at
+    the display precision of its commodity, the larger (pool.cc:437, 466;
+    amount.cc:882-891), which leaves a written cost as it is:
+    `(1/9 FOO) @ 200 EUR`, whose amount is zero at the precision 0 of
+    FOO, records its cost of 200/9 EUR at the six places that the cost
+    takes from the amount, 22.222222 EUR. A price without a commodity is
+    not rounded (pool.cc:439-440, 460): `3 AAPL @@ 100` records 100/3. An
+    amount without a commodity is priced as well, on the vertex of the
+    null commodity, which `pricedb` does not list and through which a
+    valuation can pass: after `Assets:A  10 @ $5`, `P 2024/01/01 X 5`
+    values one X at $25 on both C++ binaries.
+
+    No price is recorded (pool.cc:483-493) for a virtual cost, `(@)` or
+    `(@@)`, which Phase 6 exchanges without adding a price
+    (test/regress/999-a.test, test/regress/999-b.test,
+    test/regress/1050.test); for a price that
+    is exactly zero, a zero cost or one that rounds to zero; for an
+    amount whose own lot price is fixated, `{=P}` or `{{=T}}`, or which
+    an `apply fixed` rate annotates (`PostSpec.rateFixed`); for a cost
+    whose own lot price is in the amount's commodity (issue #1217,
+    test/regress/1217.test); and for a cost in the amount's commodity,
+    which Phase 6 rejects for a plain amount (xact.cc:679-681). A fixated
+    cost, `@ =P` or `@@ =T`, records its price, since Phase 6 fixates the
+    lot price only after the exchange (xact.cc:816-819).
+
+    The departures known are these, each measured on both C++ binaries.
+    The precision of an amount expression is the approximation of
+    `parseAmountField`, and the zero test of such an amount reads the
+    display precision that the reader learns from it, the departure
+    recorded beside the precision rule of `finalizeXact`, so that the
+    price of a cost on such an amount can be rounded, or taken from the
+    cost alone, otherwise than in C++: `(1.5 * 1.5 AAPL) @@ $10` records
+    $4.44444444 in C++ and $4.4444444444444 here, and
+    `(1.25/3 FOO) @ 1 EUR`, an amount that C++ takes as zero, records
+    0.416667 EUR in C++ and 1 EUR here. The precision of a cost written
+    as an expression is the approximation that the docstring of
+    `zeroTestPrec` records, and so is the rounding of such a cost on an
+    amount that is zero: `0 AAPL @@ ($100/3)` records $33.333333 in C++
+    and $33 here.
+
+    More widely, the price is rounded, and the zero test of its amount
+    reads, at display precisions that this reader learns, and so the
+    price inherits each departure of that learning. Those departures
+    begin with the sources that this reader omits, which the docstring
+    of `zeroTestPrec` gives: the postings of an automated transaction and
+    of a periodic template, the latter recorded at `flushPending` as
+    well, an `apply fixed` rate, and the amount literals of the value
+    expressions that C++ parses with migration, but for that of a
+    posting amount, such as a `define`, a typed metadata value, a `check`
+    line of a transaction or an `eval` directive. The tentative precision
+    of a price directive departs as the `P` arm of `handleDirective`
+    records, and the precision that a `D` directive locks departs as the
+    `D` arm records. The literals of an amount expression depart as the
+    precision rule of `finalizeXact` records. The amount of a balance
+    assertion or assignment teaches nothing here past six places, teaches
+    here alone where it is an expression (the `=` branch of `annotLoop`),
+    and teaches the commodity that it names as written (the rule on
+    `teach` in `finalizeXact`). A transaction dropped for a UUID seen
+    before teaches nothing here, while C++ learns from it as it reads it
+    (the comment on `dup` in `finalizeXact`). After a transaction of
+    `Assets:Cash  $10` against an elided `Equity` with the line
+    `check amount < $0.001`, `3 AAPL @@ $100` records $33.333333333 in
+    C++ and $33.333333 here. `3 AAPL @@ 100 EUR` records 33.33333333 EUR
+    in C++ and 33.333333 EUR here after `~ Monthly` with `X  0.50 EUR`
+    against an elided `Y`, and 33.333333333 EUR in C++ and 33.333333 EUR
+    here beside `Assets:Cash  -100 EUR = -100.000 E` under
+    `commodity EUR` with `alias E`. After `Assets:Cash  $1.2345` against
+    an elided `Equity` and then `D $1.00`, `3 AAPL @@ $100` records
+    $33.3333333333 in C++ and $33.33333333 here; after
+    `Assets:A  0.0001 AAPL` against an elided `Equity` and then
+    `D 1.00 AAPL`, `0.001 AAPL @@ $10` records $10000 in C++ and $10
+    here, where its amount is zero at the two places of the directive.
+    Beside `Assets:Cash  $-100 = $-100.0000000`, `3 AAPL @@ $100` records
+    $33.3333333333333 in C++ and $33.333333 here, and `3 MSFT @@ $100`
+    records $33.33333333 in C++ and $33.333333 here after a transaction
+    with `UUID: abc` and `Assets:Cash  $-5` is repeated with `$-5.00`.
+
+    The cost is read as the reader reads any amount, and so inherits the
+    departures of its style model, of the `commodity` aliases and of a
+    one-to-one `C` equivalence that the docstring of `priceDirective`
+    records for a price: after a periodic template with `X  10,5 E`
+    against an elided `Y`, which teaches C++ alone a decimal comma for
+    `E` (the departure recorded at `flushPending`), `10 AAPL @ 1,500 E`
+    records 1.5 E in C++ and 1500 E here, and beside `C 1 A = 1 B`,
+    `10 X @ 5 A` records 5 B in C++ and 5 A here.
+
+    An `apply fixed` or `apply rate` directive left open in an included
+    file stays in force here to the end of the journal, the departure
+    recorded at the `apply` arm of `handleDirective`, so that the table
+    lacks the prices that C++ records for later costs on amounts in its
+    commodity, and no issue stands in their place (fail-open): with
+    `apply fixed AAPL $40` left open in an included file,
+    `10 AAPL @ $50` after the `include` line records $50 in C++ and
+    nothing here. -/
+private def costPrice (st : St) (p : PostSpec) : Option (String × Amount) := do
+  let a ← p.rawAmount
+  let c ← p.rawCost
+  -- the exclusion by `rateFixed` fails open where an `apply fixed` or
+  -- `apply rate` left open in an included file annotates the amount here
+  -- alone: the table then lacks the point that C++ records, and no issue
+  -- stands in its place (the last paragraph above)
+  guard (!p.costVirtual && !p.fixated && !p.rateFixed)
+  guard (c.comm != a.comm && p.costLotComm != some a.comm)
+  let prec := fun (k : String) => (st.precisions.lookup k).getD 0
+  let ab := fun (x : ℚ) => if x < 0 then -x else x
+  let zero := a.q == 0 || (a.comm != "" && p.amtPrec > prec a.comm
+    && roundsToZeroAt (prec a.comm) a.q)
+  let q := if zero then ab c.q else ab (c.q / a.q)
+  let q := if c.comm == "" then q
+    else if zero then roundAt (max p.rawCostPrec (prec c.comm)) q
+    else roundAt (p.amtPrec + prec c.comm + 6) q
+  guard (q != 0)
+  pure (a.comm, ⟨c.comm, q⟩)
+
+/-- The state `st` once the prices `points` that Phase 6 records for the
+    costs of a transaction whose header line is `header` are written to
+    the price log, each as the commodity that it prices, its price
+    (`costPrice`) and the date that a note of its posting or of its
+    transaction, or an `apply tag` in force, gives its posting
+    (`noteDateOf`). A point is dated 00:00 of that date, with the issue
+    `posting-date`, which stands alone where `priceDay` does not read
+    that date, or else of the transaction's date as `priceDay` reads it
+    (`xactHeaderParts`), failing which the issue `unread-price` stands in
+    place of the point. C++ makes the commodity of each price primary
+    (commodity.cc:72-78, commodity.h:237), as it is here whether the
+    table holds the point or an issue stands in its place. -/
+private def recordCostPoints (st : St) (header : String)
+    (points : List (String × Amount × Option (Option Int))) : St :=
+  let xactDay := priceDay st (xactHeaderParts header).1
+  points.foldl (init := st) fun st (comm, price, noted) =>
+    let st := if st.primary.contains price.comm then st
+      else { st with primary := price.comm :: st.primary }
+    match noted, xactDay with
+    | some (some d), _ =>
+        { st with priceLog := ⟨d * 86400, comm, price⟩ :: st.priceLog
+                  priceIssues := ("posting-date", comm) :: st.priceIssues }
+    | some none, _ =>
+        { st with priceIssues := ("posting-date", comm) :: st.priceIssues }
+    | none, some d =>
+        { st with priceLog := ⟨d * 86400, comm, price⟩ :: st.priceLog }
+    | none, none =>
+        { st with priceIssues := ("unread-price", comm) :: st.priceIssues }
 
 /-! ## Transaction finalization -/
 
@@ -2338,10 +2823,10 @@ private structure PoolResult where
       (xact.cc:425-431), which depends on the price directives and the
       exchanges that precede the transaction, a history that balancing
       does not read (`St.primary` records the commodities that price
-      directives mark, for valuation alone). Balancing does not read
-      this candidate either, as the docstring of `impliedExchange`
-      records; `verifyExtended` weighs the generated postings under it
-      as under the orientations of `candidates`. -/
+      directives and written costs mark, for valuation alone). Balancing
+      does not read this candidate either, as the docstring of
+      `impliedExchange` records; `verifyExtended` weighs the generated
+      postings under it as under the orientations of `candidates`. -/
   swapped : List PoolCandidate := []
   /-- the commodities in which C++ can complete the pool with more than
       one posting, through its elided posting or through the bucket's
@@ -2843,13 +3328,14 @@ private def impliedExchange (st : St) (xact pool : List PostSpec)
     depends on the orientation is refused as out of scope. The check
     reads neither which commodities are COMMODITY_PRIMARY (the #1130
     entry of `impliedExchange`; `St.primary` records only those that
-    price directives mark, for valuation) nor the order in which C++
-    takes two balance entries when neither is the top posting's key
-    (balance.h:99, xact.cc:422-423), and each of these decides the
-    orientation. Because the first is not read, the refusal also falls
-    on a transaction before which no price directive, `C` directive or
-    earlier exchange has marked any commodity primary, where C++ takes
-    the orientation that the top posting's key decides. Under
+    price directives and written costs mark, for valuation) nor the
+    order in which C++ takes two balance entries when neither is the
+    top posting's key (balance.h:99, xact.cc:422-423), and each of
+    these decides the orientation. Because the first is not read, the
+    refusal also falls on a transaction before which no price
+    directive, `C` directive or earlier exchange has marked any
+    commodity primary, where C++ takes the orientation that the top
+    posting's key decides. Under
     `= /Brokerage/` with `Expenses:Fees 0.01` and `Assets:Cash $-15.00`,
     C++ accepts `Assets:Brokerage 10 AAPL {$150.00}` against
     `Assets:Cash $-1500.00` as the first transaction of a journal, the
@@ -3038,14 +3524,35 @@ private def finalizeXact (st : St) (hline : Nat) (_header : String)
   -- textual_xacts.cc:316-318), so it is always checked
   let uuid? := if periodic then none else
     rawPosts.findSome? fun (_, r) => uuidOf r
-  match uuid? with
-  | some u =>
-      if st.uuids.contains u then
-        return st   -- duplicate transaction: dropped whole
-      else pure ()
-  | none => pure ()
+  -- a transaction whose UUID has been seen is dropped whole but for the
+  -- prices of its costs, for which its postings are still read: C++
+  -- finalizes a transaction before it looks its UUID up and drops it
+  -- (journal.cc:573-596), so that Phase 6 records those prices, at the
+  -- date of the duplicate (`costPrice`). That date can differ from the
+  -- earlier transaction's, since C++ compares the amounts of the two
+  -- with the annotations that Phase 6 gives them (journal.cc:547-555,
+  -- 624-639), which carry the date of the exchange only where the amount
+  -- has no lot price and no lot date of its own (xact.cc:684-692,
+  -- 803-812; pool.cc:508-522): with `-1 AAPL {$4} @ $5`, or
+  -- `1 AAPL [2024/01/01] @ $5`, under `UUID: abc` on 2024/01/03 and again
+  -- on 2024/01/10, `pricedb` lists AAPL at $5 on 2024/01/10 on both C++
+  -- binaries. The duplicate teaches nothing here, while C++ learns from
+  -- it as it reads it, a departure that the docstring of `costPrice`
+  -- records. C++ rejects the journal where the postings of the two are
+  -- not equivalent (journal.cc:624-639), which is not checked here
+  -- (fail-open): `1 AAPL @ $5` under `UUID: abc` on 2024/01/03 and again
+  -- on 2024/01/10 is rejected by both C++ binaries and read here. A
+  -- duplicate with a posting that `parsePosting` does not read is dropped
+  -- whole without an error, and the issue `unread-price`, with no
+  -- commodity, stands in place of its points (`Result.priceIssues`):
+  -- C++ reads `Assets:Cash  $-5 = (abs($-5) * -1)` in the duplicate of
+  -- the purchase with a lot date above, skipping the check of a
+  -- duplicate's assertion (textual_xacts.cc:787-809,
+  -- test/regress/1771.test), and lists AAPL at $5 on 2024/01/10, while
+  -- `parsePosting` does not read `abs`
+  let dup := uuid?.any st.uuids.contains
   let st := match uuid? with
-    | some u => { st with uuids := u :: st.uuids }
+    | some u => if dup then st else { st with uuids := u :: st.uuids }
     | none => st
   -- parse postings, learning styles as we go; standalone comments
   -- after a posting append to ITS note (append_note, 783/2268), the
@@ -3058,12 +3565,27 @@ private def finalizeXact (st : St) (hline : Nat) (_header : String)
     if rawT.startsWith ";" then
       match posts with
       | pl :: rest =>
-          posts := { pl with note := pl.note ++ ";" ++ (rawT.drop 1).toString }
+          posts := { pl with note := pl.note ++ ";" ++ (rawT.drop 1).toString
+                             noteDate := noteDateOf stv (rawT.drop 1).toString
+                               <|> pl.noteDate }
             :: rest
       | [] => leadNotes := leadNotes ++ [(rawT.drop 1).toString]
       continue
     let (p?, learned, comm?, decs, isExpr, teach) ←
-      parsePosting stv ln raw periodic
+      match parsePosting stv ln raw periodic with
+      | .ok r => pure r
+      | .error e =>
+          if dup then
+            return { st with priceIssues := ("unread-price", "") :: st.priceIssues }
+          else throw e
+    -- the decimals of a balance assertion or assignment reach the
+    -- commodity named as written, while C++ names it through the
+    -- commodity aliases as it parses the amount (pool.cc:121-127,
+    -- 150-154), as the rule for a posting amount below does, a known
+    -- departure: under `commodity EUR` with `alias E`, after
+    -- `Assets:Cash  0 EUR = 0.000 E` against an elided `Equity`, C++
+    -- prints a later `(1/3 EUR)` against an elided `Equity` as 0.333 EUR,
+    -- where it leaves no row here (wrong rows)
     for (c, d) in teach do
       stv := bumpPrecision stv c d
     -- a style learned from a posting amount reaches its commodity, as
@@ -3124,6 +3646,13 @@ private def finalizeXact (st : St) (hline : Nat) (_header : String)
           | some a =>
               (resolveEquiv stv.equivs ((stv.commAliases.lookup a.comm).getD a.comm)).1
           | none => 1
+        -- what `costPrice` reads: the amount unreduced and the cost
+        -- reduced, each commodity named through the aliases, as C++
+        -- parses them (textual_xacts.cc:583, 691), and the date that the
+        -- posting's own note gives it
+        let named := fun (c : String) => (stv.commAliases.lookup c).getD c
+        let rawAmount : Option Amount :=
+          p.amount.map fun a => ⟨named a.comm, a.q⟩
         let p := { p with
           amount := p.amount.map (canonAmt stv)
           costVal := p.costVal.map (canonAmt stv)
@@ -3132,10 +3661,47 @@ private def finalizeXact (st : St) (hline : Nat) (_header : String)
             let c := canonAmt stv lu
             if scale == 0 then c else ⟨c.comm, c.q / scale⟩
           lotScale := if scale == 0 then 1 else scale
-          assignTarget := p.assignTarget.map (canonAmt stv) }
+          assignTarget := p.assignTarget.map (canonAmt stv)
+          rawAmount := rawAmount
+          rawCost := p.rawCost.map (canonAmt stv)
+          costLotComm := p.costLotComm.map named
+          rateFixed := rawAmount.any fun a => a.comm != "" && !p.annotated
+            && stv.fixatedComms.contains (some a.comm)
+          noteDate := noteDateOf stv p.note }
         posts := p :: posts
     | none => pure ()
   let ordered := posts.reverse
+  -- the prices that Phase 6 records for the costs of a transaction with
+  -- a date (`costPrice`), read here, once its postings have taught this
+  -- reader the display precisions that C++ reads when Phase 6 runs, and
+  -- written to the price log once the transaction is balanced
+  -- (`recordCostPoints`), each with the date that a note gives its
+  -- posting, the posting's own or else its transaction's (`noteDateOf`).
+  -- C++ reads the dates of a transaction in turn, each replacing the one
+  -- before: the note of the header (`xactHeaderParts`), the note lines
+  -- before the first posting, and then the text of each `apply tag` in
+  -- force, the innermost first, so that the outermost prevails (Phase 7
+  -- of `parse_xact`, textual_xacts.cc:1167-1188; `St.applyTags`). Under
+  -- `apply tag [2024/02/01] x:y` around `apply tag [2024/03/01] z:w`,
+  -- both C++ binaries list the price of `1 AAPL @ $5` in a transaction
+  -- of 2024/01/03, whose header note is `; [2024/01/09]`, at 2024/02/01.
+  -- A `~` template's costs record no price: C++ runs the lot matching
+  -- and exchange phases of finalize, where exchange() records prices,
+  -- only for a dated transaction (xact.cc:522-822, `if (has_date())`),
+  -- and a template has no date. After `~ Monthly` with
+  -- `Assets:Broker  10 AAPL @ $150`, `pricedb` lists no AAPL price and
+  -- `bal -X $` leaves a later AAPL holding unvalued, on 3.4.1 and on
+  -- 76b9dc2b2 alike
+  let xactNoteDate := ((xactHeaderParts _header).2.toList ++ leadNotes
+      ++ st.applyTags.filterMap id).foldl
+    (fun acc n => noteDateOf stv n <|> acc) none
+  let costPoints : List (String × Amount × Option (Option Int)) :=
+    if periodic then []
+    else ordered.filterMap fun p => (costPrice stv p).map fun (c, pr) =>
+      (c, pr, p.noteDate <|> xactNoteDate)
+  -- a transaction whose UUID has been seen writes these points alone, to
+  -- the state before it (the comment on `dup`)
+  if dup then return recordCostPoints st _header costPoints
   -- assignments: sequential against running balance + this xact so far
   let mut resolved : List PostSpec := []
   -- intra-xact prior posts, keyed by (account, commodity, realOnly?)
@@ -3723,6 +4289,9 @@ private def finalizeXact (st : St) (hline : Nat) (_header : String)
     if p.kind == .real && p.amount.isNone then
       stv := { stv with datedEvents :=
         ((acctFor p.account, ""), xd, 0, .real) :: stv.datedEvents }
+  -- the points of `costPoints`, written now that the transaction is
+  -- balanced, since Phase 6 follows the implicit exchange of Phase 3
+  stv := recordCostPoints stv _header costPoints
   pure { stv with gens := flows :: stv.gens }
 
 /-- Split on a separator word at paren/quote depth zero. -/
@@ -4170,32 +4739,6 @@ private def defineDirective (st : St) (restS : String) :
         | .error _ => pure st   -- non-amount define: report-time only
   | _ => pure st
 
-/-- The fields of the date `s` of a price directive, each as its number
-    and its count of digits, where `s` is fields of digits joined by
-    single characters among `/`, `-` and `.`, and `none` otherwise. C++
-    reads `.` and `-` in a date as `/`: `parse_datetime` always, for a
-    date with a time (times.cc:429-432), and the readers of a date
-    without a time unless an input date format is given
-    (times.cc:239-243, `St.inputDateFormat`). -/
-private def priceDateFields (s : String) : Option (List (Int × Nat)) :=
-  (((s.splitOn "/").flatMap (·.splitOn "-")).flatMap (·.splitOn ".")).mapM
-    fun p =>
-      if !p.isEmpty && p.toList.all Char.isDigit then
-        p.toNat?.map fun v => ((v : Int), p.length)
-      else none
-
-/-- Whether the year `y`, the month `m` and the day `d` name a day that
-    C++ can hold: the gregorian dates of boost, which `ptime_from_tm` and
-    `date_from_tm` build (times.cc:154-155, 181-182), span the years 1400
-    to 9999 and refuse a day that the month lacks, so that
-    `P 1399/12/31 EUR $1` and `P 2024/02/30 EUR $1` reject the journal on
-    both C++ binaries. -/
-private def priceDayValid (y m d : Int) : Bool :=
-  let leap := (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
-  let days := if m == 2 then (if leap then 29 else 28)
-    else if m == 4 || m == 6 || m == 9 || m == 11 then 30 else 31
-  1400 ≤ y && y ≤ 9999 && 1 ≤ m && m ≤ 12 && 1 ≤ d && d ≤ days
-
 /-- The seconds into its day of the time `s` of a price directive, read
     as strptime reads `%H:%M:%S` for `parse_datetime` (times.cc:154-155,
     2530-2531): an hour, a minute and a second of one or two digits
@@ -4235,42 +4778,6 @@ private def priceInstant (dateS timeS : String) : Option Int := do
     | _ => none
   if priceDayValid y m d then some (daysFromCivil y m d * 86400 + tod)
   else none
-
-/-- The day, counted as `daysFromCivil` counts it, of the date `dateS` of
-    a price directive without a time, read as `parse_date` reads it,
-    through readers that C++ tries in turn until one reads the date
-    (pool.cc:565-567; times.cc:229-327, 2539-2544), with a year of four
-    digits and a month and a day of one or two: `Y/M/D`
-    (test/baseline/cmd-pricemap.test, test/baseline/opt-historical.test,
-    test/regress/7C44010B.test), `Y/M`, which is the first day of the
-    month (times.cc:2541), and `M/D` in the year of a `Y` or `year`
-    directive (times.cc:175-182, 277-281;
-    test/regress/coverage-wave2-textual.test). Any other date is `none`,
-    and so is every date where an input date format is given
-    (`St.inputDateFormat`), and `M/D` in two more cases. Where no year
-    directive has been read, C++ takes the year of its current time and,
-    for a month after the current one, the year before
-    (times.cc:283-301). Where `St.yearUnsure` is set, C++ takes the year
-    of an `apply year` directive, or in a journal with included files
-    the year that it restores where an included file ends
-    (textual_directives.cc:424-446, 464-476), neither of which
-    `defaultYear` follows. -/
-private def priceDay (st : St) (dateS : String) : Option Int := do
-  guard !st.inputDateFormat
-  match ← priceDateFields dateS with
-  | [(y, 4), (m, lm), (d, ld)] =>
-      if lm ≤ 2 && ld ≤ 2 && priceDayValid y m d then
-        some (daysFromCivil y m d)
-      else none
-  | [(y, 4), (m, lm)] =>
-      if lm ≤ 2 && priceDayValid y m 1 then some (daysFromCivil y m 1)
-      else none
-  | [(m, lm), (d, ld)] =>
-      let y ← st.defaultYear
-      if lm ≤ 2 && ld ≤ 2 && !st.yearUnsure && priceDayValid y m d then
-        some (daysFromCivil y m d)
-      else none
-  | _ => none
 
 /-- Whether C++ skips the character `c` as white space before a symbol
     or an amount (`peek_next_nonws`, utils.h:644-651, which asks
@@ -4545,6 +5052,24 @@ private def priceDirective (st : St) (n : Nat) (rest : String) : St := Id.run do
           return { st with
             priceIssues := ("undated-price", comm) :: st.priceIssues, primary }
 
+/-- The state `st` with an `apply` directive pushed, as the innermost,
+    onto the three lists that hold one entry for each `apply` directive in
+    force: the account of an `apply account` onto `St.applyStack`, the
+    commodity of an `apply fixed` or `apply rate` onto `St.fixatedComms`
+    and the text of an `apply tag` onto `St.applyTags`, each `none` for a
+    directive of another kind. -/
+private def pushApply (st : St) (acct fixed tag : Option String) : St :=
+  { st with applyStack := acct :: st.applyStack
+            fixatedComms := fixed :: st.fixatedComms
+            applyTags := tag :: st.applyTags }
+
+/-- The state `st` with the innermost `apply` directive removed from the
+    three lists that `pushApply` extends. -/
+private def popApply (st : St) : St :=
+  { st with applyStack := st.applyStack.drop 1
+            fixatedComms := st.fixatedComms.drop 1
+            applyTags := st.applyTags.drop 1 }
+
 private def handleDirective (st : St) (n : Nat) (t : String) :
     Except String St := do
   -- general_directive ends the directive word at the first space or tab
@@ -4595,6 +5120,20 @@ private def handleDirective (st : St) (n : Nat) (t : String) :
       -- rewrites payees: labels only, no flows
       pure st
   | "apply" =>
+      -- C++ keeps the `apply` directives of each file on a stack of its
+      -- own, which ends with the file, an included file reading the
+      -- stacks of the files that include it after its own
+      -- (textual_internal.h:138-176; textual_directives.cc:402, 428-430),
+      -- while the reader splices included files into one text (`splice`
+      -- in Driver.lean) with one stack, so that an `apply` left open in an
+      -- included file stays in force here to the end of the journal, a
+      -- known departure: with `apply account Sub` left open in an included
+      -- file, C++ posts a later `Assets:B  $5` against an elided `Equity`
+      -- to `Assets:B` and `Equity`, where this reader posts it to
+      -- `Sub:Assets:B` and `Sub:Equity` (wrong rows), and with
+      -- `apply fixed AAPL $40` left open there, `10 AAPL @ $50` after the
+      -- `include` line records the price $50 in C++ and none here, with no
+      -- issue in its place (fail-open, `costPrice`)
       if restS.startsWith "account" then
         let acct := trimS (restS.drop "account".length).toString
         -- apply_account_directive requires a name and finds it under
@@ -4609,17 +5148,48 @@ private def handleDirective (st : St) (n : Nat) (t : String) :
           match findAccountName acct with
           | none =>
               err n s!"apply account '{acct}' has an empty sub-account name"
-          | some a => pure { st with applyStack := some a :: st.applyStack }
+          | some a => pure (pushApply st (some a) none none)
       else
-        -- apply tag: labels only (uuid tags never come from `apply`).
+        -- `apply tag` gives labels, which bring no flows, with two
+        -- exceptions. A date that its text gives, read as a note's
+        -- (`noteDateOf`), becomes the date of each transaction under it
+        -- and so of the prices of their costs (`St.applyTags`): under
+        -- `apply tag [2024/02/01] x:y`, both C++ binaries list the price
+        -- of `1 AAPL @ $5` in a transaction of 2024/01/03 at 2024/02/01,
+        -- where the table holds it with the issue `posting-date`; left
+        -- open in an included file, the same directive leaves that price
+        -- at 2024/01/03 in C++, the scope departure above, and the table
+        -- holds it at 2024/02/01 with that issue. A `UUID` tag that its
+        -- text gives is the transaction's own in C++, which `uuidOf` does
+        -- not read (the departure recorded there).
         -- `apply year` sets the year that C++ gives a date of a month and
         -- a day (textual_directives.cc:464-476, 543-559), which
-        -- `defaultYear` does not follow, so that such a date of a price
-        -- directive is no longer read (`St.yearUnsure`)
-        let yearUnsure := st.yearUnsure
-          || String.ofList (restS.toList.takeWhile fun c => c != ' ' && c != '\t')
-              == "year"
-        pure { st with applyStack := none :: st.applyStack, yearUnsure }
+        -- `defaultYear` does not follow, so that `priceDay` no longer reads
+        -- such a date (`St.yearUnsure`): where a price directive or a
+        -- transaction with a cost carries one, the issue `unread-price`
+        -- stands in place of the point, and where a note gives one, the
+        -- issue `posting-date` stands alone. Under `Y 2024` and
+        -- `apply year 2024`, both C++ binaries list the price of
+        -- `1 AAPL @ $5` in a transaction of `01/03` at 2024/01/03
+        let kw := String.ofList
+          (restS.toList.takeWhile fun c => c != ' ' && c != '\t')
+        let yearUnsure := st.yearUnsure || kw == "year"
+        -- `apply fixed` and `apply rate` read their argument as a price
+        -- directive without a date (textual_directives.cc:473-474,
+        -- 530-540; pool.cc:548-572), whose first field names the
+        -- commodity, through the commodity aliases, and which needs a
+        -- price after it (`St.fixatedComms`)
+        let arg := trimS (restS.drop kw.length).toString
+        let sym := String.ofList
+          (arg.toList.takeWhile fun c => c != ' ' && c != '\t')
+        let fixed :=
+          if (kw == "fixed" || kw == "rate") && !sym.isEmpty
+              && sym.length < arg.length then
+            some ((st.commAliases.lookup sym).getD sym)
+          else none
+        let tag := if kw != "tag" then none
+          else if arg.contains ':' then some arg else some s!":{arg}:"
+        pure { pushApply st none fixed tag with yearUnsure }
   | "end" =>
       -- `end`, `end apply ...`, `end account`, `end tag` all close
       -- the innermost apply; a stray `end test`/`end comment` does not
@@ -4627,7 +5197,7 @@ private def handleDirective (st : St) (n : Nat) (t : String) :
           || restS.startsWith "account" || restS.startsWith "tag"
           || restS.startsWith "fixed" || restS.startsWith "year"
           || restS.startsWith "rate" then
-        pure { st with applyStack := st.applyStack.drop 1 }
+        pure (popApply st)
       else pure st
   | "bucket" =>
       -- default_account_directive resolves against the CURRENT apply
@@ -4756,9 +5326,14 @@ private def handleDirective (st : St) (n : Nat) (t : String) :
       -- and a later `($1/3)` as `$0.33333`, which show as 500.12 and
       -- 0.33 here (wrong rows),
       -- and it rejects a later `$1.001` against `$-1.00`, which is
-      -- accepted here (fail-open). C++ locks the style with the same
-      -- flag, which `lockPrecision` does not model; the style rule of
-      -- `finalizeXact` records that departure
+      -- accepted here (fail-open). The departure reaches the prices of
+      -- costs as well, which are rounded at that precision and whose
+      -- amounts are tested for zero at it (`costPrice`): after
+      -- `Assets:Cash  $1.2345` against an elided `Equity` and then
+      -- `D $1.00`, `3 AAPL @@ $100` records $33.3333333333 in C++ and
+      -- $33.33333333 here. C++ locks the style with the same flag, which
+      -- `lockPrecision` does not model; the style rule of `finalizeXact`
+      -- records that departure
       match parseAmount st.amt n restS with
       | .ok r =>
           let st := lockPrecision st r.amount.comm r.decimals
@@ -4962,36 +5537,82 @@ structure Result where
       template, whose result `flushPending` discards, and a transaction
       dropped for its UUID leave the flag as it was. -/
   lotFanout : Bool
-  /-- the dated price table that the price directives record, in the
+  /-- the dated price table that the price directives and the costs
+      written on the postings of transactions with a date record, in the
       order in which its points were last written (`priceDirective`,
-      `priceTable`); `pricesAt` reads it as of an instant -/
+      `costPrice`, `recordCostPoints`, `priceTable`); `pricesAt` reads it
+      as of an instant -/
   prices : List PricePoint
-  /-- the commodities that the price directives mark primary, as far as
-      this reader records them, kept for valuation alone: balancing does
-      not read them (the #1130 entry of `impliedExchange`). The list
-      holds the commodity of the price of each point recorded and of each
-      directive with the issue `undated-price`. It leaves out three kinds
-      that C++ marks where it reads the directive: the commodity of a
-      price expression whose result is in one commodity (pool.cc:615,
-      646), the commodity of the price of a directive with the issue
-      `unread-price`, and the two units of a `C` directive, the smaller
+  /-- the commodities that the price directives and the costs mark
+      primary, as far as this reader records them, kept for valuation
+      alone: balancing does not read them (the #1130 entry of
+      `impliedExchange`). Apart from the departures that `costPrice`
+      records, under which the price of a cost can round to zero here
+      alone or in C++ alone, the list holds the commodity of the price of
+      each point that a directive records, of each directive with the
+      issue `undated-price`, and of each price that C++ records for a
+      written cost, whether the table holds its point or an issue that
+      names its commodity stands in its place (commodity.cc:72-78,
+      commodity.h:237). After a periodic template with `X  $0.50`
+      against an elided `Y`, which teaches C++ alone the two places of
+      `$`, `10 AAPL @@ $0.000001` records $0.0000001 in C++, which marks
+      `$` primary, and here a price that rounds to zero at six places,
+      which records nothing. The same holds after `Assets:A  $1.0000001`
+      against an elided `Equity` and then `D $1.00`, after which `$` keeps
+      seven places in C++ and has two here: `10 AAPL @@ $0.00000001`
+      records $0.000000001 in C++ and nothing here.
+
+      The list leaves out five kinds of commodity that C++ marks. The
+      first is the commodity of a price expression whose result is in one
+      commodity (pool.cc:615, 646). The second is the commodity of the
+      price of a directive with the issue `unread-price`, with those of
+      the prices of a transaction dropped for its UUID for which that
+      issue stands. The third is each unit of a `C` directive: the smaller
       through the price that the directive records
-      (textual_directives.cc:185-188, commodity.cc:73-75) and the larger
+      (textual_directives.cc:185-188, commodity.cc:73-75), and the larger
       through `parse_conversion`, which gives it the flags of the smaller
-      (textual_directives.cc:191, amount.cc:1983-1985). It is therefore
-      complete for a journal without a `C` directive whose `priceIssues`
-      holds no `price-expr` or `unread-price` entry -/
+      (textual_directives.cc:191, amount.cc:1983-1985). The fourth is the
+      commodity of a cost that Phase 3 of `finalize` computes for an
+      implicit exchange, which Phase 6 exchanges as it does a written
+      one, with that of the lot price that it records beside it
+      (xact.cc:425-465, 669-690, 782-800). The fifth is the commodity of
+      the price that C++ records for a cost on an amount that an
+      `apply fixed` left open in an included file annotates here alone, of
+      which the table holds neither the point nor an issue (the departure
+      that `costPrice` records). The list is therefore complete, apart
+      from the departures of `costPrice` under which a price rounds to
+      zero on one side alone, for a journal whose `priceIssues` holds no
+      `price-expr` or `unread-price` entry and which has no `C` directive,
+      no transaction that an implicit exchange balances and no
+      `apply fixed` or `apply rate` left open in an included file -/
   primary : List String
-  /-- the price directives whose point the table does not hold, in the
-      order of the directives, each as an issue and the commodity that it
-      prices, empty where that is not read: `price-expr` for a price
-      that is an expression, `undated-price` for a directive without a
-      date whose instant is not known here, and `unread-price` for a
-      directive that is not read as C++ reads it (`priceDirective`).
-      Apart from the departures that `priceDirective` records, among
-      them a price read in a style other than the one in which C++ reads
-      it, a price directive of a journal that C++ reads either writes to
-      the table the point that C++ records or has an entry here -/
+  /-- the price directives and the written costs whose point the table
+      does not hold, or holds at a date that a note or an `apply tag`
+      gives, in the order in which they are read, each as an issue and
+      the commodity that it prices, empty where that is not read. The
+      issue `price-expr` stands for a price that is an expression, and
+      `undated-price` for a directive without a date whose instant is not
+      known here. The issue `unread-price` stands for a directive that is
+      not read as C++ reads it (`priceDirective`) and for a cost in a
+      transaction whose date `priceDay` does not read; with no commodity,
+      it stands for a transaction dropped for a UUID seen before with a
+      posting that `parsePosting` does not read (`finalizeXact`). The
+      issue `posting-date` stands for a cost whose price C++ records at
+      the date that a note of its posting or of its transaction, or an
+      `apply tag` in force, gives (`noteDateOf`, `St.applyTags`), and the
+      table holds the point if `priceDay` reads that date. Where an
+      `apply tag` is left open in an included file, which ends it in C++
+      alone (the departure recorded at the `apply` arm of
+      `handleDirective`), that issue also stands for a later cost whose
+      price C++ records at the date of its transaction.
+      Apart from the departures that `priceDirective` and `costPrice`
+      record, among them a price read in a style other than the one in
+      which C++ reads it, a cost whose price is rounded at a display
+      precision that this reader learns otherwise than C++, and a cost on
+      an amount that an `apply fixed` left open in an included file
+      annotates here alone, a price directive or a written cost of a
+      journal that C++ reads either writes to the table the point that
+      C++ records or has an entry here -/
   priceIssues : List (String × String)
 
 private def flushPending (st : St) : Except String St := do
