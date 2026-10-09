@@ -147,9 +147,44 @@ decimal-comma style, with `%% dc *` naming the null commodity, so
 that a comparator can normalize the other side's output. A rejected
 file prints `!! ERROR` with a reason and nothing else, which keeps
 failure visible. Flags given before a file path apply to that file
-alone, and four are recognized: `--decimal-comma`,
-`--recursive-aliases`, `--now DATE`, and
-`--input-date-format FORMAT`.
+alone, and five are recognized: `--decimal-comma`,
+`--recursive-aliases`, `--now DATE`, `--input-date-format FORMAT`,
+and the opt-in output flag `--gross`, described below.
+
+An output flag is opt-in. A file given without one prints exactly the
+output described above, byte for byte, so that a comparator that does
+not pass it needs no change. `--gross` adds, after the net rows,
+sorted lines of the forms `>> dr COMMODITY|AMOUNT|ACCOUNT` and
+`>> cr COMMODITY|AMOUNT|ACCOUNT`, which give as positive magnitudes
+the gross debit and credit totals of each account. The totals are
+summed posting by posting, as the columns of the C++ program's `--dc`
+option are, and each is displayed as a net row is. Before display, an
+account's debit total less its credit total is its net flow, which its
+net row shows (`gross_foot` in `Ledger/Register.lean`). The totals are
+worth comparing because an error in resolving the postings can leave
+every net row unchanged, as a balance assignment read as a plain
+amount does when a later assignment to the same account absorbs the
+difference. Such an error is hidden from the net rows exactly when it
+cancels in every account it touches, and the gross totals of those
+accounts still move unless it also cancels within their debits and
+within their credits, which is the blind spot of the gross comparison
+itself. C++ can complete an elided posting with several postings of
+one commodity that its lot annotations keep apart, where the oracle
+completes it with a single posting of that commodity or with none,
+and the columns that C++ shows for the completed account can then
+depart from the oracle's gross lines in two ways. The postings of C++
+can differ in sign, and both totals of the account then exceed the
+oracle's. Where the oracle's single posting carries the precision of
+a cost, which C++ can show for a lone posting but drops from the sum
+of several in one column, a column that both sides total alike can
+also show differently. A file in which the oracle finds such a
+completion prints the single line `?? gross lot-annotated-completion`
+in place of the gross lines. The test that decides this refuses some
+files in excess and misses others, and the docstring of
+`Journal.Result.lotFanout` in `Ledger/Journal.lean` records both
+conditions and the known cases, each with a journal. Such a file is
+not rejected: its net rows still print, and a `??` line never stands
+in for `!! ERROR`.
 
 The driver runs under the Lean interpreter, and the build
 deliberately produces no native executable, so that what executes

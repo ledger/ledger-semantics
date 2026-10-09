@@ -94,10 +94,24 @@ Output: `== PATH` opens each file's section; rows are
 null commodity); `!! ERROR reason` reports a rejected file and
 nothing else. Flags before a path apply to that file alone:
 `--decimal-comma`, `--recursive-aliases`, `--now DATE`,
-`--input-date-format FORMAT`. This protocol is a compatibility
-surface. The C++ harness and any third-party comparator parse it, so
-changing it is a breaking change to be made deliberately and
-announced, never as a side effect.
+`--input-date-format FORMAT`, and `--gross`. The last is an opt-in
+output flag: after the net rows it adds sorted `>> dr ROW` and
+`>> cr ROW` lines, which give as positive magnitudes the gross debit
+and credit totals of each account, summed posting by posting, or, in
+place of those lines, the single line
+`?? gross lot-annotated-completion` when the oracle finds a
+completion that C++ may split by lot annotation, so that the totals
+of the completed account, or the way they show, can depart from those
+the oracle computes. The test behind that line refuses some files in
+excess and misses others, as the docstring of
+`Journal.Result.lotFanout` records. A `??` line is never a rejection,
+and without the flag the output is byte-identical to the output
+described above. This protocol is a compatibility surface. The C++
+harness and any third-party comparator parse it, so changing it is a
+breaking change to be made deliberately and announced, never as a
+side effect. An extension is admissible only when it is opt-in and
+leaves the default output byte-identical, and it is announced here
+and in the README in the commit that introduces it.
 
 ## The pins, and how to move them
 

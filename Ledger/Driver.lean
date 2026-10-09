@@ -1,14 +1,15 @@
 import Ledger.Oracle
+import Ledger.Register
 import Ledger.Journal
 
 /-!
 # The oracle driver (differential-comparison side)
 
 Reads `.dat` files, splices `include`s (so the pure engine never does
-IO), runs the journal engine (`Journal.lean`), constructs the L2 term
-— one generator per effective transaction, the journal as their
-tensor — and evaluates the executable oracle `netFlow` at every
-touched account, printing one canonical line per nonzero balance:
+IO), runs the journal engine (`Journal.lean`), constructs the L2 term,
+with one generator per effective transaction and the journal as their
+tensor, and evaluates the executable oracle `netFlow` at every touched
+account, printing one canonical line per nonzero balance:
 
     COMMODITY|AMOUNT|ACCOUNT
 
@@ -22,9 +23,14 @@ Run through the **interpreter** (never a `lean_exe`):
 
 Flags apply to the next file only (mirroring a test's own flags) and
 reset after it: `--decimal-comma`, `--recursive-aliases`,
-`--now DATE`, `--input-date-format FORMAT`. Each file's block starts
-with `== PATH`; a rejection prints `!! ERROR ...` for that file
-(fail-closed, never silent).
+`--now DATE`, `--input-date-format FORMAT`, and the opt-in output flag
+`--gross`, which adds `>> dr ROW` and `>> cr ROW` lines of gross
+totals, summed posting by posting, after the net rows, or, in place of
+those lines, the single line `?? gross lot-annotated-completion`
+(`grossRows`). Each file's block starts with `== PATH`; a rejection
+prints `!! ERROR ...` for that file (fail-closed, never silent), and a
+`??` line is never a rejection. A file given without an output flag
+prints exactly the default protocol that the README describes.
 -/
 
 namespace Ledger
@@ -107,11 +113,100 @@ def flowsFor (arr : Array (List (Account × ℚ)))
     (i : Fin arr.size) (a : Account) : ℚ :=
   (arr[i].filter fun p => p.1 = a).foldl (fun s p => s + p.2) 0
 
+/-- The row `COMMODITY|AMOUNT|ACCOUNT` of a total `v` at the account
+    `a`, displayed as C++ displays it, or none when the total shows as
+    zero. `stat` counts the flows that the total sums and the inferred
+    ones among them. The total is displayed by `displayAmount`, except
+    that a lone inferred amount renders at its recovered precision when
+    the commodity has none, or when it would otherwise show as zero
+    (BIGINT_COST_PREC, issues #1692/#1773); sums drop the widening.
+    C++ asks whether it shows as zero with `in_place_roundto`, which
+    rounds half away from zero as `roundAt` does, not as the row is
+    printed (src/amount.cc:2041-2053, 1072-1100): `A 1 FOO @ $0.005`
+    against an elided `B`, with `$` shown at two places, is not
+    widened, prints as zero, and leaves no row. -/
+def displayRow (res : Journal.Result) (stat : Nat × Nat) (a : Account)
+    (v : ℚ) : Option String :=
+  let (dispComm, dispQ) := displayAmount res.equivs res.precisions a.commodity v
+  let (tot, inf) := stat
+  let prec := (res.precisions.lookup a.commodity).getD 0
+  if tot == 1 && inf == 1 && dispComm == a.commodity
+      && a.commodity != ""
+      && (prec == 0 || roundAt prec v == 0) then
+    if v = 0 then none
+    else some s!"{a.commodity}|{ratToCanonical v}|{a.name}"
+  else
+  if dispQ = 0 then none
+  else some s!"{dispComm}|{ratToCanonical dispQ}|{a.name}"
+
+/-- The gross rows of an evaluated journal `res`, whose generators are
+    `arr`, whose term is `term`, and whose flows touch the accounts
+    `accts`, for the opt-in flag `--gross`. For each account after the
+    report-time rewrites, the line `>> dr ROW` carries the total of the
+    positive amounts posted to it, and the line `>> cr ROW` the total of
+    the magnitudes of its negative amounts, each summed posting by
+    posting over the term (`GenSpec.debitTotal` and
+    `GenSpec.creditTotal`), as the debit and credit columns of C++
+    `bal --dc --flat` are (src/report.h:751-754 at 76b9dc2b2;
+    test/baseline/opt-dc.test). The debit total less the credit total
+    is the account's net flow (`GenSpec.gross_foot`). Each total is
+    displayed by `displayRow`, as a net row is, with the counts that
+    `Journal.Result.signStats` keeps for its own column: under `--dc`
+    C++ adds into a column only the amounts of that column's sign, the
+    other postings bringing a zero that the sum ignores
+    (src/value.cc:572-575 and 591-594, src/balance.cc:122-123), so
+    that a lone inferred amount in one column keeps its recovered
+    precision there (BIGINT_COST_PREC in src/amount.cc;
+    test/regress/1692.test) while a net row that sums it with other
+    postings drops it: after `A  2 X @ 0.2 Y` against an elided `B`,
+    and `B  1 Y` against an elided `Equity`, `bal --dc --flat` shows
+    `1 Y` for the balance of `B` and `0.4 Y` in its credit column, and
+    so do the net row and the `>> cr` line of `B` here. The lines are
+    sorted. Where the engine's postings can give an account columns
+    other than those of C++, or show them otherwise, because C++
+    completes an elided posting with a posting for each annotated key
+    of a commodity (src/xact.cc:180-248, and Phase 7 at 824-863, at
+    76b9dc2b2; test/regress/1638.test, 1998.test and
+    coverage-wave7-xact-edge.test), `Journal.Result.lotFanout` holds,
+    and the single line `?? gross lot-annotated-completion` replaces
+    the gross lines. The docstring of that field records the two
+    conditions that set it and, each with a journal, where it holds in
+    excess and where it is missed. -/
+def grossRows (res : Journal.Result) (arr : Array (List (Account × ℚ)))
+    {A B : Object} (term : (specFor arr).FreeMor A B)
+    (accts : List Account) : List String :=
+  if res.lotFanout then ["?? gross lot-annotated-completion"] else
+  let posts : Fin arr.size → List (Account × ℚ) := fun i => arr[i]
+  -- per-account debit and credit totals, then report-time rewrites
+  -- (merging)
+  let totals : List (Account × ℚ × ℚ) := accts.foldl (init := []) fun acc a0 =>
+    let a := Account.mk (Journal.applyRewrites res.rewrites a0.name) a0.commodity
+    let d := GenSpec.debitTotal posts term a0
+    let c := GenSpec.creditTotal posts term a0
+    match acc.lookup a with
+    | some _ => acc.map fun (a', d', c') =>
+        if a' = a then (a', d' + d, c' + c) else (a', d', c')
+    | none => (a, d, c) :: acc
+  let colStat := fun (name comm : String) (debit : Bool) =>
+    res.signStats.foldl (init := ((0 : Nat), (0 : Nat)))
+      fun (t, i) ((a, c, dr), t', i') =>
+        if Journal.applyRewrites res.rewrites a == name && c == comm
+            && dr == debit then
+          (t + t', i + i')
+        else (t, i)
+  let rows := totals.flatMap fun (a, d, c) =>
+    ((displayRow res (colStat a.name a.commodity true) a d).map
+        (">> dr " ++ ·)).toList
+      ++ ((displayRow res (colStat a.name a.commodity false) a c).map
+        (">> cr " ++ ·)).toList
+  (rows.toArray.qsort (· < ·)).toList
+
 /-- Balances of an (include-spliced) journal text; `spliced` says that
-    a file was spliced into it (`splice`). -/
+    a file was spliced into it (`splice`), and `gross` adds the gross
+    rows (`grossRows`) after the net rows. -/
 def balancesOf (decimalComma : Bool) (nowSecs : Option ℚ)
     (recAliases : Bool) (dfmt : Option String) (input : String)
-    (spliced : Bool := false) :
+    (spliced : Bool := false) (gross : Bool := false) :
     Except String (List String) := do
   let res ← Journal.run input decimalComma nowSecs recAliases dfmt spliced
   let arr := res.gens.toArray
@@ -134,28 +229,11 @@ def balancesOf (decimalComma : Bool) (nowSecs : Option ℚ)
           (t + t', i + i')
         else (t, i)
   let rows := merged.filterMap fun (a, v) =>
-    let (dispComm, dispQ) := displayAmount res.equivs res.precisions a.commodity v
-    -- a lone inferred balance renders at its recovered precision when
-    -- the commodity has none, or when it would otherwise show as zero
-    -- (BIGINT_COST_PREC, issues #1692/#1773); sums drop the widening.
-    -- C++ asks whether it shows as zero with `in_place_roundto`, which
-    -- rounds half away from zero as `roundAt` does, not as the row is
-    -- printed (src/amount.cc:2041-2053, 1072-1100): `A 1 FOO @ $0.005`
-    -- against an elided `B`, with `$` shown at two places, is not
-    -- widened, prints as zero, and leaves no row
-    let (tot, inf) := statFor a.name a.commodity
-    let prec := (res.precisions.lookup a.commodity).getD 0
-    if tot == 1 && inf == 1 && dispComm == a.commodity
-        && a.commodity != ""
-        && (prec == 0 || roundAt prec v == 0) then
-      if v = 0 then none
-      else some s!"{a.commodity}|{ratToCanonical v}|{a.name}"
-    else
-    if dispQ = 0 then none
-    else some s!"{dispComm}|{ratToCanonical dispQ}|{a.name}"
+    displayRow res (statFor a.name a.commodity) a v
   let styleRows := res.styles.filterMap fun (c, dc) =>
     if dc then some (if c == "" then "%% dc *" else s!"%% dc {c}") else none
-  pure (styleRows ++ (rows.toArray.qsort (· < ·)).toList)
+  let net := styleRows ++ (rows.toArray.qsort (· < ·)).toList
+  pure (if gross then net ++ grossRows res arr term accts else net)
 
 end Driver
 
@@ -401,11 +479,14 @@ def main (args : List String) : IO Unit := do
   let mut nowPending := false
   let mut dfmt : Option String := none
   let mut dfmtPending := false
+  let mut gross := false
   for arg in args do
     if arg == "--decimal-comma" then
       dc := true
     else if arg == "--recursive-aliases" then
       rec_ := true
+    else if arg == "--gross" then
+      gross := true
     else if arg == "--input-date-format" then
       dfmtPending := true
     else if dfmtPending then
@@ -426,10 +507,11 @@ def main (args : List String) : IO Unit := do
         let lines := ((toString e).splitOn "\n").map (·.trimAscii.toString)
         IO.println s!"!! ERROR {" ".intercalate (lines.filter (!·.isEmpty))}"
       | .ok (text, spliced) =>
-        match Ledger.Driver.balancesOf dc now rec_ dfmt text spliced with
+        match Ledger.Driver.balancesOf dc now rec_ dfmt text spliced gross with
         | .error e => IO.println s!"!! ERROR {e}"
         | .ok rows => for r in rows do IO.println r
       dc := false
       rec_ := false
       now := none
       dfmt := none
+      gross := false

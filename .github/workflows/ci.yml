@@ -62,9 +62,10 @@ jobs:
         run: nix build .#oracle -L
 
       # A smoke test of the executable layer: the oracle must evaluate
-      # a minimal journal and print the documented row format.  The
-      # test runs inside the built store path; the oracle tree is
-      # read-only by design.
+      # a minimal journal and print the documented row format, with no
+      # protocol extension line by default, and the opt-in `--gross`
+      # flag must add the documented gross lines.  The test runs inside
+      # the built store path; the oracle tree is read-only by design.
       - name: Oracle smoke test
         run: |
           cat > /tmp/smoke.dat <<'EOF'
@@ -78,3 +79,9 @@ jobs:
             | tee /tmp/smoke.out
           grep -q '^\$|100|Assets:Cash$' /tmp/smoke.out
           grep -q '^\$|-100|Equity:Opening$' /tmp/smoke.out
+          if grep -qE '^(>>|\?\?) ' /tmp/smoke.out; then exit 1; fi
+          nix develop --command bash -c \
+            "cd $oracle && lake env lean --run Ledger/Driver.lean --gross /tmp/smoke.dat" \
+            | tee /tmp/smoke-gross.out
+          grep -q '^>> dr \$|100|Assets:Cash$' /tmp/smoke-gross.out
+          grep -q '^>> cr \$|100|Equity:Opening$' /tmp/smoke-gross.out
