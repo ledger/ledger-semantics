@@ -88,6 +88,14 @@ outputs (the `SemanticBisimulation` ctest is the standing check):
   matching real posting of each later transaction — after balancing,
   as `extend_xact` does; templates may be virtual. C++ also matches
   virtual and deferred postings, a departure recorded at `applyAutos`.
+  C++ matches as well every posting by which it completes an elided
+  posting or the bucket's posting, and it can complete a commodity
+  with one posting per annotated key, or with postings in a commodity
+  that nets to zero, where the engine makes one posting or none;
+  `applyAutos` refuses a rule whose effect depends on those postings,
+  the check that C++ makes after it included, as out of scope, but for
+  the departures that its docstring and that of `PoolResult.splitComms`
+  record.
   After each rule that adds a posting that must balance, C++ checks
   the extended transaction once more (`verify()`, xact.cc:1040-1110,
   1683-1684), weighing a generated posting at the cost that its
@@ -107,8 +115,10 @@ outputs (the `SemanticBisimulation` ctest is the standing check):
   beginning with `;` is dropped and a line beginning with `assert `,
   `check ` or `expr ` is a posting. The result is discarded, together
   with the display precisions and amount styles that its amounts teach
-  C++, a departure that `flushPending` records; an error in the
-  template is reported with the prefix `periodic transaction: `.
+  C++ and with the postings that automated transactions generate in
+  it, which C++ gives to their accounts, two departures that
+  `flushPending` records; an error in the template is reported with
+  the prefix `periodic transaction: `.
 - **Flow-inert directives** are consumed with a justification in
   `handleDirective`; unknown constructs remain named errors.
 -/
@@ -195,8 +205,11 @@ structure PostSpec where
       `amount.has_annotation()`, which picks the top posting of an
       implicit exchange (xact.cc:386-393). C++ discards the annotation
       of an amount with no commodity (amount.cc:1908), and so does
-      this flag. The two departures recorded at `fixated` apply to
-      this flag as well. -/
+      this flag. `balancePool` reads it as well, for the weight of a
+      posting without a cost (`PoolResult.splitComms`), and so does
+      `applyAutos`, for the refusal that waits for `verifyExtended`,
+      the second case of its docstring. The two departures recorded at
+      `fixated` apply to this flag as well. -/
   annotated : Bool := false
   /-- the amount's own lot price is fixated, `{=P}` or `{{=T}}`
       (ANNOTATION_PRICE_FIXATED, annotate.cc:169), under the same
@@ -229,6 +242,52 @@ structure PostSpec where
       the first positive `costPrec` of a cost in it (`zeroTestPrec`,
       regress/1114), whose docstring records the departures. -/
   costPrec : Nat := 0
+  /-- the cost amount carries an annotation of its own, a `{lot}`,
+      `[date]` or `(note)` written after the cost and before any balance
+      assertion, on a cost with a commodity. C++ parses the cost as an
+      amount with its annotations (textual_xacts.cc:691), keeps them only
+      on an amount with a commodity (amount.cc:1908), and sums the cost
+      under its annotated commodity in Phase 1 of `finalize`
+      (xact.cc:325-333). `balancePool` reads it, as it reads `annotated`
+      for a posting without a cost, where it completes an elided posting
+      or the bucket's posting (`PoolResult.splitComms`), and `applyAutos`
+      reads both flags for the refusal that waits for `verifyExtended`,
+      the second case of its docstring.
+
+      For a posting whose own amount carries a lot price, Phase 6 books
+      no gain of the usual kind on such a cost, since its annotated
+      commodity is not the plain commodity of the basis (xact.cc:693,
+      annotate.cc:343-355). It books instead a gain apart, plain, in the
+      commodity of the lot price, of the basis less the cost times the
+      price that annotates the cost, and only when that price is in the
+      commodity of the lot price, whatever the commodity of the cost
+      (xact.cc:735-774). `costVal` adds the gain of the usual kind, the
+      basis less the cost (`gainVal`), to a cost in the commodity of the
+      lot price, annotated or not, and no gain to a cost in another
+      commodity; `balancePool` counts that gain as a weight of its own.
+      Three departures follow, each of which gives wrong rows without
+      any automated transaction:
+      - where the annotation of the cost has no price in the commodity
+        of the lot price, C++ books no gain:
+        `Assets:S  10 c {$60} @ $5 (note)` completes an elided posting
+        with `$-50 (note)` in C++ and with `$-600` here;
+      - where that price is not one unit, the two gains differ:
+        `Assets:T  10 AAPL {$50} @ $5 {$20}` completes an elided posting
+        with `$500` and `$-50 {$20}` in C++ and with `$-500` here;
+      - where the cost is in another commodity, C++ books a gain that
+        the engine does not: `Assets:T  10 AAPL {$50} @ 5 EUR {$1}`
+        completes an elided posting with `$-450` and `-50 EUR {$1}` in
+        C++ and with `-50 EUR` here, and the commodity swap of
+        baseline/feat-commodity_swap, `-100 BTC {$100} @ 2 ETH {$40}`
+        beside `200 ETH {$40}`, with the amount of its
+        `Expenses:Capital Loss` posting removed, completes that posting
+        with `$2,000.00` in C++ and leaves it without an amount here. -/
+  costAnnotated : Bool := false
+  /-- the posting is one by which `balancePool` completes an elided
+      posting, or the bucket's posting, in a commodity that C++ can
+      complete with one posting per annotated commodity
+      (`PoolResult.splitComms`); `applyAutos` reads it -/
+  splitRisk : Bool := false
   deriving Repr
 
 instance : Inhabited PostSpec :=
@@ -801,6 +860,8 @@ private structure AnnotTail where
   /-- the decimals of the kept lot's literal, and whether it is a
       `{{total}}` -/
   lotLit : Option (Nat × Bool)
+  /-- `PostSpec.costAnnotated` -/
+  costAnnotated : Bool
 
 /-- Consume the annotation/cost/assertion tail of an amount:
     `{lot} [date] (note) @ P / @@ T / = ASSERT` in any order. -/
@@ -810,18 +871,22 @@ private partial def annotLoop (ctx : AmtCtx) (line : Nat) (a : Amount)
     (costDecs : Nat := 0) (afterAssert : Bool := false)
     (annotated : Bool := false) (fixated : Bool := false)
     (ownLot : Bool := false) (perUnit : Bool := false)
-    (lotLit : Option (Nat × Bool) := none) :
+    (lotLit : Option (Nat × Bool) := none) (costAnnotated : Bool := false) :
     Except String AnnotTail := do
   -- `annotated`, `fixated` and `ownLot`: an annotation met before any
   -- cost or assertion belongs to the posting's own amount; after a
   -- cost it annotates the cost amount, after an assertion the
   -- assertion amount (textual_xacts.cc:756-757). `ownLot` says that
-  -- the lot kept was met while `own` held
+  -- the lot kept was met while `own` held. `costAnnotated`: one met
+  -- after the cost and before any assertion, on a cost with a
+  -- commodity, since C++ keeps no annotation on an amount without one
+  -- (amount.cc:1908)
   let own := !afterCost && !afterAssert
+  let onCost := afterCost && !afterAssert && cost.any (·.comm != "")
   let t := trimS tail
   if t.isEmpty || t == "." then
     pure { lot, cost, teach, costDecs, annotated, fixated, ownLot, perUnit,
-           lotLit }
+           lotLit, costAnnotated }
   else if t.startsWith "{" then
     -- `{{total}}` and `{per-unit}` lot prices, possibly `{=fixated}`;
     -- lots parse with PARSE_NO_MIGRATE — no precision teaching
@@ -856,14 +921,14 @@ private partial def annotLoop (ctx : AmtCtx) (line : Nat) (a : Amount)
       (afterAssert := afterAssert) (annotated := annotated || own)
       (fixated := if own then lot'.any (·.2) else fixated)
       (ownLot := if own then lot'.isSome else ownLot) (perUnit := perUnit)
-      (lotLit := lotLit')
+      (lotLit := lotLit') (costAnnotated := costAnnotated || onCost)
   else if t.startsWith "[" then
     match takeBalanced '[' ']' t.toList with
     | some (_, rest) =>
         annotLoop ctx line a (String.ofList rest) lot cost teach afterCost costDecs
           (afterAssert := afterAssert) (annotated := annotated || own)
           (fixated := fixated) (ownLot := ownLot) (perUnit := perUnit)
-          (lotLit := lotLit)
+          (lotLit := lotLit) (costAnnotated := costAnnotated || onCost)
     | none => err line s!"unclosed lot date in '{t}'"
   else if t.startsWith "(" && !(t.startsWith "(@") then
     match takeBalanced '(' ')' t.toList with
@@ -871,7 +936,7 @@ private partial def annotLoop (ctx : AmtCtx) (line : Nat) (a : Amount)
         annotLoop ctx line a (String.ofList rest) lot cost teach afterCost costDecs
           (afterAssert := afterAssert) (annotated := annotated || own)
           (fixated := fixated) (ownLot := ownLot) (perUnit := perUnit)
-          (lotLit := lotLit)
+          (lotLit := lotLit) (costAnnotated := costAnnotated || onCost)
     | none => err line s!"unclosed lot note in '{t}'"
   else if t.startsWith "(@@)" || t.startsWith "@@" then
     let off := if t.startsWith "(@@)" then 4 else 2
@@ -885,7 +950,7 @@ private partial def annotLoop (ctx : AmtCtx) (line : Nat) (a : Amount)
     annotLoop ctx line a pr.tail lot (some ⟨pr.amount.comm, signed⟩) teach true
       (max costDecs pr.decimals) (afterAssert := afterAssert)
       (annotated := annotated) (fixated := fixated) (ownLot := ownLot)
-      (perUnit := false) (lotLit := lotLit)
+      (perUnit := false) (lotLit := lotLit) (costAnnotated := costAnnotated)
   else if t.startsWith "(@)" || t.startsWith "@" then
     -- per-unit costs round at the cost literal's own precision,
     -- posting by posting (regress/1125); `@ =` fixates (1794). A cost
@@ -901,7 +966,7 @@ private partial def annotLoop (ctx : AmtCtx) (line : Nat) (a : Amount)
       (some ⟨pr.amount.comm, pr.amount.q * a.q⟩) teach true
       (max costDecs pr.decimals) (afterAssert := afterAssert)
       (annotated := annotated) (fixated := fixated) (ownLot := ownLot)
-      (perUnit := true) (lotLit := lotLit)
+      (perUnit := true) (lotLit := lotLit) (costAnnotated := costAnnotated)
   else if t.startsWith "=" then
     -- assertion: the C++ side checks it; positive tests pass it, but
     -- the literal still teaches display precision (1699). C++ parses
@@ -917,6 +982,7 @@ private partial def annotLoop (ctx : AmtCtx) (line : Nat) (a : Amount)
     annotLoop ctx line a pr.tail lot cost teach afterCost costDecs
       (afterAssert := true) (annotated := annotated) (fixated := fixated)
       (ownLot := ownLot) (perUnit := perUnit) (lotLit := lotLit)
+      (costAnnotated := costAnnotated)
   else
     err line s!"trailing junk after amount '{t}'"
 
@@ -948,6 +1014,8 @@ private structure AmountField where
   fixated : Bool := false
   /-- `PostSpec.costPrec` -/
   costPrec : Nat := 0
+  /-- `PostSpec.costAnnotated` -/
+  costAnnotated : Bool := false
 
 /-- Parse the amount field of a posting (everything after the
     account): amount, lot annotations, cost, assertion/assignment.
@@ -994,7 +1062,7 @@ private def parseAmountField (ctx : AmtCtx) (line : Nat) (field : String)
     -- 249). annotLoop reads the first as it reads an annotation on a
     -- plain amount, and of two lot prices it keeps the first.
     let { lot, cost, teach, costDecs, annotated, fixated, ownLot, perUnit,
-          lotLit } ←
+          lotLit, costAnnotated } ←
       annotLoop ctx line a r.tail preLot none (annotated := preLot.isSome)
         (fixated := preLot.any (·.2)) (ownLot := preLot.isSome)
     -- the precision of the cost amount, for the widened zero test of
@@ -1076,7 +1144,9 @@ private def parseAmountField (ctx : AmtCtx) (line : Nat) (field : String)
     -- (amount.cc:1908) and so adds no gain for it: `10 {$5} @ $6`
     -- against `-$50` is accepted here and rejected by C++ with a
     -- remainder of `$10` (fail-open), and against `-$60` it is
-    -- rejected here and accepted by C++ (fail-closed)
+    -- rejected here and accepted by C++ (fail-closed). Three more, on a
+    -- cost that carries an annotation of its own, give wrong rows; the
+    -- docstring of `PostSpec.costAnnotated` records them
     let costVal := match lot, cost with
       | some (p, _), some c =>
           if periodic then some c
@@ -1101,7 +1171,7 @@ private def parseAmountField (ctx : AmtCtx) (line : Nat) (field : String)
            learned := r.learned
            decimals := r.decimals, isExpr := field.startsWith "(", teach
            costDecs, gainVal, annotated := hasComm && annotated
-           fixated := hasComm && fixated, costPrec }
+           fixated := hasComm && fixated, costPrec, costAnnotated }
 
 private def parsePosting (st : St) (line : Nat) (raw : String)
     (periodic : Bool := false) :
@@ -1134,7 +1204,7 @@ private def parsePosting (st : St) (line : Nat) (raw : String)
                      assignTarget := af.assignTarget, amtDecs := af.decimals
                      costDecs := af.costDecs, gainVal := af.gainVal
                      annotated := af.annotated, fixated := af.fixated
-                     costPrec := af.costPrec },
+                     costPrec := af.costPrec, costAnnotated := af.costAnnotated },
               af.learned, af.amount.map (·.comm), af.decimals, af.isExpr,
               af.teach)
 
@@ -1262,6 +1332,39 @@ private def tagEqGuard (hline : Nat) (k xactNotes : String)
 
 /-! ## Transaction finalization -/
 
+/-- A completion that C++ can make and `balancePool` does not: a
+    posting of the elided posting's account, or of the bucket's, in a
+    commodity whose weights in the pool net to exactly zero. C++
+    completes an elided posting with one posting for each entry of the
+    sum that Phase 1 of `finalize` accumulates, keyed by annotated
+    commodity (xact.cc:180-248, 829-863; annotate.h:120-125). An entry
+    that nets to zero after a second key has entered stays in that sum
+    (balance.cc:118-133), and while one key alone has entered, the sum
+    is a single amount, zero or not (value.cc:600-607), so that C++ can
+    complete the elided posting with postings that the engine,
+    completing one posting per commodity of a nonzero residual, does not
+    make. It adds the bucket's posting to a transaction of one posting
+    whose sum is not null and completes it alike (xact.cc:368-372,
+    `PoolResult.splitComms`): under `bucket Assets:Cash` and `= /Cash/`
+    with `(Budget)  $10`, a transaction of `Expenses:Food  $0` alone
+    gives `Assets:Cash` a posting of `$0`, and C++ books `$10`. Whether
+    C++ keeps an entry that nets to zero depends on the order of the
+    postings, since a key that has netted to zero when a second key
+    enters is dropped (value.cc:1548, balance.h:128-134), and on the
+    lot gains that Phase 6 adds afterwards (xact.cc:692-713, 763); this
+    records the completion whenever the weights net to zero, which can
+    only add refusals. -/
+private structure ZeroCompletion where
+  /-- the elided posting, or the bucket's posting, whose account and
+      kind the completion takes -/
+  post : PostSpec
+  comm : String
+  /-- the commodity is at risk of a split by annotation
+      (`PoolResult.splitComms`), so that C++ can complete it with one
+      posting per annotated key, of amounts that need not be zero;
+      otherwise with at most one posting, of zero -/
+  split : Bool
+
 /-- Extend a balanced transaction by its automated transactions, one
     rule at a time, as C++ runs `extend_xact` for each rule
     (journal.cc:659-661, xact.cc:1426-1691). Besides the extended
@@ -1288,7 +1391,9 @@ private def tagEqGuard (hline : Nat) (k xactNotes : String)
     (`AutoPost.cost`), which C++ copies to it before it would derive
     one (xact.cc:1611-1612), and the lot price of a fixed template
     amount (`AutoPost.lotUnit`), from which C++ derives one under the
-    same condition on the matched posting (xact.cc:1613-1627).
+    same condition on the matched posting (xact.cc:1613-1627). It
+    returns as well the reason of a refusal that `finalizeXact` raises
+    once `verifyExtended` has passed, the second of the cases below.
 
     Only real postings are matched here, while C++ matches every
     posting that an automated transaction did not generate, virtual and
@@ -1299,11 +1404,294 @@ private def tagEqGuard (hline : Nat) (k xactNotes : String)
     the generated `Assets:X 1.00 USD` must balance; all three are
     accepted here (fail-open). With `Assets:Y -0.1` added, both C++ and
     the oracle accept the first and the third, and the balances of C++
-    hold the two generated postings that these omit. -/
-private def applyAutos (st : St) (xdate : Option Int) (payee : String)
-    (code : String) (dateStr : String)
-    (xactNotes : String) (posts : List PostSpec) :
-    List PostSpec × List (List (PostSpec × PostSpec × Bool)) :=
+    hold the two generated postings that these omit.
+
+    C++ also matches each posting by which it completes an elided
+    posting or the bucket's posting (xact.cc:1438-1447), and it can
+    complete one commodity with several postings, one per annotated key,
+    or with postings in a commodity whose weights net to zero, where
+    `balancePool` makes one posting or none (`PoolResult.splitComms`,
+    `ZeroCompletion`). A rule whose effect depends on those postings is
+    refused as out of scope, with the line of the transaction: a
+    template with a fixed amount or an expression books once per
+    matched posting, a multiplier generates a posting from each, which
+    the check that follows the rule (`verify()`, xact.cc:1040-1110,
+    1683-1684) sums under its annotated key, a comparison of the amount
+    tests each posting's own amount, and C++ tests each posting after
+    the postings that the rule generated from those before it have
+    joined the transaction and their accounts (xact.cc:1669-1671). None
+    of these tests refuses a rule without template postings: C++ runs
+    such a rule after every rule that has them (journal.cc:659-667), so
+    that the note that it adds reaches no rule that generates a posting,
+    and it changes no balance, whatever postings it matches. Under
+    `= /Cash/` with only `; :Z:`, `Expenses:A  $5` and `Expenses:B  $-5`
+    complete an elided `Assets:Cash` with `$0` in C++, which tags that
+    posting and books nothing, and nothing is booked here. The engine
+    runs such a rule in its place in the file, among the rules that
+    generate postings, a departure (wrong rows): under `= /^Equity/`
+    with only `; :SPLIT:`, followed by `= %SPLIT` with `(Budget)  1`,
+    `Assets:Tajer  100 c` against `Equity:Gold  -100 c` books nothing in
+    C++ and `-100 c` here. Any other rule is refused when one of its
+    branches matches:
+    - a completion of a commodity at risk (`PostSpec.splitRisk`), its
+      amount comparisons dropped, since the amounts that C++ compares
+      are not known here, when the rule has a template with a fixed
+      amount or an expression, or the branch compares the amount, calls
+      `all()` or reads `account("N").total`, which the postings
+      generated from an earlier key can make fail for a later one. A
+      rule whose templates only multiply stays accepted when its
+      branches do none of these, unless the second case refuses it: a
+      call of `any()` can only turn true as the rule generates postings,
+      and every other condition reads the posting of each key as it
+      reads the completion here, the posting of a key carrying the
+      details of the posting completed (xact.cc:241-243) and a commodity
+      condition reading the base commodity in C++ (post.cc:350-370), so
+      that a rule that matched the posting of one key matches those of
+      the keys after it. An expression whose value is linear in the
+      amount, such as `(amount * 2)`, books on the postings of the keys
+      what it would book on their sum, and it is refused all the same
+      (fail-closed), as is a call of `all()` that the generated postings
+      satisfy, a comparison of the amount or a total that every key
+      passes as the completion does, or a template with a fixed amount
+      when a call of `all()` or `any()`, or a comparison of the amount,
+      lets a single key match, and C++ books once, as the engine does on
+      its completion. Under `= /^Equity/` with `(Budget)  $10`,
+      `Assets:Tajer  100 c (TAG)` and `Assets:Gruulmorg  200 c` complete
+      an elided `Equity:Gold` with `-200 c` and `-100 c (TAG)` in C++,
+      which books `$20`, and with `-300 c` here, which books `$10`, while
+      with `(Budget)  0.1` in place of `$10` both book `-30 c`. Over the
+      same transaction, under `= /^Equity/ and expr amount > -250` with
+      `(Budget)  1`, C++ books `-300 c` and this books nothing; under
+      `= /^Equity/ and expr amount < -150` with `(Budget)  $10`, the key
+      of `-200 c` alone passes in C++, which books `$10`, as the engine
+      does on its completion (fail-closed); under
+      `= /^Equity/ and expr 'all(account =~ /Assets|Equity/)'` with
+      `(Budget)  1`, C++ books `-200 c`, the generated posting failing
+      `all()` for the second key, and this books `-300 c`; and after
+      `(Budget)  10 c`, under `= expr account =~ /^Equity/ and
+      account("Budget").total > -150 c` with `(Budget)  1`, C++ books
+      `-200 c` and this `-300 c`. Under `bucket Assets:Cash` and
+      `= /Cash/` with `(Budget)  $10`, a transaction of
+      `Assets:T  10 AAPL {$50} @ $5 {$1}` alone gives `Assets:Cash` the
+      postings `$-450` and `$-50 {$1}` in C++, which books `$20`, and
+      the posting `$-500` here, which books `$10`. The argument by which
+      a rule whose templates only multiply stays accepted runs from the
+      first key, which C++ tests where the elided posting is written, as
+      it tests there the posting that it makes of the commodity unsplit:
+      a rule that matches the first key matches every later one. A rule
+      that fails `any()` at the first key can still pass it at a later
+      key, which C++ appends after the postings of the transaction, once
+      the rule has generated postings from written postings that follow
+      the elided posting; the split then changes what C++ books, and
+      these tests do not refuse the rule. The engine tests its
+      completion after the written postings, a departure that
+      `PoolResult.posts` records, and so departs from C++ there with and
+      without the split: under `= expr 'account =~
+      /^Assets/ or account =~ /^Equity/ and any(account =~ /Budget/)'`
+      with `(Budget)  1`, an elided `Equity:Gold` written before
+      `Assets:Tajer  100 c (TAG)` and `Assets:Gruulmorg  200 c` makes C++
+      book `200 c`, the first key, `-200 c`, failing `any()` and the
+      appended `-100 c (TAG)` passing it, and `300 c` without `(TAG)`,
+      while this books `0 c` in both. Likewise, the refusal of a branch
+      that calls `all()` evaluates the call over the postings generated
+      before the completion in the engine's order, so that where one of
+      them has made `all()` false the completion is not refused, and the
+      split can then decide what C++ books or whether it accepts the
+      transaction. Under `= /^Equity|Assets:Tajer/ and expr
+      'all(account =~ /Assets|Equity/)'` with `(Budget)  1`, an elided
+      `Equity:Gold` written before `Assets:Tajer  100 c (TAG)` and
+      `Assets:Gruulmorg  200 c` makes C++ book `-200 c`, and `-300 c`
+      without `(TAG)`, while this books `100 c` in both, departing from
+      C++ with and without the split. Under `= /^(Assets:C|Equity)/ and
+      expr 'all(account =~ /Assets|Equity/)'` with `Budget  1`, an elided
+      `Equity:Gold` written before `Assets:A  200 c (TAG)`,
+      `Assets:B  100 c` and `Assets:C  -100 c` is completed in C++ with a
+      zero where it is written and with `-200 c (TAG)` after the
+      postings. The rule generates `Budget  0` from the zero, `all()`
+      then failing for `Assets:C`, and C++ accepts the transaction, which
+      it rejects without `(TAG)`, while this generates `Budget  -100 c`
+      from `Assets:C` and rejects both for imbalance, departing from C++
+      only with the split (fail-closed);
+    - a completion of a commodity at risk, when the rule's templates
+      only multiply, those of them that must balance do not cancel, and
+      a written posting of the real pool that the rule does not match
+      has an annotated weight in that commodity. C++ checks the
+      transaction again after such a rule (`verify()`,
+      xact.cc:1040-1110, 1683-1684), summing each annotated key apart:
+      the postings that the rule generates from the keys of the
+      completion and from the written postings that it matches leave
+      unbalanced each key in which the written postings that it does not
+      match fail to net to zero, while `verifyExtended`, which weighs
+      the merged completion, passes wherever they net to zero in the
+      commodity as a whole. Under `= /^(Assets:C|Equity)/` with
+      `Budget  1`, C++ rejects `Assets:A  100 c (TAG)`,
+      `Assets:B  -100 c` and `Assets:C  300 c` against an elided
+      `Equity:Gold`, which it completes with `-200 c` and
+      `-100 c (TAG)`, with the remainder `100 c` and `-100 c (TAG)`, and
+      accepts them without `(TAG)`, while `verifyExtended` passes both;
+      so it does with `[Budget]  1`, or with `Budget  2` and
+      `Other  -1`, in place of `Budget  1`, and with a lot price or a
+      lot date in place of the note, and under
+      `= /^(Expenses:Rent|Liabilities:Card)/` with `Budget:Spent  1`
+      it rejects `Expenses:Refund  -50 USD (refund)`,
+      `Expenses:Refund  50 USD` and `Expenses:Rent  800 USD` against
+      an elided `Liabilities:Card`, with the remainder `-50 USD` and
+      `50 USD (refund)`. Templates that cancel, such as `Budget  1` and
+      `Other  -1`, leave each key balanced, and C++ accepts the first
+      of these journals with them. The refusal waits for
+      `verifyExtended`, which `finalizeXact` runs after this function,
+      so that a transaction that the engine's own check rejects keeps
+      that reason: with `Assets:B  -50 c` in the first journal, both
+      reject it. It over-approximates where the annotated weights of the
+      written postings that the rule does not match net to zero in each
+      key in C++ (fail-closed): with `(TAG)` on `Assets:B` as well, C++
+      accepts the first journal, and so it does with `Assets:D  50 c {$2}`
+      and `Assets:E  -50 c {$2}` added, two keys that each net to zero,
+      showing in both the balances that the engine shows without the
+      refusal. Every other refusal is raised at once, before
+      `verifyExtended`, and so takes the place of the reason that this
+      check gives where both it and C++ reject the transaction for
+      imbalance. What the engine generates from a completion that C++
+      splits or posts at zero need not be what C++ generates, and that
+      check can find there an imbalance that C++ does not have: under
+      `= /^Equity/ and expr amount < -250` with `Budget  1`, C++ accepts
+      `Assets:Tajer  100 c (TAG)` and `Assets:Gruulmorg  200 c` against
+      an elided `Equity:Gold`, completed with `-200 c` and
+      `-100 c (TAG)`, neither of which passes the comparison, while the
+      merged `-300 c` passes it here and `verifyExtended` would reject
+      what the rule generates from it;
+    - a completion at zero of a commodity at risk, its amount
+      comparisons dropped. C++ books once for each of its postings, whose
+      amounts need not be zero. A template with a fixed amount or an
+      expression books on each; a rule whose templates only multiply
+      fails the check that follows it (`verify()`) unless what it
+      generates nets to zero in each key, as when those of its templates
+      that must balance cancel, or when it matches as well the written
+      postings whose weights the keys negate, and then, as when its
+      templates are all virtual, it leaves every account's balance as it
+      is, a case that this refusal does not tell apart (fail-closed):
+      under `= /^(Assets|Equity)/` with `Budget  1`, C++ accepts
+      `Assets:Tajer  100 c (TAG)` and `Assets:Gruulmorg  -100 c` against
+      an elided `Equity:Gold`, which it completes with `100 c` and
+      `-100 c (TAG)`, and shows the balances that the engine shows
+      without the refusal. Under `= /Elided/` with `Budget  $10` and
+      `Other  $-10`, `Assets:S  10 AAPL {$50}` and `Assets:T  -10 AAPL`
+      complete an elided `Assets:Elided` with `10 AAPL` and
+      `-10 AAPL {$50}` in C++, which books `$20` and `$-20`, and with
+      nothing here, which books nothing; with `Budget  1` alone, C++
+      rejects the transaction, the generated `10 AAPL` and
+      `-10 AAPL {$50}` being two keys that `verify()` does not net;
+    - any other completion at zero, at its zero amount, when the rule has
+      a template with a fixed amount or an expression, a template
+      posting that is not `(virtual)`, or a note. C++ completes such a
+      commodity with at most one posting, of zero, on which a template
+      with a fixed amount or an expression books as on any other: under
+      `= /Cash/` with `(Budget)  $10`, `Expenses:C  3 EUR`,
+      `Expenses:A  $5` and `Expenses:B  $-5` complete an elided
+      `Assets:Cash` with `$0` and `-3 EUR` in C++, which books `$20`,
+      and with `-3 EUR` here, which books `$10`. From that posting a
+      multiplier generates a posting of zero, which changes no balance
+      but which the engine does not make: one that is not virtual makes
+      a later real balance assignment to its account measure the
+      real-only balance (textual_xacts.cc:398-409), and one that must
+      balance makes C++ check the transaction again (`verify()`). Under
+      `= /Cash/` with `Budget  1` and `Other  -1`, `Expenses:A  $5` and
+      `Expenses:B  $-5` complete an elided `Assets:Cash` with `$0`, and
+      after a later `(Budget)  $10`, C++ reads `Budget  = $0` against
+      the real-only balance and posts a zero, where `$-10` is posted
+      here. A note written before the template postings tags the
+      completion (xact.cc:1497-1503), for the rules after it to read. A
+      rule whose templates are all `(virtual)` multipliers, and which
+      carries no note, stays accepted, as regress/2482 requires of its
+      completion at zero in `BTC`. The postings of zero that it
+      generates change no balance, but each enters the sum by which C++
+      shows its account, a sum that drops the precision that a lone
+      inferred amount keeps (amount.cc:634-642), a departure
+      (fail-open): under `= /Cash/` with `(Budget)  1`, when `Budget`
+      holds a lone inferred `$-0.0004`, as an elided posting beside
+      `Assets:B  1 FOO @ $0.0004` after `$1.00` elsewhere, the same
+      completion makes C++ show `Budget` as zero, while it shows
+      `$-0.0004` here.
+    The functions `any()` and `all()` of C++ test every posting of the
+    transaction (post.cc:653-700), its completions at zero included, so
+    beside a completion at zero, of either pool, a rule with a branch
+    that calls either is refused when the branch matches a real posting
+    or a real completion at zero once its calls and amount comparisons
+    are dropped: under `= /Assets:S/ and expr 'all(account =~
+    /Assets:[ST]/)'` with `(Budget)  $10`, `Assets:S  10 AAPL {$50}` and
+    `Assets:T  -10 AAPL` against an elided `Assets:Elided` make C++ book
+    nothing, and this would book `$10`. A periodic
+    template is tested alike, since C++ extends it as well
+    (textual_xacts.cc:316-317) and gives each posting that a rule
+    generates there to its account (xact.cc:1669-1671), while Phase 9
+    gives the template's own postings to none (xact.cc:987-1010). A real
+    posting so generated makes a later real balance assignment to its
+    account measure the real-only balance (textual_xacts.cc:398-409):
+    under `= /Cash/` with `Budget  1` and `Other  -1`, a template
+    `~ Monthly` in which `Expenses:A  $5` and `Expenses:B  $-5` complete
+    an elided `Assets:Cash` with `$0`, followed by `(Budget)  $10` and
+    by `Budget  = $0` against an elided `Equity`, makes C++ post a zero,
+    where `$-10` would be posted here. The refusal in a template can
+    also fall on a journal that C++ reads as the engine does
+    (fail-closed): under `= /^Equity/` with `(Budget)  $10`, a template
+    of `Assets:Tajer  100 c (TAG)` and `Assets:Gruulmorg  200 c` against
+    an elided `Equity:Gold` is refused, while C++ shows the balances
+    that the engine shows without the refusal. That the engine
+    gives no account the postings that a rule generates in a template
+    is a departure that `flushPending` records, and so is the reading of
+    `any()` and `all()` there, which C++ takes as false and true for a
+    posting without a transaction. These tests read them as the engine
+    does, so that a split that C++ makes in a template under a call of
+    `all()` that is false here goes unrefused, its postings reaching
+    accounts that the engine leaves as they are: under `= /^Equity/ and
+    expr 'all(account =~ /Nothing/)'` with `(Budget)  $10`, a template
+    of `Assets:Tajer  100 c (TAG)` and `Assets:Gruulmorg  200 c` against
+    an elided `Equity:Gold`, followed by `(Budget)  $5` and, dated after
+    the current date, by `Budget  = $0` against an elided `Equity`,
+    makes C++ post `$-25`, and `$-15` without `(TAG)`, where `$-5` is
+    posted here in both. These tests do not see the lot that C++
+    carries into the amount of a balance assignment, a departure
+    recorded at `PostSpec.fixated`, and do not refuse a split that it
+    causes (fail-open): with `10 AAPL {$5}` held in `Assets:Broker`,
+    under `= /^Equity/` with `(Budget)  $10`, `Assets:Broker  = 0 AAPL`
+    beside `Assets:Other  4 AAPL` completes an elided `Equity:Gold` with
+    `-4 AAPL` and `10 AAPL {$5}` in C++, which books `$20`, and with
+    `6 AAPL` here, which books `$10`. Nor do they refuse a rule whose
+    templates that must balance do not cancel where it matches a
+    posting whose cost carries an annotation of its own: C++ derives the
+    cost of the posting generated from it from the lot price of its
+    amount, which lacks that annotation (xact.cc:1611-1627), so that the
+    key of the annotated cost stays unbalanced in the check that follows
+    the rule, a departure of `verifyExtended` that holds without a split
+    (fail-open). Under `= /^(Assets|Equity)/` with `Budget  1`, C++
+    rejects `Assets:Tajer  10 AAPL @ $5 (note)` against an elided
+    `Equity:Gold`, which it completes with `$-50 (note)`, with the
+    remainder `$50` and `$-50 (note)`, and it rejects as well the same
+    posting beside `Assets:Gruulmorg  $20`, completed with `$-20` and
+    `$-50 (note)`; it accepts both without `(note)`, while all four are
+    accepted here.
+
+    These tests read each branch as the engine reads it, so that a
+    departure that makes the engine read a branch as false where C++
+    reads it as true for the posting of some key hides the split, or
+    the completion at zero, from them, as the departures above do for
+    `any()` and `all()`. Others recorded beside their rules do the same:
+    the balance that the engine reads for `account("N").total` before
+    the transaction (`compileConj`), the place in which it runs a rule
+    without template postings, the note written under a template posting
+    that it gives to the matched posting, and the date of a posting that
+    `dateOk` does not read: under `= /^Equity/ and expr date >=
+    [2024/02/01]` with `(Budget)  $10`, `Assets:Tajer  100 c (TAG)` and
+    `Assets:Gruulmorg  200 c` against an elided `Equity:Gold` that
+    carries `; [2024/03/01]`, in a transaction dated 2024/01/01, make C++
+    book `$20`, and `$10` without `(TAG)`, while this books nothing in
+    both. -/
+private def applyAutos (st : St) (hline : Nat) (xdate : Option Int)
+    (payee : String) (code : String) (dateStr : String)
+    (xactNotes : String) (posts : List PostSpec)
+    (zeros : List ZeroCompletion) :
+    Except String (List PostSpec × List (List (PostSpec × PostSpec × Bool))
+      × Option String) :=
   -- `TAG:: value` / `TAG: value` metadata for predicates/templates
   let tagValuesOf := fun (notes : String) =>
     (notes.splitOn ";").filterMap fun seg =>
@@ -1327,6 +1715,13 @@ private def applyAutos (st : St) (xdate : Option Int) (payee : String)
       if w.length ≥ 3 && w.startsWith ":" && w.endsWith ":" then
         ((w.drop 1).toString.toList.dropLast |> String.ofList).splitOn ":"
       else []) ++ (tagValuesOf notes).map (·.1)
+  -- the date of the transaction, while C++ reads the date of the posting
+  -- tested (item.cc:149-150, 354-355; post.cc:143-174), which a note
+  -- `; [DATE]` on the posting sets (item.cc:86-103), a departure (wrong
+  -- rows): under `= /^Equity/ and expr date >= [2024/02/01]` with
+  -- `(Budget)  $10`, `Assets:Tajer  100 c` and `Assets:Gruulmorg  200 c`
+  -- against an elided `Equity:Gold` that carries `; [2024/03/01]`, in a
+  -- transaction dated 2024/01/01, book `$10` in C++ and nothing here
   let dateOk := fun (dateTerms : List (DateCmp × Int)) =>
     dateTerms.all fun (cmp, bound) =>
       match xdate with
@@ -1432,23 +1827,81 @@ private def applyAutos (st : St) (xdate : Option Int) (payee : String)
             ⟨c.comm, c.q / scale⟩
           lotTotal := ap.lotTotal, lotScale := scale
           : PostSpec }
-  Id.run do
+  -- the refusals of completions that C++ splits or posts at zero (the
+  -- docstring gives the rule and its witnesses): `loose` drops a
+  -- branch's amount comparisons, `bare` its quantifiers as well
+  let loose := fun (b : PredSpec) => { b with amountTerms := [] }
+  let bare := fun (b : PredSpec) =>
+    { b with amountTerms := [], anyRx := none, allRx := none }
+  let splitWhy :=
+    "out-of-scope automated transaction on a completion C++ splits by annotation"
+  let zeroWhy :=
+    "out-of-scope automated transaction on a completion C++ posts at zero"
+  do
     let mut cand := posts.toArray
     let mut extra : List PostSpec := []
     let mut batches : List (List (PostSpec × PostSpec × Bool)) := []
+    -- the reason of the refusal that waits for `verifyExtended` (the
+    -- second case of the docstring)
+    let mut pendingWhy : Option String := none
     for rule in st.autos do
       if !rule.active then
         batches := batches ++ [[]]
         continue
+      -- a template with a fixed amount or an expression; whether the rule
+      -- has template postings, without which C++ runs it after every rule
+      -- that has them (journal.cc:659-667); and whether it does more on a
+      -- completion at zero than add `(virtual)` postings of zero
+      let shaped := rule.posts.any fun ap => ap.fixed.isSome || ap.exprSrc.isSome
+      let generates := !rule.posts.isEmpty
+      let marksZero := shaped || !rule.noteTag.isEmpty
+        || rule.posts.any (·.kind != .virtualUnbal)
+      if generates && !zeros.isEmpty then
+        -- `bare` drops the quantifiers, which alone read the current set
+        let tested : List (PostSpec × Amount) :=
+          (cand.toList.filterMap fun p => match p.kind, p.amount with
+            | PostKind.real, some a => some (p, a)
+            | _, _ => none)
+          ++ (zeros.filter (·.post.kind == .real)).map fun z =>
+            (z.post, ⟨z.comm, 0⟩)
+        if rule.branches.any fun b => (b.anyRx.isSome || b.allRx.isSome)
+            && tested.any fun (p, a) => matchBranch xactNotes [] (bare b) p a then
+          err hline (if zeros.any (·.split) then splitWhy else zeroWhy)
+        let cur := cand.toList ++ extra
+        for z in zeros do
+          if z.post.kind == .real && (z.split || marksZero)
+              && rule.branches.any fun b =>
+                matchBranch xactNotes cur (if z.split then loose b else b) z.post
+                  ⟨z.comm, 0⟩ then
+            err hline (if z.split then splitWhy else zeroWhy)
       let mut batch : List (PostSpec × PostSpec × Bool) := []
+      -- the commodities of the completions at risk that the rule matches,
+      -- and the written postings of the real pool that it does not match,
+      -- for the refusal that waits for `verifyExtended`
+      let mut hit : List String := []
+      let mut missed : List PostSpec := []
       for i in [0:cand.size] do
         let p : PostSpec := cand[i]!
         -- real postings only, neither virtual nor deferred ones, a
-        -- departure that the docstring records
+        -- departure that the docstring records. A deferred posting, never
+        -- matched, counts among the postings of the real pool that the
+        -- rule does not match, for the refusal that waits for
+        -- `verifyExtended`
         match p.kind, p.amount with
         | PostKind.real, some a =>
             let cur := cand.toList ++ extra
+            -- a completion at risk that a branch matches, its amount
+            -- comparisons dropped, under a template with a fixed amount or
+            -- an expression, or under a branch that compares the amount,
+            -- calls `all()` or reads `account("N").total` (the first case
+            -- of the docstring)
+            if p.splitRisk && generates && rule.branches.any fun b =>
+                (shaped || !b.amountTerms.isEmpty || b.allRx.isSome
+                    || !b.acctTotal.isEmpty)
+                  && matchBranch xactNotes cur (loose b) p a then
+              err hline splitWhy
             if rule.branches.any fun b => matchBranch xactNotes cur b p a then
+              if p.splitRisk then hit := a.comm :: hit
               let gen := rule.posts.filterMap fun ap =>
                 (instantiate xactNotes p a ap).map fun g => (ap, g)
               extra := extra ++ gen.map (·.2)
@@ -1478,13 +1931,46 @@ private def applyAutos (st : St) (xdate : Option Int) (payee : String)
               -- the expression's value carries the annotation
               batch := batch ++ gen.map fun (ap, g) =>
                 (p, g, ap.fixed.isNone && g.amount.map (·.comm) == some a.comm)
-              -- the template's own note tags the matched posting, so
-              -- later rules see it there (1984's :BUDGETED: guard)
+              -- the rule's note tags the matched posting, so later rules
+              -- see it there (1984's :BUDGETED: guard, a note written
+              -- before the template posting; xact.cc:1497-1503). C++
+              -- gives a note written under a template posting only to the
+              -- postings generated from that template (textual_xacts.cc:248,
+              -- 274; xact.h:370-374; xact.cc:1658-1665), which no later
+              -- rule with template postings matches (xact.cc:1443-1447),
+              -- while `finalizeAuto` gathers every note line of the rule, a
+              -- departure (wrong rows): under `= /Food/` with
+              -- `(Budget)  $10` and `; :SEEN:` under it, and
+              -- `= /Food/ and %SEEN` with `(Budget)  $10`,
+              -- `Expenses:Food  $5` against `Assets:Cash  $-5` books `$10`
+              -- in C++ and `$20` here. A rule without template postings tags
+              -- here, in its place in the file, while C++ runs it after every
+              -- rule that has them, a departure that the docstring records
               if !rule.noteTag.isEmpty then
                 cand := cand.set! i { p with note := p.note ++ rule.noteTag }
+            else if !p.splitRisk then
+              missed := p :: missed
+        | PostKind.deferred, some _ => missed := p :: missed
         | _, _ => pure ()
+      -- a completion at risk that the rule matches, when its templates
+      -- only multiply, those that must balance do not cancel, and a
+      -- written posting of the real pool that it does not match has an
+      -- annotated weight in that commodity (the second case of the
+      -- docstring): `verify()` sums each annotated key apart
+      -- (xact.cc:1040-1110, 1683-1684), which the engine's check of the
+      -- merged completion does not
+      let net := rule.posts.foldl (init := (0 : ℚ)) fun s ap =>
+        if ap.kind != .virtualUnbal && ap.fixed.isNone && ap.exprSrc.isNone then
+          s + ap.mult
+        else s
+      if net != 0 && missed.any fun p =>
+          match p.costVal <|> p.amount with
+          | some w => hit.contains w.comm
+              && (if p.costVal.isSome then p.costAnnotated else p.annotated)
+          | none => false then
+        pendingWhy := some splitWhy
       batches := batches ++ [batch]
-    pure (cand.toList ++ extra, batches)
+    pure (cand.toList ++ extra, batches, pendingWhy)
 
 /-- A C++ balance key: the commodity, with the lot price (its
     commodity, its price per unit and its fixated flag) when the amount
@@ -1578,8 +2064,33 @@ private inductive Exchange where
 
 /-- What `balancePool` makes of a pool that it accepts. -/
 private structure PoolResult where
-  /-- the pool's postings, its elided posting replaced by the postings
-      that complete it, or the bucket's postings added -/
+  /-- the pool's written postings, its elided posting left out, followed
+      by the postings that complete the pool, if any, through its elided
+      posting or through the bucket, in the reverse of the order in which
+      their commodities first appear among the pool's weights. C++ fills
+      the posting that it completes, the elided posting where it is
+      written or the bucket's posting, which it adds after the postings
+      of the transaction (xact.cc:368-372), with the first key of the
+      sum, in the order in which it sorts the keys, and appends a posting
+      for each further key after the postings of the transaction
+      (xact.cc:234-246, 834-835; balance.cc:494-497, 509-521). This is a
+      departure (wrong rows): a rule tests each posting after the
+      postings that it generated from those before it have joined the
+      transaction (xact.cc:1438-1447, 1669-1671), and `any()` and
+      `all()` read them (post.cc:653-700). Under `= expr 'account =~
+      /^Assets/ or account =~ /^Equity/ and any(account =~ /Budget/)'`
+      with `(Budget)  1`, an elided `Equity:Gold` written before
+      `Assets:Tajer  100 c` and `Assets:Gruulmorg  200 c` is tested first
+      in C++, before any posting in `Budget` exists, and C++ books
+      `300 c`, while here it is tested last and this books `0 c`; and
+      under `= /Elided/ and expr 'all(account =~ /Assets/)'` with
+      `(Budget)  1`, `Assets:S  $5` and `Assets:T  3 EUR` complete an
+      elided `Assets:Elided` with `$-5` and then `-3 EUR` in C++, which
+      books `$-5`, and in the opposite order here, which books
+      `-3 EUR`. Where C++ splits the completion by annotation, this
+      departure hides from the refusals of `applyAutos` a call of
+      `any()` or `all()` that the split decides, as its docstring
+      records. -/
   posts : List PostSpec
   /-- one candidate per admissible orientation of Phase 3, an
       orientation being admissible when C++ can take it and accept the
@@ -1650,6 +2161,53 @@ private structure PoolResult where
       `impliedExchange` records; `verifyExtended` weighs the generated
       postings under it as under the orientations of `candidates`. -/
   swapped : List PoolCandidate := []
+  /-- the commodities in which C++ can complete the pool with more than
+      one posting, through its elided posting or through the bucket's
+      posting, each with the weights that the engine sums in it, in
+      posting order, whether its residual is zero or not; empty when
+      neither completes the pool. C++ sums each posting that must
+      balance at its cost, if it has one, and else at its amount, under
+      its annotated commodity (xact.cc:325-333, annotate.h:120-125),
+      adds the lot gains that Phase 6 books (xact.cc:692-713, 735-763),
+      and completes the elided posting, or the bucket's, with one posting
+      for each key of that sum (xact.cc:180-248, 368-372, 829-863), where
+      `balancePool` completes it with one posting per commodity. The
+      engine reads the lot price of an annotation and its fixation
+      (`lotKeyOf`) but not its date, note or value expression, so it
+      lists a commodity in which two or more weights fall, one of them
+      annotated: an amount with `PostSpec.annotated` or a cost with
+      `PostSpec.costAnnotated`. The gain that `costVal` adds to such a
+      cost, the lot basis less the cost (`PostSpec.gainVal`), counts as a
+      weight of its own, plain, for the gain that C++ books apart: under
+      `= /Elided/` with `(Budget)  $10`,
+      `Assets:T  10 AAPL {$50} @ $5 {$1}` completes an elided
+      `Assets:Elided` with `$-450` and `$-50 {$1}` in C++, which books
+      `$20`, and with `$-500` here, which books `$10`; with
+      `bucket Assets:Cash`, the same posting alone gives `Assets:Cash`
+      those postings in C++ and `$-500` here. The weights are the
+      engine's, and they differ from those of C++ where `costVal`
+      departs from it (`PostSpec.costAnnotated`): where C++ books no gain
+      on such a cost, the gain counted here can list a commodity that C++
+      keeps whole; where the price that annotates the cost is not one
+      unit, the gain counted here differs from that of C++, and can
+      differ in sign or be zero where that of C++ is not, so that a split
+      that C++ makes goes unrefused (fail-open): under `= /Elided/` with
+      `(Budget)  $10`, `Assets:T  10 AAPL {$5} @ $5 {$20}` completes an
+      elided `Assets:Elided` with `$950` and `$-50 {$20}` in C++, which
+      books `$20`, and with `$-50` here, which books `$10`; and the gain
+      that C++ books on a cost in another commodity is not counted, so
+      that a split that it causes goes unrefused as well (fail-open):
+      under `= /Elided/` with `(Budget)  $10`,
+      `Assets:T  10 AAPL {$50} @ 5 EUR {$1}` against an elided posting
+      books `$20` in C++ and `$10` here. A commodity whose weights all
+      carry one annotation is listed although C++ keeps it whole. A
+      commodity listed in excess can only add refusals. `applyAutos`
+      refuses the rules whose effect depends on the split
+      (`PostSpec.splitRisk`, `ZeroCompletion.split`). -/
+  splitComms : List (String × List ℚ) := []
+  /-- the completions at zero that C++ can make and `posts` lacks
+      (`ZeroCompletion`), which `applyAutos` tests -/
+  zeroCompletions : List ZeroCompletion := []
 
 /-- The implicit exchange of C++'s `finalize`, Phase 3
     (src/xact.cc:374-473 at 76b9dc2b2). With no null posting, a real
@@ -2106,7 +2664,15 @@ private def impliedExchange (st : St) (xact pool : List PostSpec)
       `Assets:X 1 AAA {$5}` and `Assets:Y -1 AAA` it rejects
       `Expenses:Food $10.00` against an elided posting, as it does with
       `1 AAA [2026/01/01]` or `1 AAA (note)` in place of `1 AAA {$5}`;
-      all of these are accepted here (fail-open). Under
+      all of these are accepted here (fail-open). So is a transaction in
+      which C++ derives the cost of a generated posting from the lot
+      price of the matched amount while the matched cost carries an
+      annotation of its own, which that lot price lacks
+      (xact.cc:1611-1627): under `= /^(Assets|Equity)/` with `Budget  1`,
+      `Assets:Tajer  10 AAPL @ $5 (note)` against an elided
+      `Equity:Gold`, which C++ rejects with the remainder `$50` and
+      `$-50 (note)`; the docstring of `applyAutos` gives the same
+      posting beside a completion that C++ splits. Under
       `format 1.00 AAA`, with `Assets:Y 0.004 AAA`, it accepts
       `0.004 AAA {$1}` against `-0.004 AAA {$1}`, which is rejected here
       (fail-closed);
@@ -2144,7 +2710,15 @@ private def impliedExchange (st : St) (xact pool : List PostSpec)
       while `verify()` sums the costs that Phase 6 leaves, and these
       differ for an exchange of two lots priced in one commodity: the
       shape that the docstring of `PoolResult.candidates` gives is
-      accepted here and rejected by C++ (fail-open);
+      accepted here and rejected by C++ (fail-open). They differ as well
+      where a posting with a lot price has a cost written with a price
+      of its own in the commodity of that lot price, a cost that Phase 6
+      rewrites into the basis of the lot (xact.cc:735-774,
+      `PostSpec.costAnnotated`): under `= /Assets:Y/` with `Budget  1`
+      and `Other  -1`, C++ rejects `Assets:U  5 AAPL {$40} @ $5 {$1}`,
+      `Assets:X  $-25 {$1}` and `Assets:Y  $-175` with the remainder
+      `$25` and `$-25 {$1}`, and accepts them without the rule, while
+      both are accepted here (fail-open);
     - `PostSpec.lotTotal` stands in for the mark that C++ keeps on the
       interned commodity, and its docstring gives a journal on which
       this departs in each direction;
@@ -2622,9 +3196,53 @@ private def finalizeXact (st : St) (hline : Nat) (_header : String)
     let costTagged := fun (c : String) (s : ℚ) =>
       let pp := pricePrec c
       pp > 0 && roundAt pp s == s
+    -- the weights that stand here for what C++ sums, in posting order,
+    -- each with whether it is annotated, and the commodities in which
+    -- C++ can complete the pool with one posting per annotated key
+    -- (`PoolResult.splitComms`). A cost that carries an annotation of its
+    -- own weighs twice when `costVal` holds a lot gain: C++ sums the cost
+    -- under its annotated commodity in Phase 1, and Phase 6 can add a
+    -- gain apart, plain (xact.cc:735-763), which the gain of `costVal`
+    -- stands for with the departures recorded at `PostSpec.costAnnotated`
+    let weights : List (Amount × Bool) := pool.flatMap fun p =>
+      match p.amount, p.costVal with
+      | none, _ => []
+      | some a, none => [(a, p.annotated)]
+      | some _, some cv =>
+          let g : ℚ := match p.gainVal.map (canonAmt stv) with
+            | some ga => if !periodic && p.costAnnotated && ga.comm == cv.comm then ga.q
+                else 0
+            | none => 0
+          if g == 0 then [(cv, p.costAnnotated)]
+          else [(⟨cv.comm, cv.q - g⟩, true), (⟨cv.comm, g⟩, false)]
+    let weightsIn := fun (c : String) => weights.filter (·.1.comm == c)
+    let atRisk := fun (c : String) =>
+      (weightsIn c).length ≥ 2 && (weightsIn c).any (·.2)
+    -- for a pool that its elided posting or the bucket's posting
+    -- completes: the commodities of the weights, those at risk with their
+    -- weights, and for each commodity whose weights net to zero the
+    -- completion that C++ can still make (`ZeroCompletion`)
+    let comms := (weights.map (·.1.comm)).eraseDups
+    let splitComms := (comms.filter atRisk).map fun c =>
+      (c, (weightsIn c).map (·.1.q))
+    let zeroComps := fun (e : PostSpec) =>
+      (comms.filter fun c => !residualExact.any (·.1 == c)).map fun c =>
+        ({ post := e, comm := c, split := atRisk c } : ZeroCompletion)
+    -- the bucket's account where the bucket completes the pool (the
+    -- comment below gives the condition), and the completions at zero
+    -- that C++ can make through the posting that it adds there
+    let bucket? := if isReal && ordered.length == 1 then st.bucket else none
+    let bucketZeros := fun (b : String) =>
+      zeroComps { line := hline, account := b, kind := .real }
     match elided with
     | [] =>
-        if residualExact.isEmpty then pure { posts := pool }
+        if residualExact.isEmpty then
+          -- C++ adds the bucket's posting to a transaction of one posting
+          -- whose sum is not null, a zero one included, and completes it
+          -- with that sum (xact.cc:368-372, 829-844; `ZeroCompletion`)
+          match bucket? with
+          | some b => pure { posts := pool, splitComms, zeroCompletions := bucketZeros b }
+          | none => pure { posts := pool }
         -- the `bucket` (`A`, account `default`) completes only a
         -- transaction of exactly ONE parsed posting of any kind,
         -- counted before automated postings; with two or more postings
@@ -2633,7 +3251,7 @@ private def finalizeXact (st : St) (hline : Nat) (_header : String)
         -- (xact.cc:368 `posts.size() == 1 && !balance.is_null()`, the
         -- second conjunct implied by a nonzero real residual;
         -- regress/coverage-bucket-single-post)
-        else match (if isReal && ordered.length == 1 then st.bucket else none) with
+        else match bucket? with
           | some b =>
               -- bucket names were resolved when declared. C++ adds a null
               -- posting to the bucket (xact.cc:368-372), which it fills as
@@ -2641,12 +3259,15 @@ private def finalizeXact (st : St) (hline : Nat) (_header : String)
               -- under the cost rule above (xact.cc:829-837, 234-237): after
               -- `$1.00` in `Assets:Y`, `Assets:X  ($1/1000)` alone leaves an
               -- untagged `$-0.001` in the bucket, which shows as zero and
-              -- which a later balance assignment reads at display precision
+              -- which a later balance assignment reads at display precision.
+              -- It fills it per annotated key as well (xact.cc:829-863), so
+              -- that the bucket's posting can split (`PostSpec.splitRisk`)
               let comps := residualExact.map fun (c, s) =>
                 { line := hline, inferred := costTagged c s
                   account := b
-                  kind := PostKind.real, amount := some ⟨c, -s⟩ : PostSpec }
-              pure { posts := pool ++ comps }
+                  kind := PostKind.real, amount := some ⟨c, -s⟩
+                  splitRisk := atRisk c : PostSpec }
+              pure { posts := pool ++ comps, splitComms, zeroCompletions := bucketZeros b }
           | none =>
               -- per-posting cost rounding may explain the residual
               -- (xact.cc phase 8, regress/1125). C++ adds the exact
@@ -2748,9 +3369,12 @@ private def finalizeXact (st : St) (hline : Nat) (_header : String)
         let comps := residualExact.map fun (c, s) =>
           { line := e.line, inferred := costTagged c s, note := e.note
             account := e.account, kind := e.kind
-            amount := some ⟨c, -s⟩ : PostSpec }
+            amount := some ⟨c, -s⟩, splitRisk := atRisk c : PostSpec }
         let kept := pool.filter fun p => !(p.amount.isNone && p.assignTarget.isNone)
-        pure { posts := kept ++ comps }
+        -- the completions follow the postings kept, while C++ fills the
+        -- elided posting where it is written (xact.cc:234-246), a
+        -- departure that the docstring of `PoolResult.posts` records
+        pure { posts := kept ++ comps, splitComms, zeroCompletions := zeroComps e }
     | _ => err hline "more than one elided posting in a balancing pool"
   let realPool := rposts.filter fun p => p.kind == .real || p.kind == .deferred
   let virtPool := rposts.filter fun p => p.kind == .virtualBal
@@ -2782,10 +3406,14 @@ private def finalizeXact (st : St) (hline : Nat) (_header : String)
       for b in rule.branches do
         if let some (k, _) := b.tagEq then
           tagEqGuard hline k xactNotes rposts
-  let (finalPosts, autoBatches) :=
-    applyAutos stv (headerDateF stv.dfmt stv.defaultYear _header)
+  let (finalPosts, autoBatches, pendingWhy) ←
+    applyAutos stv hline (headerDateF stv.dfmt stv.defaultYear _header)
       hpayee hcode dateTok xactNotes completed
+      (realDone.zeroCompletions ++ virtDone.zeroCompletions)
   verifyExtended stv hline rposts realDone virtDone autoBatches periodic
+  -- the refusal that `applyAutos` defers until the check that follows each
+  -- rule has passed here, so that a rejection for imbalance keeps its reason
+  if let some why := pendingWhy then err hline why
   -- account payee-rules: an xact whose payee matches maps postings to
   -- the declared account's Unknown slot (cov4-directive-account-payee)
   let payee := hpayee
@@ -2817,7 +3445,12 @@ private def finalizeXact (st : St) (hline : Nat) (_header : String)
   -- recorded for every elided real posting, stands for it: with
   -- `Assets:A` elided against `$10` and `$-10`, and `(Assets:A)  $10` and
   -- `(Assets:A)  20 EUR` after, `Assets:A  = 0` reads no balance and posts
-  -- a zero
+  -- a zero. The bucket's posting, which C++ adds as well to a transaction
+  -- of one posting whose sum is zero (xact.cc:368-372, `ZeroCompletion`),
+  -- has no such event, a departure (wrong rows): with
+  -- `bucket Assets:Cash`, after `Expenses:Food  $0` alone and
+  -- `(Assets:Cash)  $10`, `Assets:Cash  = $0` against `Equity` posts a
+  -- zero in C++ and `$-10` here
   for p in rposts do
     if p.kind == .real && p.amount.isNone then
       stv := { stv with datedEvents :=
@@ -2935,7 +3568,24 @@ private def compileConj (st : St) (n : Nat) (conj : List String) :
           continue
       | .error e => err n e
     if term.startsWith "account(" then
-      -- account("N").total CMP AMOUNT (2099): live balance test
+      -- account("N").total CMP AMOUNT (2099): live balance test. The
+      -- engine reads the balance that the account held before the
+      -- transaction, the quantities of all its commodities summed, and
+      -- drops the commodity of the bound, while C++ reads the account's
+      -- total (account.cc:884-900), with the postings of the transaction
+      -- that have joined the account (xact.cc:987-1010) and those that
+      -- rules generated before (xact.cc:1669-1671), and fails with
+      -- "Cannot convert a balance with multiple commodities to an
+      -- amount" when that total is held in more than one commodity, or
+      -- under more than one annotation of one. Two departures follow:
+      -- under `= expr account =~ /^Equity/ and account("Budget").total
+      -- > 5 c` with `(Budget)  1`, `Budget  10 c` against an elided
+      -- `Equity` books `-10 c` to `Budget` in C++, whose total is
+      -- already `10 c`, and nothing here (wrong rows); and with
+      -- `(Budget)  10 c` and `(Budget)  3 EUR` before, under the bound
+      -- `-150 c`, C++ rejects `Assets:A  100 c` against an elided
+      -- `Equity`, which is accepted here (fail-open), and so it does
+      -- with `3 c (TAG)` in place of `3 EUR`
       let inner := (term.drop "account(".length).toString
       let nameQ := String.ofList (inner.toList.takeWhile (· != ')'))
       let acctName := unquoteAny (trimS nameQ)
@@ -3136,6 +3786,9 @@ private def finalizeAuto (st : St) (rawPosts : List (Nat × String)) :
       for (ln, raw) in rawPosts do
         let rawT := trimS raw
         if rawT.startsWith ";" then
+          -- every note line of the rule, wherever it stands, while C++
+          -- gives the matched posting only those before the first
+          -- template posting, a departure recorded in `applyAutos`
           noteTag := noteTag ++ ";" ++ (rawT.drop 1).toString
           continue
         let (content, _) := splitNote raw
@@ -3593,7 +4246,37 @@ private def flushPending (st : St) : Except String St := do
       -- template and checks it again (textual_xacts.cc:316-317,
       -- xact.cc:1683-1684), and `verifyExtended` does the same, with no
       -- lot price from Phase 6 on a matched posting, since Phase 6 runs
-      -- only for a transaction with a date (xact.cc:522)
+      -- only for a transaction with a date (xact.cc:522). C++ reads each
+      -- posting of a template as one without a transaction, for which
+      -- `any()` is false and `all()` true (textual_xacts.cc:490,
+      -- post.cc:653-700), while `applyAutos` tests both over the postings
+      -- of the template and those generated before, a departure in either
+      -- direction: under `= /^Equity/ and expr 'any(account =~ /Tajer/)'`
+      -- with `Budget  1`, a template of `Assets:Tajer  100 c` against an
+      -- elided `Equity:Gold` is accepted by C++ and rejected here
+      -- (fail-closed), and under
+      -- `= /^Equity/ and expr 'all(account =~ /Nothing/)'` with
+      -- `Budget  1` it is rejected by C++ and accepted here (fail-open).
+      -- C++ also gives each posting that a rule generates in a template to
+      -- its account (xact.cc:1669-1671), while Phase 9 gives the template's
+      -- own postings to none (xact.cc:987-1010). Such a posting belongs to
+      -- no transaction (textual_xacts.cc:490, xact.cc:93-100) and so takes
+      -- the current date, that of `--now` when it is given
+      -- (post.cc:163-174). A real one makes a later real balance
+      -- assignment to its account measure the real-only balance
+      -- (textual_xacts.cc:398-409), and an assignment dated on or after
+      -- the current date sums its amount as well
+      -- (textual_xacts.cc:430-439). The oracle keeps only the verdict and
+      -- so gives those postings to no account, a departure (wrong rows):
+      -- under `= /Expenses:Food/` with `Budget  1` and `Other  -1`, after
+      -- a template `~ Monthly` of `Expenses:Food  $100` against an elided
+      -- `Assets:Cash` and a later `(Budget)  $10`, `Budget  = $0`
+      -- against an elided `Equity` posts a zero in C++, which leaves
+      -- `$10` in `Budget`, and `$-10` here, which leaves `$10` in
+      -- `Equity`; with the assignment dated after the current date, C++
+      -- posts `$-100` for it, which leaves `$-90` in `Budget` and `$100`
+      -- in `Equity`. The refusals of `applyAutos` on a completion that C++
+      -- splits or posts at zero hold in a template as well
       match finalizeXact { st with pending := .none } ln h posts.reverse
           (periodic := true) with
       | .ok _ => pure { st with pending := .none }
