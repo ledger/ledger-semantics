@@ -135,6 +135,12 @@ inductive PostKind where
 
 structure PostSpec where
   line : Nat
+  /-- the posting is a completion that `costTagged` in `balancePool`
+      marks as C++ tags an inferred amount that fits the precision of a
+      cost (BIGINT_COST_PREC); the comment on COST_PREC tagging beside it
+      records the ways in which the mark departs from the tag, two tests
+      of C++ that it weakens among them; `bumpStat` counts it for a lone
+      inferred amount, and `finalizeXact` reads it for `St.lotFanout` -/
   inferred : Bool := false
   amtDecs : Nat := 0
   costDecs : Nat := 0
@@ -286,7 +292,8 @@ structure PostSpec where
   /-- the posting is one by which `balancePool` completes an elided
       posting, or the bucket's posting, in a commodity that C++ can
       complete with one posting per annotated commodity
-      (`PoolResult.splitComms`); `applyAutos` reads it -/
+      (`PoolResult.splitComms`); `applyAutos` reads it, and so does
+      `finalizeXact`, for `St.lotFanout` -/
   splitRisk : Bool := false
   deriving Repr
 
@@ -434,6 +441,17 @@ structure St where
   /-- (account, commodity) → (flows, inferred flows): drives the
       BIGINT_COST_PREC display rule for lone inferred balances -/
   flowStats : List ((String × String) × Nat × Nat) := []
+  /-- (account, commodity, debit) → (flows, inferred flows): the flows
+      of nonzero amount that `flowStats` counts, counted apart for the
+      debit column, `true`, and the credit column (`bumpStat`) -/
+  signStats : List ((String × String × Bool) × Nat × Nat) := []
+  /-- set when a pool that its elided posting or the bucket's posting
+      completes has a commodity listed in `PoolResult.splitComms` whose
+      weights have both signs, or whose completion is tagged
+      (`PostSpec.splitRisk` and `PostSpec.inferred`); `Result.lotFanout`
+      gives its meaning, where it is set in excess and where it is
+      missed -/
+  lotFanout : Bool := false
   inComment : Bool := false
 
 private def err {α} (line : Nat) (msg : String) : Except String α :=
@@ -603,13 +621,56 @@ private def zeroTestPrec (st : St) (posts : List PostSpec) (comm : String) :
 private def lookupBal (st : St) (acct comm : String) : ℚ :=
   (st.balances.lookup (acct, comm)).getD 0
 
-private def bumpStat (st : St) (acct comm : String) (inf : Bool) : St :=
-  let key := (acct, comm)
-  match st.flowStats.lookup key with
-  | some _ => { st with flowStats := st.flowStats.map fun (k, t, i) =>
-      if k = key then (k, t + 1, i + (if inf then 1 else 0)) else (k, t, i) }
-  | none => { st with flowStats :=
-      (key, 1, if inf then 1 else 0) :: st.flowStats }
+/-- Add a flow, inferred or not, to the counts of `k` in `m`, the
+    flows and the inferred flows among them, as `bumpStat` keeps
+    `St.flowStats` and `St.signStats`. -/
+private def bumpCount {κ : Type} [DecidableEq κ] (m : List (κ × Nat × Nat))
+    (k : κ) (inf : Bool) : List (κ × Nat × Nat) :=
+  match m.lookup k with
+  | some _ => m.map fun (k', t, i) =>
+      if k' = k then (k', t + 1, i + (if inf then 1 else 0)) else (k', t, i)
+  | none => (k, 1, if inf then 1 else 0) :: m
+
+/-- Count a flow of `dq` in `comm` to `acct`, inferred or not: in
+    `flowStats`, which the net row of `Driver` and the balance
+    assignment of `finalizeXact` read for a lone inferred amount, and,
+    when `dq` is not zero, in `signStats` under the column of its sign,
+    the debit column for a positive amount and the credit column for a
+    negative one. Under `--dc`, C++ gives each posting the pair
+    `(amount > 0 ? amount : 0, amount < 0 ? amount : 0)`
+    (src/report.h:751-754 at 76b9dc2b2, baseline/opt-dc), so that a
+    posting of zero brings the integer 0 to both columns. C++ adds an
+    integer to an amount with a commodity, or such an amount to an
+    integer, by way of a balance, which ignores a zero (value.cc:572-575,
+    591-594, 621-622, 1524-1525; balance.h:131; balance.cc:122-123), so
+    that the zero leaves in its column the precision of a lone inferred
+    amount, which a sum of two amounts drops (amount.cc:634-642), and it
+    counts in neither column here. With `A  1 FOO @ $0.0004` against an
+    elided `B`, a transaction of `B  $0` and `C  $0`, before it or after
+    it, makes C++ print no row for `B` under `bal --flat` and still
+    `$0.0004` in the credit column of `B` under `bal --dc --flat`. A
+    zero whose amount carries an annotation departs from this in the
+    net row: C++ adds it to the account's total by way of a balance as
+    well, since its annotated commodity is not the plain one
+    (value.cc:600-603), and so keeps the tag, while `flowStats` counts
+    it here (wrong rows): with `B  $0 (n)` in place of `B  $0`, C++
+    prints `$-0.0004` for `B` under `bal --flat`, and `Driver` prints no
+    row for it. The flows counted are the engine's. Besides the
+    departures of the balancing, each recorded where it arises, they
+    depart from the postings of C++ where C++ completes one commodity
+    with a posting for each annotated key (`Result.lotFanout`, set
+    where that can change a column, but for the misses that its
+    docstring records), and where the tag of an inferred amount departs
+    from that of C++: on a completion (the comment on COST_PREC tagging
+    in `balancePool`), and on a posting that an automated transaction
+    generates from a tagged amount (the comment on `instantiate` in
+    `applyAutos`). -/
+private def bumpStat (st : St) (acct comm : String) (inf : Bool) (dq : ℚ) : St :=
+  let st := { st with flowStats := bumpCount st.flowStats (acct, comm) inf }
+  if dq = 0 then st
+  else
+    let skey := (acct, comm, decide (dq > 0))
+    { st with signStats := bumpCount st.signStats skey inf }
 
 private def lockPrecision (st : St) (comm : String) (d : Nat) : St :=
   let st := { st with
@@ -1140,12 +1201,26 @@ private def parseAmountField (ctx : AmtCtx) (line : Nat) (field : String)
     -- `-$50` is accepted here and rejected by C++ with a remainder of
     -- `$-10` (fail-open), and against a bracket-virtual `-$60` beside a
     -- real `$10` it is rejected here and accepted by C++
-    -- (fail-closed). C++ keeps no lot on an amount with no commodity
-    -- (amount.cc:1908) and so adds no gain for it: `10 {$5} @ $6`
-    -- against `-$50` is accepted here and rejected by C++ with a
-    -- remainder of `$10` (fail-open), and against `-$60` it is
-    -- rejected here and accepted by C++ (fail-closed). Three more, on a
-    -- cost that carries an annotation of its own, give wrong rows; the
+    -- (fail-closed). Where an elided posting completes each pool, the
+    -- gain passes from the real completion of C++ to the bracket-virtual
+    -- one here (wrong rows): `[Assets:A]  -10 AAPL {$1} @ $5` against an
+    -- elided `[Assets:B]`, beside an elided `Assets:D`, completes
+    -- `[Assets:B]` with `$50` and `Assets:D` with `$-40` in C++, and
+    -- `[Assets:B]` with `$10` and nothing in `Assets:D` here. When the
+    -- two elided postings name one account, its net row agrees with C++
+    -- and its debit and credit totals do not: with `[Assets:D]` elided
+    -- in place of `[Assets:B]` and `Assets:C  $30` beside, C++ completes
+    -- `[Assets:D]` with `$50` and `Assets:D` with `$-70`, whose columns
+    -- hold `$50` and `$70`, where the engine's flows to `Assets:D` are
+    -- `$10` and `$-30`; with `Assets:C  $-60 (n)` instead, C++ completes
+    -- `Assets:D` with `$-40` and `$60 (n)`, a split of both signs that
+    -- `St.lotFanout` misses (`Result.lotFanout`), and so does
+    -- `applyAutos` (`PoolResult.splitComms`). C++ keeps no lot on an
+    -- amount with no commodity (amount.cc:1908) and so adds no gain for
+    -- it: `10 {$5} @ $6` against `-$50` is accepted here and rejected by
+    -- C++ with a remainder of `$10` (fail-open), and against `-$60` it
+    -- is rejected here and accepted by C++ (fail-closed). Three more, on
+    -- a cost that carries an annotation of its own, give wrong rows; the
     -- docstring of `PostSpec.costAnnotated` records them
     let costVal := match lot, cost with
       | some (p, _), some c =>
@@ -1778,6 +1853,20 @@ private def applyAutos (st : St) (hline : Nat) (xdate : Option Int)
       && (b.tagEq.all fun (k, v) => tagEqHolds k v xactNotes p.note)
   let instantiate := fun (xactNotes : String) (p : PostSpec) (a : Amount) =>
     fun (ap : AutoPost) =>
+      -- C++ multiplies the matched amount by a template amount or an
+      -- expression value without a commodity, and otherwise takes the
+      -- template amount or the value as it stands (xact.cc:1533-1549), so
+      -- that a posting generated from a tagged amount (`PostSpec.inferred`)
+      -- keeps the tag, through the product, which amount_t::multiply
+      -- leaves tagged (amount.cc:705-753), or through a value that is the
+      -- matched amount, as that of `(amount)` is. The posting generated
+      -- here is untagged, a departure (wrong rows): under `= /^C$/` with
+      -- `(Budget)  1`, `(Budget)  (1)` or `(Budget)  (amount)`,
+      -- `A  1 FOO @ $0.0004` against an elided `C` gives `Budget` the row
+      -- `$-0.0004` and `$0.0004` in its credit column in C++, and no row
+      -- here; with `(Budget)  $1` in a later transaction, the rows agree,
+      -- and C++ still shows `$0.0004` in the credit column of `Budget`,
+      -- where the counts of `bumpStat` give it no lone inferred amount
       let amt? : Option Amount :=
         match ap.exprSrc with
         | some src =>
@@ -2199,11 +2288,34 @@ private structure PoolResult where
       that a split that it causes goes unrefused as well (fail-open):
       under `= /Elided/` with `(Budget)  $10`,
       `Assets:T  10 AAPL {$50} @ 5 EUR {$1}` against an elided posting
-      books `$20` in C++ and `$10` here. A commodity whose weights all
+      books `$20` in C++ and `$10` here. C++ adds the gain of a
+      bracket-virtual posting to the real balance (xact.cc:712-713), which
+      `costVal` weighs in the bracket-virtual pool (the comment beside
+      it), so that a split of the real pool that the gain causes goes
+      unrefused as well (fail-open): under `= /^Assets:D$/` with
+      `(Budget)  $10`, `[Assets:A]  -10 AAPL {$1} @ $5` against an elided
+      `[Assets:B]`, beside `Assets:C  $-60 (n)` and an elided `Assets:D`,
+      completes `Assets:D` with `$-40` and `$60 (n)` in C++, which books
+      `$20`, and with `$60` here, which books `$10`. The engine keeps
+      neither of two annotations that C++ gives an amount
+      (`PostSpec.fixated`), that of an `apply fixed` rate
+      (textual_xacts.cc:626-638) and the lot that C++ carries into the
+      amount of a balance assignment (textual_xacts.cc:843-862), so that
+      a split that either causes can go unrefused (fail-open): under
+      `= /Equity/` with `(Budget)  $10` and `apply fixed CAD $0.75`,
+      `Assets:A  10 CAD` and `Assets:C  -1 FOO @ 4 CAD` complete an
+      elided `Equity` with `4 CAD` and `-10 CAD {=$0.75}` in C++, which
+      books `$20`, and with `-6 CAD` here, which books `$10`; under
+      `= /Equity:Gold/` with `(Budget)  $10`, after `10 AAPL {$5}` in
+      `Assets:Broker`, `Assets:Broker  = 0 AAPL` beside
+      `Assets:Other  4 AAPL` completes an elided `Equity:Gold` with
+      `-4 AAPL` and `10 AAPL {$5}` in C++, which books `$20`, and with
+      `6 AAPL` here, which books `$10`. A commodity whose weights all
       carry one annotation is listed although C++ keeps it whole. A
       commodity listed in excess can only add refusals. `applyAutos`
       refuses the rules whose effect depends on the split
-      (`PostSpec.splitRisk`, `ZeroCompletion.split`). -/
+      (`PostSpec.splitRisk`, `ZeroCompletion.split`), and `finalizeXact`
+      reads the weights for `St.lotFanout`. -/
   splitComms : List (String × List ℚ) := []
   /-- the completions at zero that C++ can make and `posts` lacks
       (`ZeroCompletion`), which `applyAutos` tests -/
@@ -3176,14 +3288,53 @@ private def finalizeXact (st : St) (hline : Nat) (_header : String)
     let elided := pool.filter fun p => p.amount.isNone && p.assignTarget.isNone
     -- COST_PREC tagging: an inferred amount is tagged only when it fits
     -- the price precision recovered from a cost in its commodity
-    -- (set_cost_prec_if_needed, xact.cc:195-231). C++ scans every
-    -- posting of the transaction (xact.cc:210) and this scans the pool
-    -- alone, a departure: after `$1.00` in another account, with
-    -- `Assets:B  1 FOO @ $0.0004` against an elided `Assets:C`, and
-    -- `[Assets:E]  ($1 / 2500)` against an elided `[Assets:A]`, C++ shows
-    -- `$-0.0004` in `Assets:A`, which shows as zero here (wrong rows),
-    -- and with `(Assets:A)  (1 EUR / 300)` later, C++ rejects
-    -- `Assets:A  = 0`, which is accepted here (fail-open)
+    -- (set_cost_prec_if_needed, xact.cc:195-231). Four departures are
+    -- known. First, C++ scans every posting of the transaction
+    -- (xact.cc:210) and this scans the pool alone: after `$1.00` in
+    -- another account, with `Assets:B  1 FOO @ $0.0004` against an elided
+    -- `Assets:C`, and `[Assets:E]  ($1 / 2500)` against an elided
+    -- `[Assets:A]`, C++ shows `$-0.0004` in `Assets:A`, which shows as
+    -- zero here (wrong rows), and with `(Assets:A)  (1 EUR / 300)` later,
+    -- C++ rejects `Assets:A  = 0`, which is accepted here (fail-open).
+    -- Second, C++ recovers the precision only from a cost in the plain
+    -- commodity of the amount that it tags (xact.cc:213), and so not from
+    -- a cost that keeps an annotation of its own
+    -- (`PostSpec.costAnnotated`), while such a cost counts here (wrong
+    -- rows): `A  1 FOO @ $0.0004 (n)` completes an elided `C` with an
+    -- untagged `$-0.0004 (n)` in C++, which it prints as `$-0 (n)` and
+    -- which leaves no row for `C`, and with a tagged `$-0.0004` here, a
+    -- lone inferred balance that `Driver` shows unrounded. Third, C++
+    -- applies the test to each of the postings by which it completes a
+    -- commodity, one for each annotated key (xact.cc:234-247, 824-863),
+    -- and a sum of two of them drops the tag (amount.cc:634-642), while
+    -- this applies it to the single completion of the commodity (wrong
+    -- rows): `A  1 FOO @ $0.0001` and `B  $5 (n)` complete an elided `C`
+    -- with a tagged `$-0.0001` and an untagged `$-5 (n)` in C++, which
+    -- shows `$-5` in `C` and `$5` in its credit column, and with a tagged
+    -- `$-5.0001` here, which `Driver` shows unrounded. Fourth, C++ tags
+    -- an amount only when the recovered precision exceeds the precision
+    -- of its commodity at that point (xact.cc:217), a test that this
+    -- makes as though that precision were 0, so that where that
+    -- precision later falls below the recovered one, as a `format`
+    -- subdirective or an amount that replaces a precision taken from a
+    -- price directive can make it fall (textual_directives.cc:871-874,
+    -- amount.cc:1839-1846), an amount that C++ leaves untagged can be
+    -- tagged here and shown unrounded (wrong rows): after `X  $1.0000`
+    -- against an elided `Y`, `A  1 FOO @ $0.0001` completes an elided
+    -- `C` with an untagged `$-0.0001` in C++ and with a tagged one here,
+    -- so that a later `commodity $` with `format $1.00` leaves no row for
+    -- `C` in C++, while `Driver` shows the lone inferred balance
+    -- unrounded, and `P 2024/01/01 FOO $0.0001` in place of the first
+    -- transaction, with `X  $1.00` after the transaction of `C` in place
+    -- of the directive, does the same. Each of the four reaches the debit
+    -- and credit counts of `bumpStat` as well; `Result.lotFanout` is set
+    -- for the third, where a tagged completion is in a commodity that
+    -- `PoolResult.splitComms` lists. This omits as well the test by which
+    -- C++ tags only an amount with digits after the point
+    -- (xact.cc:222-226). That omission cannot change how an amount shows,
+    -- since a whole amount shows alike at any precision, and it sets
+    -- `Result.lotFanout` in excess where such an amount completes a
+    -- commodity that `PoolResult.splitComms` lists
     let pricePrec := fun (c : String) =>
       pool.foldl (init := (0 : Nat)) fun acc p =>
         match p.costVal with
@@ -3384,6 +3535,29 @@ private def finalizeXact (st : St) (hline : Nat) (_header : String)
     if virtPool.isEmpty then pure { posts := [] }
     else balancePool virtPool false
   let completed := realDone.posts ++ virtDone.posts ++ exempt
+  -- C++ completes the elided posting of a pool, or the bucket's posting,
+  -- with one posting for each annotated key of the sum that Phase 1
+  -- accumulates and Phase 6 extends with the lot gains that it books
+  -- (xact.cc:180-248, 368-372, 692-713, 735-763, and Phase 7 at
+  -- 824-863), where `balancePool` completes it with one posting per
+  -- commodity, and it tags those of the postings that fit the precision
+  -- of a cost, under the tests that the comment on COST_PREC tagging in
+  -- `balancePool` records, a tag that the sum of two of them drops
+  -- (amount.cc:634-642). The flag is set where this can change the debit
+  -- or credit totals of the completed account, or how they show: where
+  -- two of the weights that `PoolResult.splitComms` lists for a
+  -- commodity have opposite signs (regress/1638), and where the
+  -- completion of a commodity that it lists is tagged. Elsewhere those
+  -- totals are those of C++, except where the balancing departs from
+  -- C++, as the comments beside it record, and where `Result.lotFanout`
+  -- records a miss: the gain of a bracket-virtual posting, for one (the
+  -- comment beside `costVal`), leaves the net row of an account that
+  -- elided postings of both pools complete as in C++ and changes its
+  -- debit and credit totals
+  if (realDone.splitComms ++ virtDone.splitComms).any (fun (_, ws) =>
+        ws.any (· > 0) && ws.any (· < 0))
+      || (realDone.posts ++ virtDone.posts).any (fun p => p.splitRisk && p.inferred) then
+    stv := { stv with lotFanout := true }
   -- auto-xact extension (after balancing, as extend_xact does)
   let afterDate := stripStatus (trimS (String.ofList
     (_header.toList.dropWhile fun c => c != ' ')))
@@ -3432,7 +3606,7 @@ private def finalizeXact (st : St) (hline : Nat) (_header : String)
     | some a =>
         let nm := acctFor p.account
         stv := bumpBal stv nm a.comm a.q
-        stv := bumpStat stv nm a.comm p.inferred
+        stv := bumpStat stv nm a.comm p.inferred a.q
         stv := { stv with datedEvents :=
           ((nm, a.comm), xd, a.q, if p.kind == .real then .real else .virt)
             :: stv.datedEvents }
@@ -4172,6 +4346,116 @@ structure Result where
   precisions : List (String × Nat)
   styles : List (String × Bool)
   flowStats : List ((String × String) × Nat × Nat)
+  /-- the counts of `St.signStats`: the flows of nonzero amount that
+      `flowStats` counts, kept apart for the debit and the credit column
+      of each account (`bumpStat`) -/
+  signStats : List ((String × String × Bool) × Nat × Nat)
+  /-- some transaction has a balancing pool whose completion, through its
+      elided posting or through the bucket's posting, can give the
+      completed account debit or credit totals other than the engine's,
+      or show them otherwise. C++ completes such a posting with one
+      posting for each annotated key of the sum that Phase 1 accumulates
+      and Phase 6 extends with the lot gains that it books
+      (xact.cc:180-248, 368-372, 692-713, 735-763, and Phase 7 at
+      824-863; annotate.h:120-125), each negating the weights that fall
+      in its key, where the engine completes it with one posting per
+      commodity or with none. When no two weights of a commodity have
+      opposite signs, no two of those postings have opposite signs
+      either, and the debit and credit totals of the completed account
+      are those of the engine's single posting. When the weights have
+      both signs, the postings can have both, and both totals then
+      exceed the engine's: in regress/1638, C++ completes the elided
+      `Income:Currency` of the transaction `Buy food` with `40 USD` and
+      `-40 USD {=1.30 CAD}`, which add `40 USD` to each column of that
+      account, while the engine makes no posting in `USD` there. C++
+      also tags those of the postings that fit the precision of a cost,
+      under the tests that the comment on COST_PREC tagging in
+      `balancePool` records, and the sum of two of them in one column
+      drops the tag (amount.cc:634-642), so that a column that C++ fills
+      with two postings of one sign shows at display precision, where
+      the engine's single tagged posting, alone in its column, counts in
+      `signStats` as a lone inferred amount:
+      `A  1 FOO @ $0.0001` and `B  $5 (n)` complete an elided `C` with
+      `$-0.0001` and `$-5 (n)` in C++, which shows `$5` in the credit
+      column of `C`, and with a tagged `$-5.0001` here. The flag is set
+      when the weights that `PoolResult.splitComms` lists for a
+      commodity include one above zero and one below, whether the
+      commodity's residual is zero or not, and when the completion of a
+      commodity that it lists is tagged (`PostSpec.inferred`).
+
+      It is set in excess where C++ keeps all the weights of the
+      commodity under one key, or where its keys net to one sign, in
+      either case where the completion is not tagged, so that the totals
+      of the completed account are the engine's and show as the engine's
+      do; where a tagged completion shares its column with another flow;
+      where the tag cannot change how the column shows, since C++ widens
+      the display of a tagged amount only in a commodity of display
+      precision 0 or where the amount rounds to zero at that precision
+      (amount.cc:2041-2054), a precision known only once the journal is
+      read, and since a whole amount, which C++ leaves untagged
+      (xact.cc:222-226), shows alike at any precision; and where the
+      commodity is listed only for a weight of zero, which C++ adds to no
+      key (balance.h:131, balance.cc:122-123). In regress/1217 the cost
+      `0.00160 ETH {334.51 EUR} [2017-06-13]` and the amount
+      `-0.00160 ETH {334.51 EUR} [2017-06-13]` fall under one key, and C++
+      completes the elided `Assets:Current:Kraken` with `-334.51 EUR` and
+      a posting of zero in that key; `Assets:A  10 AAA (x)` and
+      `Assets:B  -5 AAA (x)` complete an elided `Equity` with `-5 AAA (x)`
+      alone in C++, and with `Assets:C  3 AAA` beside them with `-3 AAA`
+      and `-5 AAA (x)`; after the transaction of `C` above, a later
+      `C  $-1` against an elided `D` brings the credit column of `C` to
+      `$6` in C++ and here; after `X  $1.0000` against `Y`, the
+      transaction of `C` shows `$5.0001` in the credit column of `C` in
+      C++ and here; `A  10 FOO @ $5.00` and `B  $10 (n)` complete an
+      elided `C` with `$-50` and `$-10 (n)` in C++, neither tagged, and
+      with a tagged `$-60` here, each showing `$60` in the credit column
+      of `C`; and `A  1 FOO @ $0.0001` beside `B  $0 (n)` completes an
+      elided `C` with `$-0.0001` alone in C++ and here, each showing
+      `$0.0001` in the credit column of `C`.
+
+      It is missed where the weights that `PoolResult.splitComms` lists
+      depart from those of C++, as its docstring and that of
+      `PostSpec.costAnnotated` record, among them where C++ adds the gain
+      of a bracket-virtual posting to the real balance (xact.cc:712-713),
+      which the engine weighs in the bracket-virtual pool (the comment
+      beside `costVal`), and where C++ gives an amount an annotation that
+      the engine does not keep (`PostSpec.fixated`); the totals then
+      differ (wrong rows). With an elided `[Assets:D]` and an elided
+      `Assets:D`, `[Assets:A]  -10 AAPL {$1} @ $5` beside
+      `Assets:C  $-60 (n)` completes `[Assets:D]` with `$50` and
+      `Assets:D` with `$-40` and `$60 (n)` in C++, whose columns then
+      hold `$110` and `$40`, and with `$10` and `$60` here, which leave
+      `$70` in the debit column alone, the net row of `Assets:D` being
+      `$70` on both sides. C++ carries into the amount of a balance
+      assignment the lot of its target, or else the account's single lot
+      (textual_xacts.cc:843-862): with `10 AAPL {$5}` in `Assets:Broker`,
+      `Assets:Broker  = 0 AAPL` beside `Assets:Other  4 AAPL` completes
+      an elided `Equity:Gold` with `-4 AAPL` and `10 AAPL {$5}` in C++,
+      whose columns then hold `10 AAPL` and `4 AAPL`, and with `6 AAPL`
+      here; in a journal of its own, `Assets:Broker  = 10 AAPL {$5}`
+      beside `Assets:Other  -10 AAPL` completes an elided `Equity:Gold`
+      with `10 AAPL` and `-10 AAPL {$5}` in C++, whose columns then hold
+      `10 AAPL` each, and with no posting here. An `apply fixed` rate
+      annotates an amount (textual_xacts.cc:626-638): under
+      `apply fixed CAD $0.75`, `Assets:A  10 CAD` beside
+      `Assets:C  -1 FOO @ 4 CAD` completes an elided `Equity` with
+      `4 CAD` and `-10 CAD {=$0.75}` in C++, whose columns then hold
+      `4 CAD` and `10 CAD`, and with `-6 CAD` here.
+
+      The flag does not cover the other departures of the tag of an
+      inferred amount, the first, second and fourth that the comment on
+      COST_PREC tagging in `balancePool` records and that of a posting
+      generated from a tagged amount (the comment on `instantiate` in
+      `applyAutos`). Each can reach the net rows, and it can reach a
+      column alone where the account holds a flow of the other sign:
+      `A  1 FOO @ $0.0004 (n)` against an elided `C`, then `C  $1`
+      against an elided `D`, give `C` the row `$1` in C++ and here, and
+      C++ shows zero in the credit column of `C`, where the engine's
+      tagged `$-0.0004`, alone in that column, counts in `signStats` as a
+      lone inferred amount. A periodic
+      template, whose result `flushPending` discards, and a transaction
+      dropped for its UUID leave the flag as it was. -/
+  lotFanout : Bool
 
 private def flushPending (st : St) : Except String St := do
   match st.pending with
@@ -4868,7 +5152,7 @@ def run (input0 : String) (dcDefault : Bool := false)
                               !(s0 == start && a == name) }
             for (a, dq) in flows do
               st := bumpBal st a.name a.commodity dq
-              st := bumpStat st a.name a.commodity false
+              st := bumpStat st a.name a.commodity false dq
               -- POST_IS_TIMELOG (timelog.cc:67, 86): it never makes an
               -- account's balance real-only, yet stays in the real-only
               -- balance, from which C++ leaves out only virtual postings
@@ -4983,11 +5267,11 @@ def run (input0 : String) (dcDefault : Bool := false)
           st := { st with gens := flows :: st.gens }
           for (a, dq) in flows do
             st := bumpBal st a.name a.commodity dq
-            st := bumpStat st a.name a.commodity false
+            st := bumpStat st a.name a.commodity false dq
       st := { st with clockIn := [] }
   | none => pure ()
   pure ⟨st.gens.reverse, st.rewrites, st.equivs, st.precisions,
-        st.amt.styles, st.flowStats⟩
+        st.amt.styles, st.flowStats, st.signStats, st.lotFanout⟩
 
 /-- Apply report-time account rewrites (`account-rewrite`,
     `capture`) to a name. -/
