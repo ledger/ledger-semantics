@@ -404,6 +404,60 @@ private inductive EvKind where
   | real | virt | timelog
   deriving DecidableEq
 
+/-- A point of the dated price table: at the instant `secs`, one unit of
+    `comm` is worth `price`. The instant counts seconds from 0000-03-01
+    00:00, the origin of the day count of every date that the reader
+    reads (`daysFromCivil`) and of the instant of `--now`. C++ keeps the
+    table as an undirected graph of commodities whose edge between two
+    of them maps each instant to the price last recorded at it, in
+    either direction (`commodity_history_impl_t`, history.cc:114-120,
+    351-369; history.h:77). Its instants are local times without a zone,
+    read here as written. `St.priceLog` holds the points that the
+    directives read so far write, `priceTable` resolves them into the
+    table, and `pricesAt` reads the table as of an instant. -/
+structure PricePoint where
+  secs : Int
+  comm : String
+  price : Amount
+  deriving Repr, DecidableEq
+
+/-- The table that the log `log` of written points, the most recent
+    first, leaves: the point written last at each instant on each two
+    commodities, in either direction, in the order in which the points
+    that remain were written. C++ keys the prices of an edge of its
+    undirected graph (history.cc:114-120) by their instant alone, and
+    `add_price` overwrites the entry that it already holds
+    (history.cc:351-369): after `P 2024/01/01 EUR $1.10` and
+    `P 2024/01/01 $ 0.90 EUR`, the table holds the second point alone.
+    test/regress/coverage-iterators-dup-price.test repeats an equal
+    price at one instant, which `pricedb` lists once whether or not the
+    entry is overwritten (iterators.cc:144-161), so the replacement of a
+    different or a reversed price rests on history.cc:358-368 alone. The
+    log is resolved once, when the journal has been read (`run`), in time
+    linear in its length, where replacing the point on each write would
+    cost time quadratic in the number of prices. -/
+private def priceTable (log : List PricePoint) : List PricePoint := Id.run do
+  let mut seen : Std.HashSet (Int × String × String) := {}
+  let mut table : List PricePoint := []
+  for pt in log do
+    let key := if pt.price.comm < pt.comm then (pt.secs, pt.price.comm, pt.comm)
+      else (pt.secs, pt.comm, pt.price.comm)
+    if !seen.contains key then
+      seen := seen.insert key
+      table := pt :: table
+  return table
+
+/-- The points of `pts` that C++ reads as of the instant `t`: those
+    whose instant is not after it. C++ finds a price (`find_price`,
+    history.cc:442, 503) through the latest price of each edge that is
+    not after the reference time (history.cc:257-263) and lists the
+    prices not after it (history.cc:418). The reference time that the
+    Driver's `--now DATE` gives is 00:00 of that date, as C++ sets it
+    (global.cc:483-493), so that a price recorded at 00:00 of the
+    `--now` date is read and one recorded later that day is not. -/
+def pricesAt (pts : List PricePoint) (t : Int) : List PricePoint :=
+  pts.filter (·.secs ≤ t)
+
 structure St where
   amt : AmtCtx := {}
   /-- commodity aliases (from `commodity` block `alias` subs) -/
@@ -452,6 +506,43 @@ structure St where
       gives its meaning, where it is set in excess and where it is
       missed -/
   lotFanout : Bool := false
+  /-- every point that the price directives read so far write, the most
+      recent first, which `priceTable` resolves into the dated price
+      table when the journal has been read (`priceDirective`) -/
+  priceLog : List PricePoint := []
+  /-- the commodities that the price directives read so far mark
+      primary, as far as this reader records them (`priceDirective`),
+      kept for valuation: balancing does not read them. The list is
+      partial; `Result.primary` names what it leaves out -/
+  primary : List String := []
+  /-- the price directives whose point the table does not hold, each as
+      an issue and the commodity that it prices, empty where that is not
+      read (`priceDirective`), the most recent first -/
+  priceIssues : List (String × String) := []
+  /-- set by an in-file `--now` line, after which the current time of
+      C++ is not known here: the option takes a time with its date
+      (report.h:1059-1074 at 76b9dc2b2), and the end of an included file
+      and `end apply year` restore the time that came before
+      (textual_directives.cc:424-446, 593-595), while `nowSecs` takes the
+      date alone and keeps it to the end of the journal
+      (`priceDirective`) -/
+  nowInFile : Bool := false
+  /-- set where the year that C++ gives a date of a month and a day may
+      differ from `defaultYear`: from the start in a journal into which
+      files are spliced, since C++ restores its year where an included
+      file ends (textual_directives.cc:424-446), and at an `apply year`
+      directive, which sets that year (textual_directives.cc:464-476,
+      543-559) where `defaultYear` stays as it was (`priceDirective`) -/
+  yearUnsure : Bool := false
+  /-- set where an input date format is given, by `--input-date-format`
+      or an in-file line of it: C++ then tries that format before its
+      own readers of a date without a time, which no longer read `.` and
+      `-` as `/` (times.cc:229-243, 319-327, 2499-2502), while
+      `parse_datetime`, which reads a date with a time, still does
+      (times.cc:429-432). `dfmt` does not record this: it keeps the
+      order of the fields alone, and nothing for a format that names no
+      field (`priceDay`) -/
+  inputDateFormat : Bool := false
   inComment : Bool := false
 
 private def err {α} (line : Nat) (msg : String) : Except String α :=
@@ -2245,10 +2336,12 @@ private structure PoolResult where
       when the swap of issue #1130 applies, that is when the top
       posting's commodity is COMMODITY_PRIMARY and the other is not
       (xact.cc:425-431), which depends on the price directives and the
-      exchanges that precede the transaction, a history that the oracle
-      does not record. Balancing does not read it, as the docstring of
-      `impliedExchange` records; `verifyExtended` weighs the generated
-      postings under it as under the orientations of `candidates`. -/
+      exchanges that precede the transaction, a history that balancing
+      does not read (`St.primary` records the commodities that price
+      directives mark, for valuation alone). Balancing does not read
+      this candidate either, as the docstring of `impliedExchange`
+      records; `verifyExtended` weighs the generated postings under it
+      as under the orientations of `candidates`. -/
   swapped : List PoolCandidate := []
   /-- the commodities in which C++ can complete the pool with more than
       one posting, through its elided posting or through the bucket's
@@ -2747,13 +2840,14 @@ private def impliedExchange (st : St) (xact pool : List PostSpec)
     orientation continues; one that fails in every orientation is
     rejected with a reason that begins, as the other balance rejections
     of `finalizeXact` do, `unbalanced transaction`; one whose verdict
-    depends on the orientation is refused as out of scope. The oracle
-    records neither which commodities are COMMODITY_PRIMARY (the #1130
-    entry of `impliedExchange`) nor the order in which C++ takes two
-    balance entries when neither is the top posting's key (balance.h:99,
-    xact.cc:422-423), and each of these decides the orientation.
-    Because the first is not recorded, the refusal also falls on a
-    transaction before which no price directive, `C` directive or
+    depends on the orientation is refused as out of scope. The check
+    reads neither which commodities are COMMODITY_PRIMARY (the #1130
+    entry of `impliedExchange`; `St.primary` records only those that
+    price directives mark, for valuation) nor the order in which C++
+    takes two balance entries when neither is the top posting's key
+    (balance.h:99, xact.cc:422-423), and each of these decides the
+    orientation. Because the first is not read, the refusal also falls
+    on a transaction before which no price directive, `C` directive or
     earlier exchange has marked any commodity primary, where C++ takes
     the orientation that the top posting's key decides. Under
     `= /Brokerage/` with `Expenses:Fees 0.01` and `Assets:Cash $-15.00`,
@@ -2761,10 +2855,10 @@ private def impliedExchange (st : St) (xact pool : List PostSpec)
     `Assets:Cash $-1500.00` as the first transaction of a journal, the
     generated `0.1 AAPL {$150.00}` deriving the cost `$15.00`; that
     orientation passes here and the opposite one fails, so the
-    transaction is refused. A record of the commodities that C++ marks
-    primary would narrow the refusal. A pool with no admissible
-    orientation, which C++ rejects in every order while `balancePool`
-    accepts it, is not checked again.
+    transaction is refused. Reading a full record of the commodities
+    that C++ marks primary would narrow the refusal. A pool with no
+    admissible orientation, which C++ rejects in every order while
+    `balancePool` accepts it, is not checked again.
 
     Known departures, each with the direction in which it fails:
     - `verify()` keys every amount and cost as C++ keys it
@@ -4076,6 +4170,381 @@ private def defineDirective (st : St) (restS : String) :
         | .error _ => pure st   -- non-amount define: report-time only
   | _ => pure st
 
+/-- The fields of the date `s` of a price directive, each as its number
+    and its count of digits, where `s` is fields of digits joined by
+    single characters among `/`, `-` and `.`, and `none` otherwise. C++
+    reads `.` and `-` in a date as `/`: `parse_datetime` always, for a
+    date with a time (times.cc:429-432), and the readers of a date
+    without a time unless an input date format is given
+    (times.cc:239-243, `St.inputDateFormat`). -/
+private def priceDateFields (s : String) : Option (List (Int × Nat)) :=
+  (((s.splitOn "/").flatMap (·.splitOn "-")).flatMap (·.splitOn ".")).mapM
+    fun p =>
+      if !p.isEmpty && p.toList.all Char.isDigit then
+        p.toNat?.map fun v => ((v : Int), p.length)
+      else none
+
+/-- Whether the year `y`, the month `m` and the day `d` name a day that
+    C++ can hold: the gregorian dates of boost, which `ptime_from_tm` and
+    `date_from_tm` build (times.cc:154-155, 181-182), span the years 1400
+    to 9999 and refuse a day that the month lacks, so that
+    `P 1399/12/31 EUR $1` and `P 2024/02/30 EUR $1` reject the journal on
+    both C++ binaries. -/
+private def priceDayValid (y m d : Int) : Bool :=
+  let leap := (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
+  let days := if m == 2 then (if leap then 29 else 28)
+    else if m == 4 || m == 6 || m == 9 || m == 11 then 30 else 31
+  1400 ≤ y && y ≤ 9999 && 1 ≤ m && m ≤ 12 && 1 ≤ d && d ≤ days
+
+/-- The seconds into its day of the time `s` of a price directive, read
+    as strptime reads `%H:%M:%S` for `parse_datetime` (times.cc:154-155,
+    2530-2531): an hour, a minute and a second of one or two digits
+    each, after which C++ leaves the rest of the field unread, so that
+    `10:00:00.5` and `12:00:00:00` read as `10:00:00` and `12:00:00` on
+    both C++ binaries. A second of 60, which strptime admits, is the
+    next minute, as `ptime_from_tm` makes it (`10:00:60` reads as
+    `10:01:00`). Any other field is `none`: among them `25:00:00`,
+    `10:00` and `10:00:61`, which both C++ binaries reject, and a second
+    of more than two digits, whose reading depends on the C library. -/
+private def priceTime (s : String) : Option Int := do
+  let num := fun (cs : List Char) =>
+    let ds := cs.takeWhile Char.isDigit
+    if ds.isEmpty || ds.length > 2 then none
+    else (String.ofList ds).toNat?.map fun v => ((v : Int), cs.drop ds.length)
+  let (h, r) ← num s.toList
+  let ':' :: r := r | none
+  let (m, r) ← num r
+  let ':' :: r := r | none
+  let (sec, _) ← num r
+  if h ≤ 23 && m ≤ 59 && sec ≤ 60 then some (h * 3600 + m * 60 + sec)
+  else none
+
+/-- The instant, in seconds from 0000-03-01 (`daysFromCivil`), of a
+    price directive whose date field is `dateS` and whose time field is
+    `timeS`, read as `parse_datetime` reads `DATE TIME`
+    (pool.cc:559-564, times.cc:421-442): the date as `Y/M/D` or, failing
+    that, as `M/D/Y` (times.cc:2530-2531), with a year of four digits
+    and a month and a day of one or two, and the time of `priceTime`
+    (test/regress/1202.test, test/regress/1130.test). Any other date is
+    `none`. -/
+private def priceInstant (dateS timeS : String) : Option Int := do
+  let tod ← priceTime timeS
+  let (y, m, d) ← match ← priceDateFields dateS with
+    | [(y, 4), (m, lm), (d, ld)] | [(m, lm), (d, ld), (y, 4)] =>
+        if lm ≤ 2 && ld ≤ 2 then some (y, m, d) else none
+    | _ => none
+  if priceDayValid y m d then some (daysFromCivil y m d * 86400 + tod)
+  else none
+
+/-- The day, counted as `daysFromCivil` counts it, of the date `dateS` of
+    a price directive without a time, read as `parse_date` reads it,
+    through readers that C++ tries in turn until one reads the date
+    (pool.cc:565-567; times.cc:229-327, 2539-2544), with a year of four
+    digits and a month and a day of one or two: `Y/M/D`
+    (test/baseline/cmd-pricemap.test, test/baseline/opt-historical.test,
+    test/regress/7C44010B.test), `Y/M`, which is the first day of the
+    month (times.cc:2541), and `M/D` in the year of a `Y` or `year`
+    directive (times.cc:175-182, 277-281;
+    test/regress/coverage-wave2-textual.test). Any other date is `none`,
+    and so is every date where an input date format is given
+    (`St.inputDateFormat`), and `M/D` in two more cases. Where no year
+    directive has been read, C++ takes the year of its current time and,
+    for a month after the current one, the year before
+    (times.cc:283-301). Where `St.yearUnsure` is set, C++ takes the year
+    of an `apply year` directive, or in a journal with included files
+    the year that it restores where an included file ends
+    (textual_directives.cc:424-446, 464-476), neither of which
+    `defaultYear` follows. -/
+private def priceDay (st : St) (dateS : String) : Option Int := do
+  guard !st.inputDateFormat
+  match ← priceDateFields dateS with
+  | [(y, 4), (m, lm), (d, ld)] =>
+      if lm ≤ 2 && ld ≤ 2 && priceDayValid y m d then
+        some (daysFromCivil y m d)
+      else none
+  | [(y, 4), (m, lm)] =>
+      if lm ≤ 2 && priceDayValid y m 1 then some (daysFromCivil y m 1)
+      else none
+  | [(m, lm), (d, ld)] =>
+      let y ← st.defaultYear
+      if lm ≤ 2 && ld ≤ 2 && !st.yearUnsure && priceDayValid y m d then
+        some (daysFromCivil y m d)
+      else none
+  | _ => none
+
+/-- Whether C++ skips the character `c` as white space before a symbol
+    or an amount (`peek_next_nonws`, utils.h:644-651, which asks
+    `std::isspace`): a blank, a tab, a line feed, a carriage return, a
+    vertical tab or a form feed. -/
+private def cppSpace (c : Char) : Bool :=
+  c == ' ' || c == '\t' || c == '\n' || c == '\r' || c.toNat == 11 || c.toNat == 12
+
+/-- Whether C++ ends a commodity symbol written without quotes at the
+    character `c` (`invalid_chars`, commodity.cc:331-349): a digit, a
+    blank, a tab, a line feed, a carriage return, DEL or one of
+    `!&()*+,-./:;<=>?@[]^{|}~`. Any other character continues the
+    symbol, a double quote, a backslash and every character beyond
+    ASCII among them. -/
+private def cppSymbolEnds (c : Char) : Bool :=
+  c.isDigit || c.toNat == 127 || " \t\n\r!&()*+,-./:;<=>?@[]^{|}~".toList.contains c
+
+/-- The characters of a commodity symbol written without quotes at the
+    front of `cs`, as `commodity_t::parse_symbol` reads them
+    (commodity.cc:417-426): those before the first at which
+    `cppSymbolEnds`, a backslash standing for the character after it,
+    whatever that is, and `none` for a backslash at the end, at which
+    C++ throws. -/
+private def cppBareSymbol : List Char → Option (List Char)
+  | '\\' :: c :: r => (cppBareSymbol r).map (c :: ·)
+  | ['\\'] => none
+  | c :: r => if cppSymbolEnds c then some [] else (cppBareSymbol r).map (c :: ·)
+  | [] => some []
+
+/-- The characters of a commodity symbol between double quotes, `cs`
+    being the text after the opening quote, as `READ_INTO` reads them
+    for `commodity_t::parse_symbol` (commodity.cc:409-415,
+    utils.h:660-697): those before the closing quote, a backslash
+    standing for the character after it, or for a backspace, a form
+    feed, a line feed, a carriage return, a tab or a vertical tab after
+    it as `b`, `f`, `n`, `r`, `t` or `v`, and `none` where no quote
+    closes the symbol, at which C++ throws. -/
+private def cppQuotedSymbol : List Char → Option (List Char)
+  | '\\' :: c :: r =>
+      let e := match c with
+        | 'b' => Char.ofNat 8 | 'f' => Char.ofNat 12 | 'n' => '\n'
+        | 'r' => '\r' | 't' => '\t' | 'v' => Char.ofNat 11 | c => c
+      (cppQuotedSymbol r).map (e :: ·)
+  | '"' :: _ => some []
+  | c :: r => if c == '\\' then none else (cppQuotedSymbol r).map (c :: ·)
+  | [] => none
+
+/-- The commodity symbol that `commodity_t::parse_symbol` reads from the
+    front of `cs` (commodity.cc:404-436), after white space: the symbol
+    of `cppQuotedSymbol` after a double quote, and otherwise that of
+    `cppBareSymbol`, which is no symbol where it is a reserved word of
+    the expression language (`is_reserved_token`, commodity.cc:359-381):
+    `and`, `div`, `else`, `false`, `if`, `not`, `or` or `true`. `none`
+    stands for a symbol at which C++ throws. -/
+private def cppSymbolOf (cs : List Char) : Option String :=
+  match cs.dropWhile cppSpace with
+  | '"' :: r => (cppQuotedSymbol r).map String.ofList
+  | r => (cppBareSymbol r).map fun s =>
+      let s := String.ofList s
+      if ["and", "div", "else", "false", "if", "not", "or", "true"].contains s then ""
+      else s
+
+/-- The commodity of the price `s` of a price directive as C++ reads it
+    (`amount_t::parse`, amount.cc:1617-1659), empty for a price in no
+    commodity, and `none` where C++ throws in reading the symbol. After
+    white space and a sign, a price that begins with a digit or `.`
+    begins with its number, which `parse_quantity` reads
+    (amount.cc:1550-1580): the digits and the marks `.`, `,` and `'`
+    that follow, less the marks that end them, of which a `.` is read
+    again; the commodity is then what `cppSymbolOf` reads after the
+    number, and none at the end of the text. Any other price begins
+    with its commodity, which `cppSymbolOf` reads. -/
+private def cppPriceComm (s : String) : Option String :=
+  let cs := s.toList.dropWhile cppSpace
+  let cs := match cs with
+    | '-' :: r | '+' :: r => r.dropWhile cppSpace
+    | r => r
+  match cs with
+  | c :: _ =>
+      if c.isDigit || c == '.' then
+        let tok := cs.takeWhile fun c => c.isDigit || c == '.' || c == ',' || c == '\''
+        let num := (tok.reverse.dropWhile fun c => !c.isDigit).reverse
+        let r := cs.drop num.length
+        let r := if !num.isEmpty && r.head? == some '.' then r.drop 1 else r
+        if r.isEmpty then some "" else cppSymbolOf r
+      else cppSymbolOf cs
+  | [] => some ""
+
+/-- The state `st` once the price directive `P DATE [TIME] SYMBOL PRICE`,
+    whose text after `P` is `rest`, has written its point to the price
+    log, the directive read as `parse_price_directive` reads it
+    (pool.cc:548-652), or once an issue stands in place of that point.
+    `handleDirective` passes the text after a `P` that the first field
+    follows directly, as in `P2024/01/02 EUR $1.10`, as well.
+
+    - A field ends at a space or a tab (`next_element`,
+      utils.h:623-640). When the second field begins with a digit it is
+      a time, read with the date by `priceInstant` (pool.cc:559-564).
+      Otherwise, when the first field begins with a digit, it is a date,
+      read at 00:00 by `priceDay` (pool.cc:565-567).
+    - When neither begins with a digit the directive has no date: its
+      first field is the symbol, and C++ records the price at its current
+      time (pool.cc:568-572; `CURRENT_TIME`, times.h:127-128), which is
+      the instant of `--now` where one is given, and otherwise the instant
+      at which the run began, which C++ fixes before it reads any file
+      (global.cc:76), so that a `Y`, `year` or `apply year` directive
+      does not move it (textual_directives.cc:561-567). The point is
+      recorded here at the instant of the Driver's `--now`, and the issue
+      `undated-price` stands in its place without that `--now` and after
+      an in-file `--now` line (`St.nowInFile`).
+    - The symbol of a dated directive is the next field, or the text
+      between double quotes, after which C++ skips one character
+      (`commodity_t::parse_symbol`, commodity.cc:438-455), so that the
+      price of `"AAPL"$7` is 7 with no commodity. An alias of a
+      commodity names the commodity that it denotes, on either side
+      (pool.cc:121-127, 150-173).
+    - A price that begins with `(` is an expression, which C++ evaluates
+      (pool.cc:589-615, test/regress/1101.test) and which is not
+      evaluated here: the issue `price-expr` stands in place of its
+      point, and the primary commodities stay as they were, although C++
+      marks the commodity of a result in one commodity primary
+      (pool.cc:615, 646).
+    - Any other price is an amount, read in the journal's style as
+      `--decimal-comma` and the styles learned so far read an amount, with
+      no `define`d name read as its value, since C++ reads a name there as
+      a commodity and rejects `P 2024/01/01 EUR x` after `define x=5`
+      (amount.cc:1665). Its commodity must be the one that C++ reads
+      (`cppPriceComm`). C++ ends a symbol written without quotes at
+      characters that `parseAmount` keeps in it, reads a backslash in a
+      symbol as an escape and a reserved word as no symbol
+      (commodity.cc:331-349, 359-381, 404-436), and reads no symbol
+      after a number that a `,` begins or ends (amount.cc:1550-1580,
+      1617-1659), so that it reads `P 2024/01/01 EUR 5 A!B` as a price
+      of 5 A, `P 2024/01/01 EUR 5 and` and `P 2024/01/01 EUR 5, USD` as
+      prices of 5 in no commodity, and `P 2024/01/01 EUR 5 A\ B` as a
+      price in the commodity `A B`, where `parseAmount` reads the
+      commodities `A!B`, `and`, `USD` and `A\`. The read itself teaches
+      the commodity of the price neither a style nor a precision
+      (PARSE_NO_MIGRATE, pool.cc:617, amount.cc:1832-1835); the
+      tentative precision that C++ grants afterwards (pool.cc:628-634)
+      is the rule of the `P` arm of `handleDirective`. C++ reduces the
+      price through the commodity equivalences (amount.cc:1905-1906), as
+      `canonAmt` does but for the departure below, so that
+      `P 2024/01/01 BAR 1.5h` is a price of 5400 s. Text after the price
+      is ignored, so that `P 2024/01/01 EUR $1.10 ; note` is a price of
+      $1.10, except text that begins with `{`, `[` or `(`, which C++
+      reads as an annotation of the commodity of the price
+      (amount.cc:1636-1657, annotate.cc:147-271) and which the table does
+      not model. A price of zero is a point (test/regress/1085.test).
+    - C++ rejects a price in the commodity that it prices
+      (pool.cc:639-642, test/regress/1940.test), so that the graph holds
+      no edge from a commodity to itself (history.cc:353), and such a
+      directive records nothing here.
+    - The commodity of the price becomes primary (pool.cc:646,
+      commodity.cc:72-78) where the point is recorded and where the issue
+      `undated-price` stands in its place.
+
+    Where a directive is not read as C++ reads it, the issue
+    `unread-price` stands in place of its point: a date or a time that
+    `priceDay` or `priceInstant` does not read, a symbol that is missing
+    or whose quote is not closed, and a price that `parseAmount` does not
+    read, that carries an annotation or whose commodity C++ reads
+    otherwise. C++ rejects the journal at most such directives
+    (pool.cc:551-552, 561-562; textual_directives.cc:195-200), and the
+    journal is read on here as before the table was kept (fail-open), so
+    that the issue changes no comparison; C++ reads the others, as it
+    reads `P 01/15 EUR $1.10` under no year directive and
+    `P 2024/01/01 EUR 5 A!B`, and there the issue marks the point that
+    the table lacks.
+    Three departures are known, and in each the table holds a point that
+    C++ does not record, or lacks one that it does, with no issue. A `C`
+    directive records the price of its larger unit at 1970-01-01 00:00,
+    which the table does not hold, and marks both of its units primary,
+    which `Result.primary` does not record (textual_directives.cc:174-191,
+    amount.cc:1983-1985). Where it declares a one-to-one equivalence, C++
+    reduces a price to its right side while `canonAmt` names the side
+    that the rule of the `C` arm of `handleDirective` chooses: beside
+    `C 1 A = 1 B`, `P 2024/01/01 X 5 A` is a price of 5 B in C++ and of
+    5 A here. `Result.equivs` names such directives.
+    When an `alias` subdirective gives a commodity a name that a posting,
+    a price or another `alias` has already given to a commodity of its
+    own, C++ retires that commodity and gives its vertex of the price
+    graph, with the prices recorded on it, to the commodity that the
+    alias names, which no longer reads the vertex that it held before or
+    any price recorded there (pool.cc:150-173, history.cc:336-349; the
+    comment at history.cc:347 that this vertex had no edges does not
+    hold where a price was recorded on it). The amounts read before the
+    alias keep the retired commodity, which reads the vertex that the two
+    now share. The table keeps each point under the commodities that its
+    directive named, and so departs in two directions. It lacks, for each
+    of the two, the points that C++ reads for it through the shared
+    vertex and that a directive gave the other: for the commodity that
+    the alias names, those recorded before the alias for the retired one,
+    and for the retired one, those recorded after it, so that `pricedb`
+    can list one price twice where the table holds one point (a missing
+    point). After `P 2018-08-30 $ 68.1451 RUB` and then `commodity ₽`
+    with `alias RUB`, `pricedb` lists that one price both as `$` in `RUB`
+    and as `₽` in `RUB` (test/regress/1678.test), and after a posting of
+    `10 RUB` and the same block it lists a later `P 2024/01/02 RUB $0.01`
+    both for `RUB` and for `₽`. It also keeps the points recorded before
+    the alias for the commodity that the alias names, which C++ no longer
+    reads (a wrong point): after `P 2024/01/01 E $1`,
+    `P 2024/01/01 EUR $3` and then `commodity EUR` with `alias E`,
+    `pricedb` lists `EUR` at `$1` alone and `-X $` values a later posting
+    of `10 EUR` at $10 on both C++ binaries, where the table holds `E` at
+    `$1` and `EUR` at `$3`. The price is read in the style that this
+    reader has learned, and so inherits the departures of the reader's
+    style model that the style rule of `finalizeXact`, the `D` arm of
+    `handleDirective` and `flushPending` record: where C++ has the other
+    style for the commodity of the price, or for the null commodity where
+    the price has none, a number that reads differently in the two
+    styles is a point at a value that C++ does not hold (a wrong point).
+    After `D $1,000.00` and a posting of `$1,5`, `P 2024/01/04 Z $1,500`
+    is a price of $1500 in C++ and of $1.5 here, and after a periodic
+    template with a posting of `1.000,50 EUR`, `P 2024/01/04 Z 1,234 EUR`
+    is a price of 1.234 EUR in C++ and of 1234 EUR here. -/
+private def priceDirective (st : St) (n : Nat) (rest : String) : St := Id.run do
+  let blank := fun (c : Char) => c == ' ' || c == '\t'
+  let field := fun (s : String) => String.ofList (s.toList.takeWhile (!blank ·))
+  let after := fun (s : String) =>
+    String.ofList ((s.toList.dropWhile (!blank ·)).dropWhile blank)
+  let digitFirst := fun (s : String) => s.toList.head?.any Char.isDigit
+  let issue := fun (i c : String) =>
+    { st with priceIssues := (i, c) :: st.priceIssues }
+  let dateS := field rest
+  let rest1 := after rest
+  if rest1.isEmpty then return issue "unread-price" ""
+  -- the instant of the directive, `none` where it is not read or not
+  -- known, whether it has a date, and the text that holds the symbol
+  -- and the price, after the date and the time
+  let timeS := field rest1
+  let (instant, dated, symPrice) :=
+    if digitFirst timeS then (priceInstant dateS timeS, true, after rest1)
+    else if digitFirst dateS then
+      ((priceDay st dateS).map (· * 86400), true, rest1)
+    else
+      (if st.nowInFile then none else st.nowSecs.map (·.floor), false, rest1)
+  let symP : Option (String × String) :=
+    if !dated then some (dateS, symPrice)
+    else
+      match symPrice.toList with
+      | '"' :: cs =>
+          (cs.findIdx? (· == '"')).map fun i =>
+            (String.ofList (cs.take i), String.ofList (cs.drop (i + 2)))
+      | _ => some (field symPrice, after symPrice)
+  let some (sym, priceS) := symP | return issue "unread-price" ""
+  if sym.isEmpty then return issue "unread-price" ""
+  let comm := (st.commAliases.lookup sym).getD sym
+  if dated && instant.isNone then return issue "unread-price" comm
+  let priceT := trimS priceS
+  if priceT.startsWith "(" then return issue "price-expr" comm
+  match parseAmount { st.amt with defines := [] } n priceT with
+  | .error _ => return issue "unread-price" comm
+  | .ok r =>
+      if r.tail.startsWith "{" || r.tail.startsWith "[" || r.tail.startsWith "(" then
+        return issue "unread-price" comm
+      -- the commodity of the price must be the one that C++ reads
+      -- (commodity.cc:331-349, 359-381, 404-436; amount.cc:1550-1580,
+      -- 1617-1659): it reads `5 A!B` as 5 A, and `5 and` and `5, USD` as
+      -- 5 in no commodity
+      if cppPriceComm priceT != some r.amount.comm then
+        return issue "unread-price" comm
+      let price := canonAmt st r.amount
+      if price.comm == comm then return st
+      let primary :=
+        if st.primary.contains price.comm then st.primary
+        else price.comm :: st.primary
+      match instant with
+      | some t =>
+          return { st with priceLog := ⟨t, comm, price⟩ :: st.priceLog, primary }
+      | none =>
+          return { st with
+            priceIssues := ("undated-price", comm) :: st.priceIssues, primary }
+
 private def handleDirective (st : St) (n : Nat) (t : String) :
     Except String St := do
   -- general_directive ends the directive word at the first space or tab
@@ -4142,8 +4611,15 @@ private def handleDirective (st : St) (n : Nat) (t : String) :
               err n s!"apply account '{acct}' has an empty sub-account name"
           | some a => pure { st with applyStack := some a :: st.applyStack }
       else
-        -- apply tag: labels only (uuid tags never come from `apply`)
-        pure { st with applyStack := none :: st.applyStack }
+        -- apply tag: labels only (uuid tags never come from `apply`).
+        -- `apply year` sets the year that C++ gives a date of a month and
+        -- a day (textual_directives.cc:464-476, 543-559), which
+        -- `defaultYear` does not follow, so that such a date of a price
+        -- directive is no longer read (`St.yearUnsure`)
+        let yearUnsure := st.yearUnsure
+          || String.ofList (restS.toList.takeWhile fun c => c != ' ' && c != '\t')
+              == "year"
+        pure { st with applyStack := none :: st.applyStack, yearUnsure }
   | "end" =>
       -- `end`, `end apply ...`, `end account`, `end tag` all close
       -- the innermost apply; a stray `end test`/`end comment` does not
@@ -4193,7 +4669,17 @@ private def handleDirective (st : St) (n : Nat) (t : String) :
       -- (fail-open). After `P 2024/01/01 EUR $1.2345` and
       -- `P 2024/01/01 FOO 1.25 EUR`, EUR is known in C++ and keeps
       -- precision 0, so that a later `(1/3 EUR)` prints no row there
-      -- and 0.33 here (wrong rows)
+      -- and 0.33 here (wrong rows). The rule takes the price to be the
+      -- last field, or the last two, and so finds none where text
+      -- follows it: `P 2024/01/01 EUR $1.2345 ; note` gives an unseen `$`
+      -- four tentative places in C++ and none here, so that a later
+      -- `($1/3)` against an elided posting shows as `$0.3333` in C++ and
+      -- leaves no row here (wrong rows). The point of the directive, or
+      -- the issue that stands in its place, is recorded first, by
+      -- `priceDirective`, whose docstring records where its reading
+      -- departs from that of C++; the two touch different parts of the
+      -- state, so their order is immaterial
+      let st := priceDirective st n restS
       let toks := (restS.splitOn " ").filter (!·.isEmpty)
       match toks.reverse with
       | last :: _ =>
@@ -4323,8 +4809,17 @@ private def handleDirective (st : St) (n : Nat) (t : String) :
             else if c == 'm' then some 'm'
             else if c == 'd' then some 'd'
             else none
-          pure { st with dfmt := if order.isEmpty then none else some order }
+          pure { st with dfmt := if order.isEmpty then none else some order
+                         inputDateFormat := true }
         else if base == "--now" then
+          -- `headerDate` reads a date of three fields alone, where C++
+          -- also reads a time after the date, or a period
+          -- (report.h:1059-1074 at 76b9dc2b2), and where the end of an
+          -- included file or `end apply year` restores the time that came
+          -- before (textual_directives.cc:424-446, 593-595), so that a
+          -- price directive without a date is no longer read
+          -- (`St.nowInFile`)
+          let st := { st with nowInFile := true }
           match headerDate none (trimS val) with
           | some d => pure { st with nowSecs := some ((d * 86400 : Int) : ℚ) }
           | none => pure st
@@ -4332,6 +4827,17 @@ private def handleDirective (st : St) (n : Nat) (t : String) :
           pure st
       else if word == "expr" || word == "eval" then
         pure st          -- evaluate-and-discard
+      else if word.startsWith "P" then
+        -- C++ reads a line that begins with `P` and holds no word
+        -- directive as a price directive, from the first character after
+        -- the `P` that is not a blank (textual.cc:329, 363-364;
+        -- textual_directives.cc:195-200), so that `P2024/01/02 EUR $1.10`
+        -- is a price of EUR on 2024/01/02. Its point is recorded
+        -- (`priceDirective`), but the line is otherwise skipped as an
+        -- unrecognized one, so that the tentative precision of the `P`
+        -- arm is not granted, a known departure with the consequences
+        -- that the `P` arm describes (wrong rows, fail-open)
+        pure { priceDirective st n (trimS (t.drop 1).toString) with errFlag := true }
       else
         -- unrecognized word directive: the C++ reader warns and
         -- skips it (and its indented block) under --permissive
@@ -4456,6 +4962,37 @@ structure Result where
       template, whose result `flushPending` discards, and a transaction
       dropped for its UUID leave the flag as it was. -/
   lotFanout : Bool
+  /-- the dated price table that the price directives record, in the
+      order in which its points were last written (`priceDirective`,
+      `priceTable`); `pricesAt` reads it as of an instant -/
+  prices : List PricePoint
+  /-- the commodities that the price directives mark primary, as far as
+      this reader records them, kept for valuation alone: balancing does
+      not read them (the #1130 entry of `impliedExchange`). The list
+      holds the commodity of the price of each point recorded and of each
+      directive with the issue `undated-price`. It leaves out three kinds
+      that C++ marks where it reads the directive: the commodity of a
+      price expression whose result is in one commodity (pool.cc:615,
+      646), the commodity of the price of a directive with the issue
+      `unread-price`, and the two units of a `C` directive, the smaller
+      through the price that the directive records
+      (textual_directives.cc:185-188, commodity.cc:73-75) and the larger
+      through `parse_conversion`, which gives it the flags of the smaller
+      (textual_directives.cc:191, amount.cc:1983-1985). It is therefore
+      complete for a journal without a `C` directive whose `priceIssues`
+      holds no `price-expr` or `unread-price` entry -/
+  primary : List String
+  /-- the price directives whose point the table does not hold, in the
+      order of the directives, each as an issue and the commodity that it
+      prices, empty where that is not read: `price-expr` for a price
+      that is an expression, `undated-price` for a directive without a
+      date whose instant is not known here, and `unread-price` for a
+      directive that is not read as C++ reads it (`priceDirective`).
+      Apart from the departures that `priceDirective` records, among
+      them a price read in a style other than the one in which C++ reads
+      it, a price directive of a journal that C++ reads either writes to
+      the table the point that C++ records or has an entry here -/
+  priceIssues : List (String × String)
 
 private def flushPending (st : St) : Except String St := do
   match st.pending with
@@ -4917,8 +5454,8 @@ private def tagEqScan (input : String) (spliced : Bool) :
   | none, _ => pure none
 
 /-- Run the engine over (include-spliced) journal text; `spliced` is
-    set when `splice` in Driver.lean spliced a file into it, which only
-    the bounds of `tagEqScan` read. -/
+    set when `splice` in Driver.lean spliced a file into it, which the
+    bounds of `tagEqScan` and `St.yearUnsure` read. -/
 def run (input0 : String) (dcDefault : Bool := false)
     (nowSecs : Option ℚ := none) (recAliases : Bool := false)
     (dfmtS : Option String := none) (spliced : Bool := false) :
@@ -4936,7 +5473,9 @@ def run (input0 : String) (dcDefault : Bool := false)
   -- the bounds of `tag("K") == "V"` (regress/842), before any line
   let tagEqRule ← tagEqScan input spliced
   let mut st : St := { amt := { dcDefault }, nowSecs, dfmt
-                       recursiveAliases := recAliases }
+                       recursiveAliases := recAliases
+                       yearUnsure := spliced
+                       inputDateFormat := dfmtS.isSome }
   let mut n : Nat := 0
   for line0 in input.splitOn "\n" do
     n := n + 1
@@ -5271,7 +5810,8 @@ def run (input0 : String) (dcDefault : Bool := false)
       st := { st with clockIn := [] }
   | none => pure ()
   pure ⟨st.gens.reverse, st.rewrites, st.equivs, st.precisions,
-        st.amt.styles, st.flowStats, st.signStats, st.lotFanout⟩
+        st.amt.styles, st.flowStats, st.signStats, st.lotFanout,
+        priceTable st.priceLog, st.primary.reverse, st.priceIssues.reverse⟩
 
 /-- Apply report-time account rewrites (`account-rewrite`,
     `capture`) to a name. -/
