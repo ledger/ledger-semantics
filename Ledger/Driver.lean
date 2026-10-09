@@ -133,9 +133,19 @@ def displayRow (res : Journal.Result) (stat : Nat × Nat) (a : Account)
   if tot == 1 && inf == 1 && dispComm == a.commodity
       && a.commodity != ""
       && (prec == 0 || roundAt prec v == 0) then
+    -- at the widened precision C++ tests the exact value
+    -- (`amount_t::is_zero`, src/amount.cc:1388-1408 at 76b9dc2b2)
     if v = 0 then none
     else some s!"{a.commodity}|{ratToCanonical v}|{a.name}"
   else
+  -- a total that shows as zero leaves no row: C++ displays an account
+  -- only when its display total is nonzero
+  -- (`format_accounts::mark_accounts`, src/output.cc:325 at
+  -- 76b9dc2b2), and prints an amount of a balance only when it is
+  -- nonzero (`print_amount_from_balance`, src/balance.cc:561), each
+  -- time by `amount_t::is_zero`, which reads the amount as it prints
+  -- at its display precision, the rounding `cppRoundAt` reproduces
+  -- (src/amount.cc:1374-1430)
   if dispQ = 0 then none
   else some s!"{dispComm}|{ratToCanonical dispQ}|{a.name}"
 
@@ -216,6 +226,15 @@ def balancesOf (decimalComma : Bool) (nowSecs : Option ℚ)
   -- per-account oracle totals, then report-time rewrites (merging)
   let totals := accts.filterMap fun a =>
     let v := netFlow (flowsFor arr) term a
+    -- a total of exactly zero leaves no row, dropped here before the
+    -- merge as `displayRow` would drop it after: C++ forms the total of
+    -- an account by addition alone (`post_t::add_to_value` and
+    -- `account_t::total`, src/post.cc:977-1014 and
+    -- src/account.cc:884-900 at 76b9dc2b2), and an addition to a
+    -- balance ignores an amount of exactly zero and never erases an
+    -- entry (`balance_t::operator+=`, src/balance.cc:118-133), so a
+    -- commodity whose amounts net to exactly zero has no entry or an
+    -- entry of value zero, and neither prints a row (`displayRow`)
     if v = 0 then none
     else some (Account.mk (Journal.applyRewrites res.rewrites a.name) a.commodity, v)
   let merged : List (Account × ℚ) := totals.foldl (init := []) fun acc (a, v) =>
