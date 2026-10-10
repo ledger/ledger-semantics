@@ -108,10 +108,11 @@ outputs (the `SemanticBisimulation` ctest is the standing check):
   when one is declared (regress/1607); no balance check.
 - **UUID dedup**: a transaction in whose body `uuidOf` finds a UUID
   already seen is dropped whole but for the prices that its costs
-  record, since C++ finalizes it before it drops it (C++ `journal.cc`
-  semantics); it is the one documented non-flow-inert label. C++ reads
-  the transaction's own `UUID` tag instead, a departure in the rows that
-  the docstring of `uuidOf` records.
+  record, written or computed by an implicit exchange, since C++
+  finalizes it before it drops it (C++ `journal.cc` semantics); it is
+  the one documented non-flow-inert label. C++ reads the transaction's
+  own `UUID` tag instead, a departure in the rows that the docstring of
+  `uuidOf` records.
 - **Periodic templates** `~`: finalized as a transaction without a
   date against the state before them, booking no lot gain and with no
   UUID de-duplication. As C++ `parse_posts` reads the postings, a line
@@ -220,6 +221,13 @@ structure PostSpec where
       the second case of its docstring. The two departures recorded at
       `fixated` apply to this flag as well. -/
   annotated : Bool := false
+  /-- the amount's own annotation carries a date, a note or a value
+      expression, `[date]`, `(note)` or `((expr))`, under the same
+      conditions as `annotated`. C++ keys an amount by these as well as
+      by its lot price (annotate.h:120-125), and `lotKeyOf` does not, the
+      `[date]` departure of `impliedExchange`; `exchangePoints` reads it
+      for the postings that Phase 3 converts -/
+  annotDetails : Bool := false
   /-- the amount's own lot price is fixated, `{=P}` or `{{=T}}`
       (ANNOTATION_PRICE_FIXATED, annotate.cc:169), under the same
       conditions as `annotated`. Unlike `LotPrice.fixated` in
@@ -234,7 +242,8 @@ structure PostSpec where
       target's lot or the account's single lot into the amount it
       computes (textual_xacts.cc:843-862). Each can fail either way;
       the docstring of `impliedExchange` gives a journal shape for each
-      direction. -/
+      direction, and `exchangePoints` sets an issue in place of the
+      prices that either can decide. -/
   fixated : Bool := false
   /-- the precision of an explicit cost amount: the cost literal's
       decimals, plus the amount's precision for a per-unit `@`
@@ -323,18 +332,23 @@ structure PostSpec where
   costLotComm : Option String := none
   /-- the precision that C++ gives the amount: its literal's decimals,
       or for an amount expression the approximation of
-      `parseAmountField` (`costPrice`) -/
+      `parseAmountField` (`costPrice`, `exchangePoints`, `cppSum`) -/
   amtPrec : Nat := 0
   /-- the amount as written, before `finalizeXact` reduces it through
       the commodity equivalences, its commodity named through the
       commodity aliases: C++ parses a posting amount unreduced
-      (textual_xacts.cc:583) and exchanges it so (`costPrice`) -/
+      (textual_xacts.cc:583) and exchanges it so (`costPrice`,
+      `exchangePoints`). It is `none` for a posting written without an
+      amount, so that an amount beside it is one that a balance
+      assignment computes (`cppSum`, `exchangePoints`) -/
   rawAmount : Option Amount := none
   /-- the amount has a commodity and no annotation of its own, and an
       `apply fixed` or `apply rate` directive in force names that
       commodity (`St.fixatedComms`), so that C++ annotates the amount
       with the fixated price of the directive (textual_xacts.cc:626-638).
-      `costPrice` reads it alone: the engine keeps no such annotation, a
+      `costPrice` reads it, and so does `exchangePoints`, for C++'s top
+      posting and for the issue that stands in place of the prices of an
+      implicit exchange: the engine keeps no such annotation, a
       departure that the docstring of `impliedExchange` records -/
   rateFixed : Bool := false
   /-- the date that a note of the posting gives it, the last of its note
@@ -575,21 +589,25 @@ structure St where
       missed -/
   lotFanout : Bool := false
   /-- every point that the price directives and the costs of the
-      transactions read so far write, the most recent first, which
-      `priceTable` resolves into the dated price table when the journal
-      has been read (`priceDirective`, `costPrice`, `recordCostPoints`) -/
+      transactions read so far write, written or computed by an implicit
+      exchange, the most recent first, which `priceTable` resolves into
+      the dated price table when the journal has been read
+      (`priceDirective`, `costPrice`, `exchangePoints`,
+      `recordCostPoints`) -/
   priceLog : List PricePoint := []
   /-- the commodities that the price directives and the costs read so
-      far mark primary, as far as this reader records them
-      (`priceDirective`, `recordCostPoints`), kept for valuation:
+      far mark primary, written or computed by an implicit exchange, as
+      far as this reader records them (`priceDirective`,
+      `recordCostPoints`), kept for valuation and for the sides of the
+      prices that an implicit exchange records (`exchangePoints`):
       balancing does not read them. The list is partial; `Result.primary`
       names what it leaves out -/
   primary : List String := []
   /-- the price directives and the costs whose point the table does not
       hold, or holds at a date that a note or an `apply tag` gives, each
       as an issue and the commodity that it prices, empty where that is
-      not read (`priceDirective`, `recordCostPoints`, `finalizeXact`), the
-      most recent first -/
+      not read (`priceDirective`, `recordCostPoints`, `exchangePoints`,
+      `finalizeXact`), the most recent first -/
   priceIssues : List (String × String) := []
   /-- set by an in-file `--now` line, after which the current time of
       C++ is not known here: the option takes a time with its date
@@ -1123,6 +1141,8 @@ private structure AnnotTail where
   teach : List (String × Nat)
   costDecs : Nat
   annotated : Bool
+  /-- `PostSpec.annotDetails` -/
+  annotDetails : Bool
   fixated : Bool
   ownLot : Bool
   /-- the cost is a per-unit `@`, not a total `@@` -/
@@ -1146,7 +1166,8 @@ private partial def annotLoop (ctx : AmtCtx) (line : Nat) (a : Amount)
     (annotated : Bool := false) (fixated : Bool := false)
     (ownLot : Bool := false) (perUnit : Bool := false)
     (lotLit : Option (Nat × Bool) := none) (costAnnotated : Bool := false)
-    (costLot : Option String := none) (costVirtual : Bool := false) :
+    (costLot : Option String := none) (costVirtual : Bool := false)
+    (annotDetails : Bool := false) :
     Except String AnnotTail := do
   -- `annotated`, `fixated` and `ownLot`: an annotation met before any
   -- cost or assertion belongs to the posting's own amount; after a
@@ -1155,13 +1176,14 @@ private partial def annotLoop (ctx : AmtCtx) (line : Nat) (a : Amount)
   -- the lot kept was met while `own` held. `costAnnotated`: one met
   -- after the cost and before any assertion, on a cost with a
   -- commodity, since C++ keeps no annotation on an amount without one
-  -- (amount.cc:1908)
+  -- (amount.cc:1908). `annotDetails`: a date, a note or a value
+  -- expression met while `own` holds
   let own := !afterCost && !afterAssert
   let onCost := afterCost && !afterAssert && cost.any (·.comm != "")
   let t := trimS tail
   if t.isEmpty || t == "." then
-    pure { lot, cost, teach, costDecs, annotated, fixated, ownLot, perUnit,
-           lotLit, costAnnotated, costLot, costVirtual }
+    pure { lot, cost, teach, costDecs, annotated, annotDetails, fixated, ownLot,
+           perUnit, lotLit, costAnnotated, costLot, costVirtual }
   else if t.startsWith "{" then
     -- `{{total}}` and `{per-unit}` lot prices, possibly `{=fixated}`;
     -- lots parse with PARSE_NO_MIGRATE — no precision teaching
@@ -1204,6 +1226,7 @@ private partial def annotLoop (ctx : AmtCtx) (line : Nat) (a : Amount)
       (ownLot := if own then lot'.isSome else ownLot) (perUnit := perUnit)
       (lotLit := lotLit') (costAnnotated := costAnnotated || onCost)
       (costLot := costLot') (costVirtual := costVirtual)
+      (annotDetails := annotDetails)
   else if t.startsWith "[" then
     match takeBalanced '[' ']' t.toList with
     | some (_, rest) =>
@@ -1212,6 +1235,7 @@ private partial def annotLoop (ctx : AmtCtx) (line : Nat) (a : Amount)
           (fixated := fixated) (ownLot := ownLot) (perUnit := perUnit)
           (lotLit := lotLit) (costAnnotated := costAnnotated || onCost)
           (costLot := costLot) (costVirtual := costVirtual)
+          (annotDetails := annotDetails || own)
     | none => err line s!"unclosed lot date in '{t}'"
   else if t.startsWith "(" && !(t.startsWith "(@") then
     match takeBalanced '(' ')' t.toList with
@@ -1221,6 +1245,7 @@ private partial def annotLoop (ctx : AmtCtx) (line : Nat) (a : Amount)
           (fixated := fixated) (ownLot := ownLot) (perUnit := perUnit)
           (lotLit := lotLit) (costAnnotated := costAnnotated || onCost)
           (costLot := costLot) (costVirtual := costVirtual)
+          (annotDetails := annotDetails || own)
     | none => err line s!"unclosed lot note in '{t}'"
   else if t.startsWith "(@@)" || t.startsWith "@@" then
     let off := if t.startsWith "(@@)" then 4 else 2
@@ -1236,6 +1261,7 @@ private partial def annotLoop (ctx : AmtCtx) (line : Nat) (a : Amount)
       (annotated := annotated) (fixated := fixated) (ownLot := ownLot)
       (perUnit := false) (lotLit := lotLit) (costAnnotated := costAnnotated)
       (costLot := costLot) (costVirtual := t.startsWith "(@@)")
+      (annotDetails := annotDetails)
   else if t.startsWith "(@)" || t.startsWith "@" then
     -- per-unit costs round at the cost literal's own precision,
     -- posting by posting (regress/1125); `@ =` fixates (1794). A cost
@@ -1253,6 +1279,7 @@ private partial def annotLoop (ctx : AmtCtx) (line : Nat) (a : Amount)
       (annotated := annotated) (fixated := fixated) (ownLot := ownLot)
       (perUnit := true) (lotLit := lotLit) (costAnnotated := costAnnotated)
       (costLot := costLot) (costVirtual := t.startsWith "(@)")
+      (annotDetails := annotDetails)
   else if t.startsWith "=" then
     -- assertion: the C++ side checks it; positive tests pass it, but
     -- the literal still teaches display precision (1699). C++ parses
@@ -1280,7 +1307,7 @@ private partial def annotLoop (ctx : AmtCtx) (line : Nat) (a : Amount)
       (afterAssert := true) (annotated := annotated) (fixated := fixated)
       (ownLot := ownLot) (perUnit := perUnit) (lotLit := lotLit)
       (costAnnotated := costAnnotated) (costLot := costLot)
-      (costVirtual := costVirtual)
+      (costVirtual := costVirtual) (annotDetails := annotDetails)
   else
     err line s!"trailing junk after amount '{t}'"
 
@@ -1309,6 +1336,8 @@ private structure AmountField where
       it reaches only the flows that `flushPending` discards. -/
   gainVal : Option Amount := none
   annotated : Bool := false
+  /-- `PostSpec.annotDetails` -/
+  annotDetails : Bool := false
   fixated : Bool := false
   /-- `PostSpec.costPrec` -/
   costPrec : Nat := 0
@@ -1375,8 +1404,8 @@ private def parseAmountField (ctx : AmtCtx) (line : Nat) (field : String)
     -- note, which C++ reports as more than one (annotate.cc:157, 193,
     -- 249). annotLoop reads the first as it reads an annotation on a
     -- plain amount, and of two lot prices it keeps the first.
-    let { lot, cost, teach, costDecs, annotated, fixated, ownLot, perUnit,
-          lotLit, costAnnotated, costLot, costVirtual } ←
+    let { lot, cost, teach, costDecs, annotated, annotDetails, fixated, ownLot,
+          perUnit, lotLit, costAnnotated, costLot, costVirtual } ←
       annotLoop ctx line a r.tail preLot none (annotated := preLot.isSome)
         (fixated := preLot.any (·.2)) (ownLot := preLot.isSome)
     -- the precision of the cost amount, for the widened zero test of
@@ -1502,6 +1531,7 @@ private def parseAmountField (ctx : AmtCtx) (line : Nat) (field : String)
            learned := r.learned
            decimals := r.decimals, isExpr := field.startsWith "(", teach
            costDecs, gainVal, annotated := hasComm && annotated
+           annotDetails := hasComm && annotDetails
            fixated := hasComm && fixated, costPrec, costAnnotated
            rawCost := cost, rawCostPrec, costVirtual, costLotComm := costLot
            amtPrec }
@@ -1536,7 +1566,8 @@ private def parsePosting (st : St) (line : Nat) (raw : String)
                      lotUnit := af.lotUnit, lotTotal := af.lotTotal
                      assignTarget := af.assignTarget, amtDecs := af.decimals
                      costDecs := af.costDecs, gainVal := af.gainVal
-                     annotated := af.annotated, fixated := af.fixated
+                     annotated := af.annotated, annotDetails := af.annotDetails
+                     fixated := af.fixated
                      costPrec := af.costPrec, costAnnotated := af.costAnnotated
                      rawCost := af.rawCost, rawCostPrec := af.rawCostPrec
                      costVirtual := af.costVirtual
@@ -1876,7 +1907,14 @@ private def xactHeaderParts (header : String) : String × Option String :=
     as an expression is the approximation that the docstring of
     `zeroTestPrec` records, and so is the rounding of such a cost on an
     amount that is zero: `0 AAPL @@ ($100/3)` records $33.333333 in C++
-    and $33 here.
+    and $33 here. C++ multiplies and divides by an amount in `%` as by a
+    hundredth of its quantity (amount.cc:727-733, 799-808), arithmetic
+    that this reader does not model, so that where Phase 6 divides a
+    total cost by such an amount (pool.cc:437), the price that C++
+    records is the quotient here times a hundred, rounded at the same
+    places: `10% @@ $20.00` records $200 in C++, through which a later
+    `1%` values at $2 on both C++ binaries, since a valuation multiplies
+    the price by the amount (amount.cc:1324-1325), and $2 here.
 
     More widely, the price is rounded, and the zero test of its amount
     reads, at display precisions that this reader learns, and so the
@@ -1955,8 +1993,9 @@ private def costPrice (st : St) (p : PostSpec) : Option (String × Amount) := do
 /-- The state `st` once the prices `points` that Phase 6 records for the
     costs of a transaction whose header line is `header` are written to
     the price log, each as the commodity that it prices, its price
-    (`costPrice`) and the date that a note of its posting or of its
-    transaction, or an `apply tag` in force, gives its posting
+    (`costPrice` for a written cost, `exchangePoints` for one that an
+    implicit exchange computes) and the date that a note of its posting
+    or of its transaction, or an `apply tag` in force, gives its posting
     (`noteDateOf`). A point is dated 00:00 of that date, with the issue
     `posting-date`, which stands alone where `priceDay` does not read
     that date, or else of the transaction's date as `priceDay` reads it
@@ -2654,32 +2693,56 @@ private def lotKeyOf (p : PostSpec) (a : Amount) : LotKey :=
     `finalize` (xact.cc:333, through `add_or_set_value`,
     value.h:1025-1031): null before the first amount, a single amount
     while every amount has one key, and a balance of keyed entries from
-    the first amount of another key on. -/
+    the first amount of another key on. The single amount and each entry
+    carry the precision that C++ keeps with them, `none` where this
+    reader does not know it (`cppSum`). -/
 private inductive CppSum where
   | null
-  | amount (k : LotKey) (q : ℚ)
-  | balance (entries : List (LotKey × ℚ))
+  | amount (k : LotKey) (q : ℚ) (d : Option Nat)
+  | balance (entries : List (LotKey × ℚ × Option Nat))
 
-/-- Add one keyed amount as C++ does. An amount absorbs an amount of
-    its own key (value.cc:600-607); an amount of another key turns it
-    into a balance, which keeps the old entry only when it is not
-    exactly zero (value.cc:1548, balance.h:128-134). A balance ignores
-    an exactly zero amount and otherwise accumulates per key, and it
-    never erases an entry that addition brings to zero
+/-- Add one keyed amount of precision `d` as C++ does. An amount
+    absorbs an amount of its own key (value.cc:600-607) and takes its
+    precision where that is larger, even from an amount that is exactly
+    zero (amount.cc:630-632); an amount of another key turns it into a
+    balance, which keeps the old entry, with its precision, only when it
+    is not exactly zero (value.cc:1548, balance.h:128-134). A balance
+    ignores an exactly zero amount and otherwise accumulates per key,
+    raising the precision of the entry to that of each amount added into
+    it, and it never erases an entry that addition brings to zero
     (balance.cc:118-133); only subtraction erases one
-    (balance.cc:165-170). -/
-private def CppSum.add (s : CppSum) (k : LotKey) (q : ℚ) : CppSum :=
-  let addEntry := fun (es : List (LotKey × ℚ)) =>
+    (balance.cc:165-170). Where the precision of either amount is not
+    known, that of the sum is not known either. -/
+private def CppSum.add (s : CppSum) (k : LotKey) (q : ℚ) (d : Option Nat) :
+    CppSum :=
+  let maxP := fun (a b : Option Nat) => do pure (max (← a) (← b))
+  let addEntry := fun (es : List (LotKey × ℚ × Option Nat)) =>
     if q == 0 then es
     else match es.lookup k with
-      | some _ => es.map fun (k', v) => if k' == k then (k', v + q) else (k', v)
-      | none => es ++ [(k, q)]
+      | some _ =>
+          es.map fun (k', v, d') =>
+            if k' == k then (k', v + q, maxP d' d) else (k', v, d')
+      | none => es ++ [(k, q, d)]
   match s with
-  | .null => .amount k q
-  | .amount k' v =>
-      if k' == k then .amount k (v + q)
-      else .balance (addEntry (if v == 0 then [] else [(k', v)]))
+  | .null => .amount k q d
+  | .amount k' v d' =>
+      if k' == k then .amount k (v + q) (maxP d' d)
+      else .balance (addEntry (if v == 0 then [] else [(k', v, d')]))
   | .balance es => .balance (addEntry es)
+
+/-- The real balance that C++ accumulates over the postings `pool` in
+    their order (`CppSum`), each amount keyed by `lotKeyOf` and taken at
+    the precision that C++ gives it (`PostSpec.amtPrec`), or at none
+    where a balance assignment computes it, whose precision this reader
+    does not keep (`PostSpec.rawAmount`). `impliedExchange` reads its
+    entries, and `exchangePoints` the precisions of the two entries that
+    Phase 3 converts. -/
+private def cppSum (pool : List PostSpec) : CppSum :=
+  pool.foldl (init := CppSum.null) fun s p =>
+    match p.amount with
+    | some a =>
+        s.add (lotKeyOf p a) a.q (if p.rawAmount.isSome then some p.amtPrec else none)
+    | none => s
 
 /-- One orientation in which C++'s Phase 3 can take a balancing pool
     and accept it: the conversion it makes, if any, and what it leaves
@@ -2823,10 +2886,12 @@ private structure PoolResult where
       (xact.cc:425-431), which depends on the price directives and the
       exchanges that precede the transaction, a history that balancing
       does not read (`St.primary` records the commodities that price
-      directives and written costs mark, for valuation alone). Balancing
-      does not read this candidate either, as the docstring of
-      `impliedExchange` records; `verifyExtended` weighs the generated
-      postings under it as under the orientations of `candidates`. -/
+      directives, written costs and implicit exchanges mark, for
+      valuation and for the sides of the prices that an implicit exchange
+      records, `exchangePoints`). Balancing does not read this candidate
+      either, as the docstring of `impliedExchange` records;
+      `verifyExtended` weighs the generated postings under it as under
+      the orientations of `candidates`. -/
   swapped : List PoolCandidate := []
   /-- the commodities in which C++ can complete the pool with more than
       one posting, through its elided posting or through the bucket's
@@ -3006,10 +3071,12 @@ private structure PoolResult where
 
     Known departures, each with the direction in which it fails:
     - the swap of issue #1130, which makes a COMMODITY_PRIMARY side the
-      cost side `y` (xact.cc:425-431), is not modelled, because it
-      depends on the history of price directives and earlier
-      exchanges. The verdict here is that of the orientation that the
-      top posting's key decides, and `verifyExtended` refuses a
+      cost side `y` (xact.cc:425-431), is not modelled for the verdict,
+      because it depends on the history of price directives and earlier
+      exchanges; `exchangePoints` applies it to the sides of the prices
+      that the conversion records, through `St.primary`, which follows
+      that history in part. The verdict here is that of the orientation
+      that the top posting's key decides, and `verifyExtended` refuses a
       transaction whose verdict after an automated transaction depends
       on the orientation. The swap changes which side is doubled and
       whether a lot gain applies, and so the balancing verdict can fail
@@ -3131,10 +3198,7 @@ private structure PoolResult where
     further departure, which the comment beside `costVal` records. -/
 private def impliedExchange (st : St) (xact pool : List PostSpec)
     (periodic : Bool := false) : Exchange :=
-  let bal := pool.foldl (init := CppSum.null) fun s p =>
-    match p.amount with
-    | some a => s.add (lotKeyOf p a) a.q
-    | none => s
+  let bal := cppSum pool
   let mustBal := xact.filter fun p => p.kind != .virtualUnbal && p.amount.isSome
   let top? := (mustBal.filter (·.annotated)).getLast? <|> mustBal.head?
   -- Phase 8 tests every entry at its display precision (xact.cc:898):
@@ -3235,7 +3299,9 @@ private def impliedExchange (st : St) (xact pool : List PostSpec)
     | .declines _ => .declines
   if xact.any (·.costVal.isSome) then .declines
   else match bal, top? with
-    | .balance [x, y], some top =>
+    | .balance [(kx, qx, _), (ky, qy, _)], some top =>
+        let x : LotKey × ℚ := (kx, qx)
+        let y : LotKey × ℚ := (ky, qy)
         if x.2 == 0 || y.2 == 0 || top.fixated then .declines
         else
           let tk := top.amount.map (lotKeyOf top)
@@ -3254,6 +3320,360 @@ private def impliedExchange (st : St) (xact pool : List PostSpec)
             | .declines _, .declines _ => .declines
             | _, _ => .unordered both
     | _, _ => .declines
+
+/-- The sides on which C++ prices the costs that the implicit exchange
+    of Phase 3 computes (`exchangePoints`). -/
+private inductive ExchangeSides where
+  /-- C++ records no price: no candidate converts in the orientation
+      that the swap of issue #1130 fixes, or the two entries are of one
+      commodity -/
+  | noPrice
+  /-- the postings of the key of `x` take costs at the rate of `y` -/
+  | sides (x y : LotKey × ℚ)
+  /-- the unspecified order of the two entries decides
+      (xact.cc:422-423, balance.h:99) -/
+  | byOrder
+
+/-- The prices that Phase 6 of `finalize` records for the costs that the
+    implicit exchange of Phase 3 computes in a transaction with a date,
+    each as the commodity that it prices, its price per unit and the
+    date that a note gives its posting, which `recordCostPoints` writes
+    as it writes the prices of written costs, together with the issues
+    that stand in place of the points that this reader does not compute.
+    A candidate of `cands` that converts carries the two entries of the
+    real balance, `x` first. For a transaction that is kept, `cands` and
+    `orderDependent` are what `balancePool` made of the real pool
+    (`PoolResult.candidates`, `PoolResult.orderDependent`), and `xact` is
+    every posting of the transaction with the amounts that its balance
+    assignments compute; for one dropped for a UUID seen before, they
+    are taken from the verdict of `impliedExchange`, and `xact` holds the
+    postings as written, since C++ skips the balance assignments of such
+    a transaction (`finalizeXact`). `xactNoteDate` is the date that a
+    note of the transaction or an `apply tag` gives it (`noteDateOf`).
+
+    C++ gives every must-balance posting of the key of `x`,
+    bracket-virtual ones included, the cost of the rate `|y/x|` times
+    its quantity (xact.cc:454-465), and Phase 6 hands each such posting
+    to `commodity_pool_t::exchange` as it hands one with a written cost
+    (xact.cc:669-690). The exchange records the absolute value of that
+    cost divided by the amount as the price of the amount's commodity
+    at 00:00 of the posting's date, rounded half away from zero at the
+    precision of the amount plus the display precision of the commodity
+    of `y` plus six, as `costPrice` rounds a divided cost
+    (pool.cc:437-468, 488-493). With `$` primary,
+    `Assets:Gen1  $20.00` against `Assets:Gen2  -7.00 GEN` prices `GEN`
+    at $2.8571428571, the rate 20/7 at ten places, on both C++ binaries.
+    The amount is the one written, before a commodity equivalence
+    reduces it (`PostSpec.rawAmount`), and the cost is the rate times
+    the reduced amount, as Phase 3 computes it. Each posting records its
+    own point, so that of two postings of the key at one instant the
+    later prevails, with its own precision. Phase 6 records beside such
+    a cost the lot price of a posting whose lot price is in a commodity
+    other than that of the cost (issue #3232, xact.cc:782-800), which
+    the table does not hold.
+
+    The sides are those that C++ takes. When the commodity of `x` is
+    COMMODITY_PRIMARY and that of `y` is not, the swap of issue #1130
+    exchanges them (xact.cc:425-431), so that the price is of the other
+    commodity in the primary one. A commodity is primary once a price
+    in it has been recorded (commodity.cc:72-78), which `St.primary`
+    follows for the price directives, the written costs and the costs
+    that earlier implicit exchanges compute. In test/regress/1130.test,
+    after price directives in `USD`, `USD 210.0` against `EUR -200.0`
+    prices `EUR` at 1.05 USD, where the sides of the top posting would
+    price `USD` in `EUR` and replace the `EUR` price that the
+    transaction before records at the same instant. Where the top
+    posting's key is not an entry of the balance, C++ takes the two
+    entries in the unspecified order of its map (balance.h:99) and swaps
+    them, since neither is the top posting's (xact.cc:422-423). The swap
+    of issue #1130 then fixes the sides when exactly one of the two
+    commodities is primary, and the points are those of that orientation
+    where a candidate converts in it; where none does, C++ rejects the
+    transaction in that orientation, and no point is recorded. When
+    neither or both of the two are primary, the order decides, and the
+    issue `exchange-order` stands in place of the points, once for each
+    of the two commodities.
+
+    Where `x` and `y` are lots of one commodity and every must-balance
+    posting whose amount is in that commodity is written in it, C++
+    records no price, whichever keys it gives the amounts: the price
+    would be in the amount's own commodity (pool.cc:492), and the cost
+    carries the annotation of the other lot, which keeps Phase 6 from the
+    lot price of issue #3232 (xact.cc:735, 782). No point is recorded
+    then, and no issue stands, whichever rule on issues the transaction
+    would otherwise meet: beside `Assets:C  = $0`, `10 AAPL {$5}` against
+    `-5 AAPL {$10}` records no price on both C++ binaries. A posting
+    written in a unit that a `C` directive reduces to that commodity is
+    priced in that commodity, as the source of Phase 6 records it
+    (pool.cc:492), and such a transaction, like one in which a balance
+    assignment computes an amount in that commodity, is read as any
+    other, an issue that stands for it standing once: beside
+    `C 1 KAAPL = 1000 AAPL`, `1 KAAPL {$5000}` after `-500 AAPL {$10}`
+    prices `KAAPL` at 500 AAPL here, a price that neither `pricedb`,
+    which hides the larger unit (amount.cc:1983-1985, iterators.cc:180,
+    192), nor a valuation shows on either C++ binary. Otherwise no price
+    is recorded (pool.cc:437, 483-493) for a posting whose own lot price
+    is fixated, for a cost whose lot price, the lot price of the entry
+    `y`, is in the amount's commodity (issue #1217), for a cost in the
+    amount's own commodity, for an amount that is exactly zero, and for a
+    price that rounds to zero, which makes no commodity primary either.
+    Where `y` has no commodity, the rate takes the commodity of `x`
+    (amount.cc:814-815) and Phase 6 rejects the cost (xact.cc:679-681).
+    Where the amount is not zero and shows as zero at the display
+    precision of its commodity (`amount_t::is_zero`), the price is the
+    cost itself, rounded at the precision of the cost or at the display
+    precision of the commodity of `y`, the larger (pool.cc:437, 466;
+    amount.cc:882-891). The precision of the cost is that of the rate
+    plus that of the amount, and the rate's is the sum of the precisions
+    of the two entries of the balance plus six, but no more than the
+    display precision of the commodity of `y` plus six
+    (amount.cc:810-826; `cppSum`): under `commodity EUR` with
+    `format 1.00 EUR`, `100 EUR` and `0.001 EUR` against `$-110.00` price
+    `EUR` at $0.001099989 on both C++ binaries, the cost of the later
+    posting at eleven places, and test/regress/1789.test prices `B` at
+    1 A.
+
+    The issue `unread-price` stands, once for each of the two
+    commodities, in place of the points of a transaction in which C++
+    can key an amount otherwise than the engine, and so take another top
+    posting (xact.cc:386-393), other sides, other postings to convert
+    (xact.cc:461) or a lot that withholds the price (issue #1217,
+    pool.cc:483-486). There are three such cases, each measured on both
+    C++ binaries.
+    - A balance assignment computes the amount of a must-balance
+      posting in a commodity. C++ can carry into that amount the
+      target's lot or the account's single lot
+      (textual_xacts.cc:843-866), even into an amount of zero, and this
+      reader keeps neither (`PostSpec.fixated`). An amount without a
+      commodity keeps no annotation (amount.cc:1908), and where Phase 3
+      converts one, the issue stands for the null commodity alone, in
+      place of its point, whose precision this reader does not keep.
+      After `10 AAPL {6 EUR}` in `Assets:Broker`, `Assets:Cash  60 EUR`
+      followed by `Assets:Broker  = 0 AAPL` prices `AAPL` at 6 EUR,
+      where the sides of the engine would price `EUR` in `AAPL`, and
+      `Assets:Bank  $-66.00 (a)` and `Assets:Cash  60 EUR (b)` followed
+      by `Assets:Broker  = 10 AAPL {6 EUR}`, which computes a zero,
+      price `$` at 0.90909091 EUR, where they would price `EUR` in `$`.
+      An amount without a commodity that an assignment computes also
+      leaves unknown the precision of the rate, which rounds the price of
+      an amount that shows as zero, and so where a `C` directive reduces
+      another commodity to the null commodity, the issue stands as well
+      for that commodity in place of the point of an amount in it that
+      shows as zero: beside `C 1 X = 1`, under `commodity X` with
+      `format 1 X`, after `10` in `Assets:A`, `Assets:A  = 5` and
+      `Assets:B  0.001 X` against `Assets:C  $10.00` set the issue for
+      the null commodity and for `X` in a journal that both C++ binaries
+      read.
+    - An `apply fixed` or `apply rate` directive annotates the amount of
+      a must-balance posting in its commodity with its fixated price
+      (`PostSpec.rateFixed`, textual_xacts.cc:626-638), which the engine
+      does not key (the `apply fixed` entry of the docstring of
+      `impliedExchange`), and the posting that C++ takes as its top
+      posting, the last must-balance posting so annotated or annotated
+      of its own, carries no fixated price. Where it carries one, Phase 3
+      converts nothing (xact.cc:386-404) and no price is recorded: under
+      `apply fixed CAD $0.75`, `$-75.00` against `100 CAD`, which
+      Phase 4 settles at the fixated price, records none, where the
+      engine would price `$` in `CAD`. A paren-virtual posting so
+      annotated changes nothing, since Phase 3 reads only the postings
+      that must balance (xact.cc:388, 461): beside `(Memo)  5 CAD`,
+      `10 EUR` against `$-11.00` prices `EUR` at $1.10, as it does here.
+    - Two or more must-balance postings of the key of `x` include one
+      whose annotation carries a date, a note or a value expression
+      (`PostSpec.annotDetails`). C++ converts only the postings whose
+      annotated commodity is that of `x`, these details included
+      (xact.cc:461, annotate.h:120-125), which the key here leaves out
+      (the `[date]` entry of the docstring of `impliedExchange`), so
+      that it can leave a posting of the key without a cost and record
+      the price of another. After `$1.00`, `7 EUR` against `$-20.00`
+      beside the bracket-virtual postings `1.000 EUR [2024/01/01]` and
+      `-1.000 EUR [2024/01/01]` prices `EUR` at $2.85714286, the rate at
+      the precision of the `7 EUR`, where the last posting of the key
+      would price it here at eleven places. The issue stands as well
+      where those details agree, since this reader does not keep them.
+    The commodity of a price for which an issue stands is not made
+    primary here.
+
+    The points inherit the departures of `impliedExchange`, which
+    decides the conversion, and those of `costPrice` in the display
+    precisions and the styles that this reader learns and in the
+    precision of an amount expression, the approximation of
+    `parseAmountField` (`PostSpec.amtPrec`), which rounds the price and,
+    through `cppSum`, the rate for an amount that shows as zero: after
+    `$1.00`, `Assets:A  (1.5 * 1.5 EUR)` against `Assets:B  $-10.00`
+    prices `EUR` at $4.4444444444 on both C++ binaries, at the precision
+    2 of the product plus 2 plus 6, and at $4.444444444444444 here.
+    Among those of `impliedExchange`, a top posting in a unit that a
+    commodity equivalence reduces, such as the hours and minutes that
+    C++ reduces to seconds (session.cc:80-81), matches neither entry in
+    C++, which then lets the order of the entries decide the sides
+    (xact.cc:333, 422): after `$1.00`, `Assets:Cash  $-50.00` against
+    `Assets:Time  1 h (note)` prices `$` at 72 s on both C++ binaries
+    and `h` at $50 here. The swap reads `St.primary`, which leaves out
+    commodities that C++ marks (`Result.primary`), the units of a `C`
+    directive among them, so that where it decides otherwise than C++
+    the table holds the price of one of the two commodities in the other
+    where C++ holds the price of the other in the one: beside
+    `C 1 Kb = 1024 b`, which marks `b` primary in C++ alone, `1024 b`
+    against `$-1000` prices `$` at 1.024 b on both C++ binaries and `b`
+    at $0.976563 here. An `apply fixed` or `apply rate` left open in an
+    included file stays in force here to the end of the journal, the
+    departure recorded at the `apply` arm of `handleDirective`, so that
+    where it would annotate the top posting the table lacks the price
+    that C++ records, and no issue stands in its place (fail-open): with
+    `apply fixed CAD $0.75` left open in an included file, `100 CAD`
+    against `$-75.00` after the `include` line prices `CAD` at $0.75 on
+    both C++ binaries and records nothing here.
+
+    C++ multiplies and divides by an amount in `%` as by a hundredth of
+    its quantity (amount.cc:727-733, 799-808), arithmetic that this
+    reader does not model, the departure that `costPrice` records for a
+    total cost. Phase 3 gives a converted posting in `%` the cost that it
+    has here, but Phase 6 divides that cost by the amount (pool.cc:437),
+    so that the price that C++ records is the quotient here times a
+    hundred, rounded at the same places: `Assets:A  10%` against
+    `Assets:B  $-20.00` prices `%` at $200 in C++, through which a later
+    `1%` values at $2.00 on both C++ binaries, since a valuation
+    multiplies the price by the amount (amount.cc:1324-1325), and at $2
+    here. Where the amount shows as zero, C++ records the cost itself, as
+    here, but at the two places more that a product by such an amount
+    carries (amount.cc:733): under `commodity %` with `format 1%`,
+    `100%` and `0.001%` against `$-110.00` price `%` at $0.0010999890001
+    in C++, through which a later `10000000000000%` values at
+    $109998900.01 on both C++ binaries, and at $0.001099989 here. A price
+    in `%` of another commodity is the same in C++ and here. -/
+private def exchangePoints (st : St) (xact : List PostSpec)
+    (cands : List PoolCandidate) (orderDependent : Bool)
+    (xactNoteDate : Option (Option Int)) :
+    List (String × Amount × Option (Option Int)) × List (String × String) :=
+  let prec := fun (k : String) => (st.precisions.lookup k).getD 0
+  let ab := fun (q : ℚ) => if q < 0 then -q else q
+  let primary := fun (e : LotKey × ℚ) => st.primary.contains e.1.1
+  let mustBal := xact.filter fun p => p.kind != .virtualUnbal && p.amount.isSome
+  -- C++ annotates an amount that an `apply fixed` or `apply rate`
+  -- directive names with its fixated price (textual_xacts.cc:626-638), so
+  -- that the last must-balance posting so annotated or annotated of its own
+  -- is its top posting, which converts nothing when it is fixated
+  -- (xact.cc:386-404)
+  let cppTop := (mustBal.filter fun p => p.annotated || p.rateFixed).getLast? <|> mustBal.head?
+  match cands.filterMap (·.exchange) with
+  | [] => ([], [])
+  | exchs@((x0, y0) :: _) =>
+    -- no price between two lots of one commodity whose must-balance
+    -- postings in it are all written in it, whichever keys C++ gives the
+    -- amounts: the price would be in the amount's own commodity
+    -- (pool.cc:492), and the cost carries the other lot's annotation,
+    -- which keeps Phase 6 from the lot price of #3232 (xact.cc:735, 782);
+    -- a posting written in a unit that a `C` directive reduces to it, or
+    -- one whose amount a balance assignment computes, is read below
+    let differ := x0.1.1 != y0.1.1
+    if !differ && mustBal.all (fun p =>
+        p.amount.all (·.comm != x0.1.1) || p.rawAmount.any (·.comm == x0.1.1)) then
+      ([], [])
+    else
+    -- an issue in place of the points, once for each of the two
+    -- commodities, or once where the two are one
+    let both : String → List (String × Amount × Option (Option Int)) × List (String × String) :=
+      fun issue => ([], (issue, x0.1.1) :: (if differ then [(issue, y0.1.1)] else []))
+    -- an amount in a commodity that a balance assignment computes, into
+    -- which C++ can carry a lot that this reader does not keep
+    -- (textual_xacts.cc:843-866) and which can then be its top posting
+    -- (xact.cc:386-393); an amount without a commodity keeps no annotation
+    -- (amount.cc:1908)
+    if mustBal.any fun p => p.rawAmount.isNone && p.amount.any (·.comm != "") then
+      both "unread-price"
+    else if mustBal.any (·.rateFixed) then
+      if cppTop.any fun p => p.rateFixed || p.fixated then ([], [])
+      else both "unread-price"
+    else
+    -- the sides that C++ takes: those of the top posting's key, swapped
+    -- by issue #1130 (xact.cc:425-431); where the order of the two
+    -- entries decides (xact.cc:422-423, balance.h:99), those that the
+    -- swap fixes when exactly one commodity is primary
+    let fixedBySwap : Option ((LotKey × ℚ) × (LotKey × ℚ)) :=
+      if differ && primary x0 && !primary y0 then some (y0, x0)
+      else if differ && primary y0 && !primary x0 then some (x0, y0)
+      else none
+    let sides : ExchangeSides :=
+      if !orderDependent && exchs.length == 1 then
+        let (x, y) := fixedBySwap.getD (x0, y0)
+        .sides x y
+      else match fixedBySwap with
+        | some (x, y) => if exchs.any (·.1.1 == x.1) then .sides x y else .noPrice
+        | none => if differ then .byOrder else .noPrice
+    match sides with
+    | .byOrder => both "exchange-order"
+    | .noPrice => ([], [])
+    | .sides x y =>
+      -- every must-balance posting of the key of `x` takes a cost in the
+      -- commodity of `y` (xact.cc:454-465)
+      let conv := mustBal.filter fun p => p.amount.any fun a => lotKeyOf p a == x.1
+      let rate := ab (y.2 / x.2)
+      -- the precisions of the two entries, which give that of the rate
+      -- `y/x` (amount.cc:810-826), for a cost on an amount that shows
+      -- as zero, taken from the real pool as `finalizeXact` filters it
+      -- (`realPool`) for `balancePool` and so for the verdict of
+      -- `impliedExchange`; the rule on balance assignments above leaves
+      -- each known but where an assignment computes an amount without a
+      -- commodity
+      let precs : List (LotKey × Option Nat) :=
+        match cppSum (xact.filter fun p => p.kind == .real || p.kind == .deferred) with
+        | .balance es => es.map fun (k, _, d) => (k, d)
+        | .amount k _ d => [(k, d)]
+        | .null => []
+      let ratePrec : Option Nat := do
+        let px ← (precs.lookup x.1).bind id
+        let py ← (precs.lookup y.1).bind id
+        pure (min (px + py + 6) (prec y.1.1 + 6))
+      -- a `y` without a commodity gives the rate the commodity of `x`
+      -- (amount.cc:814-815), and Phase 6 rejects a cost in the amount's
+      -- own commodity (xact.cc:679-681)
+      if y.1.1 == "" then ([], [])
+      -- C++ converts only the postings whose annotated commodity, its
+      -- date, note and value expression included, is that of `x`
+      -- (xact.cc:461, annotate.h:120-125), which the key here leaves out
+      else if conv.length ≥ 2 && conv.any (·.annotDetails) then both "unread-price"
+      else conv.foldl (init := ([], [])) fun (pts, iss) p =>
+        match p.rawAmount, p.amount with
+        | some r, some a =>
+            -- no price for a fixated lot, for a cost whose lot price is
+            -- in the amount's commodity (#1217) or for a cost in the
+            -- amount's own commodity (pool.cc:483-493), nor for an amount
+            -- that is exactly zero, whose cost of zero is no price
+            -- (pool.cc:437, 488)
+            if p.fixated || r.comm == y.1.1 || y.1.2.any (·.1 == r.comm) || r.q == 0 then
+              (pts, iss)
+            -- an amount that shows as zero prices its cost itself
+            -- (pool.cc:437), rounded at the precision of that cost, the
+            -- rate's and the amount's, or at the display precision of its
+            -- commodity, the larger (pool.cc:466, amount.cc:882-891)
+            else if r.comm != "" && p.amtPrec > prec r.comm
+                && roundsToZeroAt (prec r.comm) r.q then
+              match ratePrec with
+              | some rp =>
+                  let q := roundAt (max (rp + p.amtPrec) (prec y.1.1)) (ab (rate * a.q))
+                  -- no price that rounds to zero (pool.cc:488)
+                  if q == 0 then (pts, iss)
+                  else (pts ++ [(r.comm, ⟨y.1.1, q⟩, p.noteDate <|> xactNoteDate)], iss)
+              -- reached only where a `C` directive reduces the commodity
+              -- of the amount to the null commodity: a precision is
+              -- unknown only for an entry that an amount computed by a
+              -- balance assignment feeds (`cppSum`), which the first rule
+              -- above leaves only to the null commodity, and a `y`
+              -- without a commodity does not come here; the issue stands
+              -- in place of the point
+              | none => (pts, iss ++ [("unread-price", r.comm)])
+            else
+              let q := roundAt (p.amtPrec + prec y.1.1 + 6) (ab (rate * a.q / r.q))
+              -- no price that rounds to zero (pool.cc:488)
+              if q == 0 then (pts, iss)
+              else (pts ++ [(r.comm, ⟨y.1.1, q⟩, p.noteDate <|> xactNoteDate)], iss)
+        -- an amount without a commodity that a balance assignment
+        -- computes, which the rule above leaves here, prices the null
+        -- commodity at a precision that this reader does not keep
+        | none, some a =>
+            if a.q == 0 then (pts, iss) else (pts, iss ++ [("unread-price", a.comm)])
+        | _, none => (pts, iss)
 
 /-- The check that C++ makes once more after an automated transaction.
     `auto_xact_t::extend_xact` runs one rule at a time and, after a
@@ -3328,9 +3748,10 @@ private def impliedExchange (st : St) (xact pool : List PostSpec)
     depends on the orientation is refused as out of scope. The check
     reads neither which commodities are COMMODITY_PRIMARY (the #1130
     entry of `impliedExchange`; `St.primary` records only those that
-    price directives and written costs mark, for valuation) nor the
-    order in which C++ takes two balance entries when neither is the
-    top posting's key (balance.h:99, xact.cc:422-423), and each of
+    price directives, written costs and implicit exchanges mark, for
+    valuation and for the sides of the prices of an implicit exchange)
+    nor the order in which C++ takes two balance entries when neither is
+    the top posting's key (balance.h:99, xact.cc:422-423), and each of
     these decides the orientation. Because the first is not read, the
     refusal also falls on a transaction before which no price
     directive, `C` directive or earlier exchange has marked any
@@ -3700,8 +4121,23 @@ private def finalizeXact (st : St) (hline : Nat) (_header : String)
     else ordered.filterMap fun p => (costPrice stv p).map fun (c, pr) =>
       (c, pr, p.noteDate <|> xactNoteDate)
   -- a transaction whose UUID has been seen writes these points alone, to
-  -- the state before it (the comment on `dup`)
-  if dup then return recordCostPoints st _header costPoints
+  -- the state before it (the comment on `dup`), with those of the costs
+  -- that its implicit exchange computes (`exchangePoints`). C++ finalizes
+  -- the duplicate before it drops it and skips its balance assignments,
+  -- which leave their postings without an amount (textual_xacts.cc:787-809),
+  -- so that Phase 3 converts only where no real posting lacks one
+  -- (xact.cc:380)
+  if dup then
+    let realPool := ordered.filter fun p => p.kind == .real || p.kind == .deferred
+    let (cands, od) : List PoolCandidate × Bool :=
+      if !realPool.all (·.amount.isSome) then ([], false)
+      else match impliedExchange stv ordered realPool with
+        | .converts cs _ => (cs, false)
+        | .unordered cs => (cs, true)
+        | _ => ([], false)
+    let (exPoints, exIssues) := exchangePoints stv ordered cands od xactNoteDate
+    let st := recordCostPoints st _header (costPoints ++ exPoints)
+    return { st with priceIssues := exIssues.reverse ++ st.priceIssues }
   -- assignments: sequential against running balance + this xact so far
   let mut resolved : List PostSpec := []
   -- intra-xact prior posts, keyed by (account, commodity, realOnly?)
@@ -4290,8 +4726,15 @@ private def finalizeXact (st : St) (hline : Nat) (_header : String)
       stv := { stv with datedEvents :=
         ((acctFor p.account, ""), xd, 0, .real) :: stv.datedEvents }
   -- the points of `costPoints`, written now that the transaction is
-  -- balanced, since Phase 6 follows the implicit exchange of Phase 3
-  stv := recordCostPoints stv _header costPoints
+  -- balanced, since Phase 6 follows the implicit exchange of Phase 3,
+  -- and those of the costs that the implicit exchange computes where the
+  -- real pool was accepted through it (`exchangePoints`); a periodic
+  -- template has no Phase 6 (xact.cc:522)
+  let (exPoints, exIssues) := if periodic then ([], [])
+    else exchangePoints stv rposts realDone.candidates realDone.orderDependent
+      xactNoteDate
+  stv := recordCostPoints stv _header (costPoints ++ exPoints)
+  stv := { stv with priceIssues := exIssues.reverse ++ stv.priceIssues }
   pure { stv with gens := flows :: stv.gens }
 
 /-- Split on a separator word at paren/quote depth zero. -/
@@ -5537,82 +5980,122 @@ structure Result where
       template, whose result `flushPending` discards, and a transaction
       dropped for its UUID leave the flag as it was. -/
   lotFanout : Bool
-  /-- the dated price table that the price directives and the costs
-      written on the postings of transactions with a date record, in the
-      order in which its points were last written (`priceDirective`,
-      `costPrice`, `recordCostPoints`, `priceTable`); `pricesAt` reads it
-      as of an instant -/
+  /-- the dated price table that the price directives and the costs of
+      the postings of transactions with a date record, written or
+      computed by an implicit exchange, in the order in which its points
+      were last written (`priceDirective`, `costPrice`, `exchangePoints`,
+      `recordCostPoints`, `priceTable`); `pricesAt` reads it as of an
+      instant -/
   prices : List PricePoint
   /-- the commodities that the price directives and the costs mark
-      primary, as far as this reader records them, kept for valuation
-      alone: balancing does not read them (the #1130 entry of
-      `impliedExchange`). Apart from the departures that `costPrice`
-      records, under which the price of a cost can round to zero here
-      alone or in C++ alone, the list holds the commodity of the price of
-      each point that a directive records, of each directive with the
-      issue `undated-price`, and of each price that C++ records for a
-      written cost, whether the table holds its point or an issue that
-      names its commodity stands in its place (commodity.cc:72-78,
-      commodity.h:237). After a periodic template with `X  $0.50`
-      against an elided `Y`, which teaches C++ alone the two places of
-      `$`, `10 AAPL @@ $0.000001` records $0.0000001 in C++, which marks
-      `$` primary, and here a price that rounds to zero at six places,
-      which records nothing. The same holds after `Assets:A  $1.0000001`
-      against an elided `Equity` and then `D $1.00`, after which `$` keeps
-      seven places in C++ and has two here: `10 AAPL @@ $0.00000001`
-      records $0.000000001 in C++ and nothing here.
+      primary, as far as this reader records them, kept for valuation and
+      for the sides of the prices that an implicit exchange records
+      (`exchangePoints`): balancing does not read them (the #1130 entry
+      of `impliedExchange`). Apart from the departures that `costPrice`
+      and `exchangePoints` record, under which the price of a cost can
+      round to zero here alone or in C++ alone, the list holds the
+      commodity of the price of each point that a directive records, of
+      each directive with the issue `undated-price`, and of each price
+      that C++ records for a written cost or for one that an implicit
+      exchange computes, whether the table holds its point or an issue
+      that `recordCostPoints` sets stands in its place
+      (commodity.cc:72-78, commodity.h:237). After a periodic template
+      with `X  $0.50` against an elided `Y`, which teaches C++ alone the
+      two places of `$`, `10 AAPL @@ $0.000001` records $0.0000001 in
+      C++, which marks `$` primary, and here a price that rounds to zero
+      at six places, which records nothing. The same holds after
+      `Assets:A  $1.0000001` against an elided `Equity` and then
+      `D $1.00`, after which `$` keeps seven places in C++ and has two
+      here: `10 AAPL @@ $0.00000001` records $0.000000001 in C++ and
+      nothing here.
 
       The list leaves out five kinds of commodity that C++ marks. The
       first is the commodity of a price expression whose result is in one
       commodity (pool.cc:615, 646). The second is the commodity of the
       price of a directive with the issue `unread-price`, with those of
       the prices of a transaction dropped for its UUID for which that
-      issue stands. The third is each unit of a `C` directive: the smaller
-      through the price that the directive records
-      (textual_directives.cc:185-188, commodity.cc:73-75), and the larger
-      through `parse_conversion`, which gives it the flags of the smaller
-      (textual_directives.cc:191, amount.cc:1983-1985). The fourth is the
-      commodity of a cost that Phase 3 of `finalize` computes for an
-      implicit exchange, which Phase 6 exchanges as it does a written
-      one, with that of the lot price that it records beside it
-      (xact.cc:425-465, 669-690, 782-800). The fifth is the commodity of
-      the price that C++ records for a cost on an amount that an
-      `apply fixed` left open in an included file annotates here alone, of
-      which the table holds neither the point nor an issue (the departure
-      that `costPrice` records). The list is therefore complete, apart
-      from the departures of `costPrice` under which a price rounds to
-      zero on one side alone, for a journal whose `priceIssues` holds no
-      `price-expr` or `unread-price` entry and which has no `C` directive,
-      no transaction that an implicit exchange balances and no
+      issue stands and of the costs of an implicit exchange for which
+      `exchangePoints` sets that issue or `exchange-order`. The third is
+      each unit of a `C` directive: the smaller through the price that
+      the directive records (textual_directives.cc:185-188,
+      commodity.cc:73-75), and the larger through `parse_conversion`,
+      which gives it the flags of the smaller (textual_directives.cc:191,
+      amount.cc:1983-1985). The fourth is the commodity of the lot price
+      that Phase 6 records beside the cost that an implicit exchange
+      computes for a posting whose lot price is in another commodity
+      (issue #3232, xact.cc:782-800). The fifth is the commodity of the
+      price that C++ records for a cost on an amount that an
+      `apply fixed` left open in an included file annotates here alone,
+      of which the table holds neither the point nor an issue (the
+      departure that `costPrice` records). The list is therefore
+      complete, apart from the departures of `costPrice` and
+      `exchangePoints` under which a price rounds to zero on one side
+      alone, the arithmetic of `%` among them, for a journal whose
+      `priceIssues` holds no `price-expr`, `unread-price` or
+      `exchange-order` entry and which has no `C` directive, no amount in
+      hours or minutes, the built-in units of time that reduce to seconds
+      (session.cc:80-81), which as the top posting of an implicit
+      exchange can let C++ take other sides (`exchangePoints`), no
+      posting whose lot price is in a commodity other than that of the
+      cost that an implicit exchange computes for it, and no
       `apply fixed` or `apply rate` left open in an included file -/
   primary : List String
-  /-- the price directives and the written costs whose point the table
-      does not hold, or holds at a date that a note or an `apply tag`
-      gives, in the order in which they are read, each as an issue and
-      the commodity that it prices, empty where that is not read. The
-      issue `price-expr` stands for a price that is an expression, and
-      `undated-price` for a directive without a date whose instant is not
-      known here. The issue `unread-price` stands for a directive that is
-      not read as C++ reads it (`priceDirective`) and for a cost in a
-      transaction whose date `priceDay` does not read; with no commodity,
-      it stands for a transaction dropped for a UUID seen before with a
-      posting that `parsePosting` does not read (`finalizeXact`). The
-      issue `posting-date` stands for a cost whose price C++ records at
-      the date that a note of its posting or of its transaction, or an
-      `apply tag` in force, gives (`noteDateOf`, `St.applyTags`), and the
-      table holds the point if `priceDay` reads that date. Where an
-      `apply tag` is left open in an included file, which ends it in C++
-      alone (the departure recorded at the `apply` arm of
-      `handleDirective`), that issue also stands for a later cost whose
-      price C++ records at the date of its transaction.
-      Apart from the departures that `priceDirective` and `costPrice`
-      record, among them a price read in a style other than the one in
-      which C++ reads it, a cost whose price is rounded at a display
-      precision that this reader learns otherwise than C++, and a cost on
-      an amount that an `apply fixed` left open in an included file
-      annotates here alone, a price directive or a written cost of a
-      journal that C++ reads either writes to the table the point that
-      C++ records or has an entry here -/
+  /-- the price directives and the costs, written or computed by an
+      implicit exchange, whose point the table does not hold, or holds at
+      a date that a note or an `apply tag` gives, in the order in which
+      they are read, each as an issue and the commodity that it prices,
+      empty where that is not read. The issue `price-expr` stands for a
+      price that is an expression, and `undated-price` for a directive
+      without a date whose instant is not known here. The issue
+      `unread-price` stands for a directive that is not read as C++ reads
+      it (`priceDirective`), for a cost in a transaction whose date
+      `priceDay` does not read, and, once for each of its two
+      commodities, for the costs of an implicit exchange whose prices
+      this reader does not compute: in a transaction in which a balance
+      assignment computes the amount of a must-balance posting in a
+      commodity, in which an `apply fixed` or `apply rate` directive
+      annotates such an amount and C++ takes as its top posting one
+      without a fixated price, or in which two or more postings of the
+      key that Phase 3 converts include one annotated with a date, a note
+      or a value expression (`exchangePoints`). It stands once, for the
+      null commodity, in place of the point of an amount without a
+      commodity that a balance assignment computes and that Phase 3
+      converts, whose precision this reader does not keep, and once, for
+      a commodity that a `C` directive reduces to the null commodity, in
+      place of the point of an amount in it that shows as zero beside
+      such an amount, whose rate has then a precision unknown here as
+      well (`exchangePoints`). Without a commodity it also stands for a
+      price directive whose symbol is missing or empty or whose quote is
+      not closed (`priceDirective`), and for a transaction dropped for a
+      UUID seen before with a posting that `parsePosting` does not read
+      (`finalizeXact`); elsewhere an entry without a commodity names the
+      null commodity. The issue `exchange-order` stands, once for each of
+      its two commodities, for the costs of an implicit exchange whose
+      sides the order of the two entries of the balance decides
+      (`exchangePoints`). The issue `posting-date` stands for a cost
+      whose price C++ records at the date that a note of its posting or
+      of its transaction, or an `apply tag` in force, gives
+      (`noteDateOf`, `St.applyTags`), and the table holds the point if
+      `priceDay` reads that date. Where an `apply tag` is left open in an
+      included file, which ends it in C++ alone (the departure recorded
+      at the `apply` arm of `handleDirective`), that issue also stands
+      for a later cost whose price C++ records at the date of its
+      transaction. Apart from the departures that `priceDirective`,
+      `costPrice` and `exchangePoints` record, among them a price read in
+      a style other than the one in which C++ reads it, a cost whose
+      price is rounded at a display precision that this reader learns
+      otherwise than C++, a cost on an amount in `%`, whose price C++
+      computes by the arithmetic of `%`, a cost on an amount that an
+      `apply fixed` left open in an included file annotates here alone,
+      and the sides of an implicit exchange that a commodity marked
+      primary in C++ alone, or a top posting in hours or minutes,
+      decides, a price directive or a cost of a journal that C++ reads
+      either writes to the table the point that C++ records or has an
+      entry here. Phase 6 also records, beside the cost that an implicit
+      exchange computes, the lot price of a posting whose lot price is in
+      a commodity other than that of the cost (issue #3232,
+      xact.cc:782-800), and the table holds neither that point nor an
+      issue in its place -/
   priceIssues : List (String × String)
 
 private def flushPending (st : St) : Except String St := do
