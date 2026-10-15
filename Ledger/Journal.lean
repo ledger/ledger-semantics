@@ -267,6 +267,58 @@ structure PostSpec where
       annotation then holds; `exchangePoints` reads it for the lot price
       that Phase 6 records beside the cost of a converted posting -/
   annotDate : Bool := false
+  /-- the amount's own annotation carries a value expression, `((EXPR))`,
+      one that opens with a `(` that a second `(` follows directly
+      (annotate.cc:203-246), under the same conditions as `annotated`.
+      C++ values an amount through the expression of its annotation,
+      unless its lot price is fixated, which it reads first
+      (annotate.cc:400-405, 417-418), and Phase 6 gives a posting that
+      has a cost, written or computed by an implicit exchange, and whose
+      amount has no lot price an annotation without the expression
+      (xact.cc:802-811, pool.cc:508-522). With `P 2026/02/01 AAPL $170`,
+      `bal -X $` at 2026/03/01 shows 2000 on both C++ binaries for
+      `10 AAPL {$150} ((200))` against `$-1500`, for
+      `10 AAPL {$150} ((200)) @ $160` against an elided posting and for a
+      virtual `10 AAPL ((200))`, $1500 for `10 AAPL {=$150} ((200))`
+      against `$-1500`, and $1700 for `10 AAPL ((200)) @ $150` against an
+      elided posting and for `10 AAPL ((200))` against `$-1500`. The flag
+      is set as well for the target of a balance assignment whose own
+      annotation carries one, on a target with a commodity: C++ keeps the
+      annotation of an annotated target in the amount that it computes
+      (`strip` is false, textual_xacts.cc:807, 855-858), and Phase 6
+      reads that amount as it reads a written one, so that
+      `= 10 AAPL ((200))` against an elided posting, a virtual
+      `= 10 AAPL ((200))` and `= 10 AAPL {$150} ((200))` against an
+      elided posting show 2000, and `= 10 AAPL ((200))` against `$-1500`
+      shows $1700, on both C++ binaries. `finalizeXact` records the
+      commodity of every such amount or target in `St.valueExprComms`,
+      those whose expression C++ does not read included (conservative) -/
+  lotExpr : Bool := false
+  /-- the cost carries a value expression in its own annotation, `((EXPR))`
+      written after the cost and before any balance assertion, on a cost
+      with a commodity, under the conditions of `costAnnotated`
+      (`annotLoop`). C++ parses the cost with its annotation
+      (textual_xacts.cc:691) and adds it to the balance of the transaction
+      in that annotated commodity (xact.cc:325-333), so that an elided
+      posting, or the bucket's (xact.cc:368-369), which takes the negated
+      balance (xact.cc:829-844), carries the expression. With
+      `P 2026/02/01 AAPL $170` and `P 2026/02/01 EUR $1.1`, `bal -X $` at
+      2026/03/01 shows -280000 for an elided `Assets:Cash` against
+      `10 AAPL @ 140 EUR ((200))`, where the table gives $-1540, and as
+      much for a bucket `Assets:Cash`, for `@@ 1400 EUR ((200))`, for a
+      virtual cost `(@)`, and for the expression after a lot date, after
+      a lot price of the amount or before an assertion, on both C++
+      binaries. A `$` cost shows nothing under `bal -X $`, since C++
+      converts an amount of the commodity sought without valuing it
+      (amount.cc:1279-1280), while with `P 2026/02/01 $ 0.9 EUR`,
+      `bal -X EUR` shows -300000 for `Assets:Cash` against
+      `10 AAPL @ $150 ((200))`, and EUR-1350.0 without the expression. A
+      cost in the null commodity keeps no annotation (amount.cc:1908), so
+      that `10 AAPL @ 140 ((200))` leaves `Assets:Cash` at -1400.
+      `finalizeXact` records the commodity of such a cost in
+      `St.valueExprComms`, where no posting takes the cost included, as on
+      a virtual posting (conservative) -/
+  costExpr : Bool := false
   /-- the amount's own lot price is fixated, `{=P}` or `{{=T}}`
       (ANNOTATION_PRICE_FIXATED, annotate.cc:169), under the same
       conditions as `annotated`. Unlike `LotPrice.fixated` in
@@ -475,7 +527,9 @@ private inductive Pending where
   -- a `~` template: balance-checked by `flushPending`, flows discarded
   | periodic (line : Nat) (header : String) (posts : List (Nat × String))
   | acctBlock (frames : List (Nat × String))
-  | commBlock (comm : String)
+  -- a `commodity` block: the name that this reader keeps, and the symbol
+  -- that C++ reads from the directive text (`commodityDirectiveSymbol`)
+  | commBlock (comm : String) (sym : String)
   | ignoreBlock
 
 /-- The kind of a posting recorded in `St.datedEvents`, as a balance
@@ -651,6 +705,19 @@ structure St where
       `recordCostPoints`, `exchangePoints`, `finalizeXact`), the most
       recent first -/
   priceIssues : List (String × String) := []
+  /-- the commodities that a value expression read so far can value,
+      each once, the most recent first: the commodity of an amount or a
+      balance-assignment target whose own annotation carries one
+      (`PostSpec.lotExpr`), of a cost whose own annotation carries one
+      (`PostSpec.costExpr`), or of a template amount of an automated
+      transaction that does, of a `commodity` block with a `value`
+      subdirective, and every commodity of a transaction that a note or
+      an `apply tag` can give the tag `Value` (`finalizeXact`,
+      `finalizeAuto`, `run`, `Result.valueExprComms`) -/
+  valueExprComms : List String := []
+  /-- set once a value expression that can value any commodity has been
+      read (`Result.valueExprAll`) -/
+  valueExprAll : Bool := false
   /-- set by an in-file `--now` line, after which the current time of
       C++ is not known here: the option takes a time with its date
       (report.h:1059-1074 at 76b9dc2b2), and the end of an included file
@@ -1142,6 +1209,69 @@ private def uuidOf (s : String) : Option String :=
       some (trimS (rest.takeWhile fun c => c != ',' && c != ';').toString)
   | _ => none
 
+/-! ## Value expressions -/
+
+/-- The text of the line `s` from its first `;` on, and nothing where it
+    holds none: it holds every note that C++ reads from the line, since
+    the note of a transaction's header, of a posting line, a note line of
+    a transaction, a note line of an automated transaction and the note
+    of a check-in or check-out line of a timelog each begin with a `;`
+    (textual_xacts.cc:1052-1074, 899-900, 1101-1103, 240-248;
+    textual_directives.cc:96-97, 125-126). -/
+private def noteText (s : String) : String :=
+  String.ofList (s.toList.dropWhile (· != ';'))
+
+/-- Whether the note text `s` can give the tag `Value` a value: it holds
+    `value:` in any case. C++ gives a tag a value from a note line whose
+    first word of two characters or more is the tag's name followed by
+    `:` or `::`, the name read in any case (metadata.cc:47-51, 137-197),
+    so that every note line from which the tag `Value` takes a value
+    holds this text, while the test admits more lines than give it one,
+    such as `; Market value: 3` or `; Value:` with no value
+    (conservative). -/
+private def namesValueTag (s : String) : Bool :=
+  (s.toLower.splitOn "value:").length > 1
+
+/-- The names under which `St.valueExprComms` records an amount's
+    commodity `c`, already named through the commodity aliases: `c`, and
+    `c` reduced through the commodity equivalences, as the flows name it
+    (`canonAmt`). C++ reduces the amounts of a transaction at the end of
+    `finalize` and not those of a posting that an automated transaction
+    generates (xact.cc:987-996), so that either name can be the one whose
+    amounts a value expression reaches. Only the equivalences read so far
+    reduce `c`, so that a smaller unit that a later `C` directive declares
+    is not named (`Result.valueExprComms`). -/
+private def valueExprNames (st : St) (c : String) : List String :=
+  [c, (resolveEquiv st.equivs c).2].eraseDups
+
+/-- The symbol that C++ reads from the text `s` that follows the word of
+    a `commodity` directive (textual_directives.cc:808-813), as the
+    `parse_symbol` that takes a line reads it (commodity.cc:438-455): the
+    text between a leading double quote and the next one, or else the
+    text before the first blank or tab (`next_element`, utils.h:623-640),
+    so that `commodity N2` names `N2` and `commodity AAPL ; note` names
+    `AAPL`. -/
+private def commodityDirectiveSymbol (s : String) : String :=
+  match s.toList with
+  | '"' :: cs => String.ofList (cs.takeWhile (· != '"'))
+  | cs => String.ofList (cs.takeWhile fun c => c != ' ' && c != '\t')
+
+/-- `st` with each commodity of `cs` that `St.valueExprComms` does not
+    hold yet added to it, the null commodity left out: C++ gives no
+    amount of it a value expression, since it keeps no annotation on
+    such an amount (amount.cc:1908) and `extend_post` fails an assertion
+    where such a posting would take one (pool.cc:349), which rejects the
+    journal. Under `; Value: 200`, after `value 200` and under
+    `account Assets:A` with `value 200`, both C++ binaries reject
+    `Assets:A  10` against `Equity  -10`, which is accepted here
+    (fail-open); and under the tag they value `10 AAPL @ 5` against
+    `-5 EUR @ 10`, whose costs alone are in the null commodity, at 2000
+    and -1000. -/
+private def recordValueExprComms (st : St) (cs : List String) : St :=
+  let comms := cs.foldl (init := st.valueExprComms) fun acc c =>
+    if c.isEmpty || acc.contains c then acc else c :: acc
+  { st with valueExprComms := comms }
+
 /-! ## Posting-line parsing -/
 
 private def stripStatus (s : String) : String :=
@@ -1190,6 +1320,10 @@ private structure AnnotTail where
   annotDetails : Bool
   /-- `PostSpec.annotDate` -/
   annotDate : Bool
+  /-- `PostSpec.lotExpr` -/
+  lotExpr : Bool
+  /-- `PostSpec.costExpr` -/
+  costExpr : Bool
   fixated : Bool
   ownLot : Bool
   /-- the cost is a per-unit `@`, not a total `@@` -/
@@ -1214,7 +1348,8 @@ private partial def annotLoop (ctx : AmtCtx) (line : Nat) (a : Amount)
     (ownLot : Bool := false) (perUnit : Bool := false)
     (lotLit : Option (Nat × Bool) := none) (costAnnotated : Bool := false)
     (costLot : Option String := none) (costVirtual : Bool := false)
-    (annotDetails : Bool := false) (annotDate : Bool := false) :
+    (annotDetails : Bool := false) (annotDate : Bool := false)
+    (lotExpr : Bool := false) (costExpr : Bool := false) :
     Except String AnnotTail := do
   -- `annotated`, `fixated` and `ownLot`: an annotation met before any
   -- cost or assertion belongs to the posting's own amount; after a
@@ -1224,13 +1359,17 @@ private partial def annotLoop (ctx : AmtCtx) (line : Nat) (a : Amount)
   -- after the cost and before any assertion, on a cost with a
   -- commodity, since C++ keeps no annotation on an amount without one
   -- (amount.cc:1908). `annotDetails`: a date, a note or a value
-  -- expression met while `own` holds, and `annotDate` a date
+  -- expression met while `own` holds, `annotDate` a date, and `lotExpr` a
+  -- value expression, which opens with a `(` that a second `(` follows
+  -- directly (annotate.cc:203-246, `PostSpec.lotExpr`); `costExpr`: a
+  -- value expression met where `costAnnotated` is set (`PostSpec.costExpr`)
   let own := !afterCost && !afterAssert
   let onCost := afterCost && !afterAssert && cost.any (·.comm != "")
   let t := trimS tail
   if t.isEmpty || t == "." then
-    pure { lot, cost, teach, costDecs, annotated, annotDetails, annotDate, fixated,
-           ownLot, perUnit, lotLit, costAnnotated, costLot, costVirtual }
+    pure { lot, cost, teach, costDecs, annotated, annotDetails, annotDate, lotExpr,
+           costExpr, fixated, ownLot, perUnit, lotLit, costAnnotated, costLot,
+           costVirtual }
   else if t.startsWith "{" then
     -- `{{total}}` and `{per-unit}` lot prices, possibly `{=fixated}`;
     -- lots parse with PARSE_NO_MIGRATE — no precision teaching
@@ -1274,6 +1413,7 @@ private partial def annotLoop (ctx : AmtCtx) (line : Nat) (a : Amount)
       (lotLit := lotLit') (costAnnotated := costAnnotated || onCost)
       (costLot := costLot') (costVirtual := costVirtual)
       (annotDetails := annotDetails) (annotDate := annotDate)
+      (lotExpr := lotExpr) (costExpr := costExpr)
   else if t.startsWith "[" then
     match takeBalanced '[' ']' t.toList with
     | some (_, rest) =>
@@ -1283,16 +1423,19 @@ private partial def annotLoop (ctx : AmtCtx) (line : Nat) (a : Amount)
           (lotLit := lotLit) (costAnnotated := costAnnotated || onCost)
           (costLot := costLot) (costVirtual := costVirtual)
           (annotDetails := annotDetails || own) (annotDate := annotDate || own)
+          (lotExpr := lotExpr) (costExpr := costExpr)
     | none => err line s!"unclosed lot date in '{t}'"
   else if t.startsWith "(" && !(t.startsWith "(@") then
     match takeBalanced '(' ')' t.toList with
-    | some (_, rest) =>
+    | some (inner, rest) =>
         annotLoop ctx line a (String.ofList rest) lot cost teach afterCost costDecs
           (afterAssert := afterAssert) (annotated := annotated || own)
           (fixated := fixated) (ownLot := ownLot) (perUnit := perUnit)
           (lotLit := lotLit) (costAnnotated := costAnnotated || onCost)
           (costLot := costLot) (costVirtual := costVirtual)
           (annotDetails := annotDetails || own) (annotDate := annotDate)
+          (lotExpr := lotExpr || (own && inner.head? == some '('))
+          (costExpr := costExpr || (onCost && inner.head? == some '('))
     | none => err line s!"unclosed lot note in '{t}'"
   else if t.startsWith "(@@)" || t.startsWith "@@" then
     let off := if t.startsWith "(@@)" then 4 else 2
@@ -1309,6 +1452,7 @@ private partial def annotLoop (ctx : AmtCtx) (line : Nat) (a : Amount)
       (perUnit := false) (lotLit := lotLit) (costAnnotated := costAnnotated)
       (costLot := costLot) (costVirtual := t.startsWith "(@@)")
       (annotDetails := annotDetails) (annotDate := annotDate)
+      (lotExpr := lotExpr) (costExpr := costExpr)
   else if t.startsWith "(@)" || t.startsWith "@" then
     -- per-unit costs round at the cost literal's own precision,
     -- posting by posting (regress/1125); `@ =` fixates (1794). A cost
@@ -1327,6 +1471,7 @@ private partial def annotLoop (ctx : AmtCtx) (line : Nat) (a : Amount)
       (perUnit := true) (lotLit := lotLit) (costAnnotated := costAnnotated)
       (costLot := costLot) (costVirtual := t.startsWith "(@)")
       (annotDetails := annotDetails) (annotDate := annotDate)
+      (lotExpr := lotExpr) (costExpr := costExpr)
   else if t.startsWith "=" then
     -- assertion: the C++ side checks it; positive tests pass it, but
     -- the literal still teaches display precision (1699). C++ parses
@@ -1356,6 +1501,7 @@ private partial def annotLoop (ctx : AmtCtx) (line : Nat) (a : Amount)
       (costAnnotated := costAnnotated) (costLot := costLot)
       (costVirtual := costVirtual) (annotDetails := annotDetails)
       (annotDate := annotDate)
+      (lotExpr := lotExpr) (costExpr := costExpr)
   else
     err line s!"trailing junk after amount '{t}'"
 
@@ -1388,6 +1534,10 @@ private structure AmountField where
   annotDetails : Bool := false
   /-- `PostSpec.annotDate` -/
   annotDate : Bool := false
+  /-- `PostSpec.lotExpr` -/
+  lotExpr : Bool := false
+  /-- `PostSpec.costExpr` -/
+  costExpr : Bool := false
   fixated : Bool := false
   /-- `PostSpec.costPrec` -/
   costPrec : Nat := 0
@@ -1417,16 +1567,19 @@ private def parseAmountField (ctx : AmtCtx) (line : Nat) (field : String)
   else if field.startsWith "=" then
     -- balance assignment (amountless posting); lot annotations on the
     -- target are parsed and dropped (1603), and the flags stay false
-    -- (the departure recorded at `PostSpec.fixated`). Its amount teaches
-    -- as an assertion's does, with the departures recorded at the `=`
-    -- branch of `annotLoop`: after `Assets:Cash  $1.00` against an elided
-    -- `Equity` and `Assets:Cash  = $1.0000000` against another, C++
-    -- prints a later `($1/3)` against an elided `Equity` as `$0.3333333`,
-    -- where it shows as 0.33 here (wrong rows)
+    -- (the departure recorded at `PostSpec.fixated`), but for `lotExpr`,
+    -- since C++ keeps the value expression of an annotated target in the
+    -- amount that it computes (textual_xacts.cc:807, 855-858;
+    -- `PostSpec.lotExpr`). Its amount teaches as an assertion's does,
+    -- with the departures recorded at the `=` branch of `annotLoop`:
+    -- after `Assets:Cash  $1.00` against an elided `Equity` and
+    -- `Assets:Cash  = $1.0000000` against another, C++ prints a later
+    -- `($1/3)` against an elided `Equity` as `$0.3333333`, where it shows
+    -- as 0.33 here (wrong rows)
     let r ← parseAmount ctx line (trimS (field.drop 1).toString)
-    let _ ← annotLoop ctx line r.amount r.tail none none
+    let ann ← annotLoop ctx line r.amount r.tail none none
     pure { assignTarget := some r.amount, learned := r.learned
-           decimals := r.decimals
+           decimals := r.decimals, lotExpr := r.amount.comm != "" && ann.lotExpr
            teach := if r.decimals <= 6 then [(r.amount.comm, r.decimals)] else [] }
   else do
     -- a leading lot `{P} AMT` has no witness: C++ rejects the form
@@ -1450,12 +1603,14 @@ private def parseAmountField (ctx : AmtCtx) (line : Nat) (field : String)
     -- Two more forms that C++ rejects are accepted, both fail-open: an
     -- annotation after an amount expression, `(EXPR) {lot}`, which C++
     -- leaves unparsed and reports as an unexpected character
-    -- (textual_xacts.cc:908-910), and a second lot price, date or
-    -- note, which C++ reports as more than one (annotate.cc:157, 193,
-    -- 249). annotLoop reads the first as it reads an annotation on a
-    -- plain amount, and of two lot prices it keeps the first.
-    let { lot, cost, teach, costDecs, annotated, annotDetails, annotDate, fixated,
-          ownLot, perUnit, lotLit, costAnnotated, costLot, costVirtual } ←
+    -- (textual_xacts.cc:908-910), and a second lot price, date, value
+    -- expression or note, which C++ reports as more than one
+    -- (annotate.cc:157, 193, 213-214, 249). annotLoop reads the first as
+    -- it reads an annotation on a plain amount, and of two lot prices it
+    -- keeps the first.
+    let { lot, cost, teach, costDecs, annotated, annotDetails, annotDate, lotExpr,
+          costExpr, fixated, ownLot, perUnit, lotLit, costAnnotated, costLot,
+          costVirtual } ←
       annotLoop ctx line a r.tail preLot none (annotated := preLot.isSome)
         (fixated := preLot.any (·.2)) (ownLot := preLot.isSome)
     -- the precision of the cost amount, for the widened zero test of
@@ -1595,6 +1750,7 @@ private def parseAmountField (ctx : AmtCtx) (line : Nat) (field : String)
            decimals := r.decimals, isExpr := field.startsWith "(", teach
            costDecs, gainVal, annotated := hasComm && annotated
            annotDetails := hasComm && annotDetails, annotDate := hasComm && annotDate
+           lotExpr := hasComm && lotExpr, costExpr
            fixated := hasComm && fixated, costPrec, costAnnotated
            rawCost := cost, rawCostPrec, costVirtual, costLotComm := costLot
            amtPrec }
@@ -1609,7 +1765,12 @@ private def parsePosting (st : St) (line : Nat) (raw : String)
     pure (none, none, none, 0, false, [])
   else if !periodic && (content.startsWith "assert "
       || content.startsWith "check " || content.startsWith "expr ") then
-    -- inline expression check/eval: verified/discarded by the C++ side.
+    -- an inline `assert`, `check` or `expr` line: C++ verifies the first
+    -- two and evaluates the third, for which `finalizeXact` sets
+    -- `St.valueExprAll`. An assignment inside a check, or inside an
+    -- assertion that holds, is a limit that `Result.valueExprAll` states;
+    -- an assertion that fails makes C++ reject the journal
+    -- (textual_xacts.cc:1119-1121), which is accepted here (fail-open).
     -- Only a dated transaction has this branch (parse_xact,
     -- textual_xacts.cc:1107-1125). C++ collects the postings of a
     -- periodic template with parse_posts, which hands every line not
@@ -1630,7 +1791,8 @@ private def parsePosting (st : St) (line : Nat) (raw : String)
                      assignTarget := af.assignTarget, amtDecs := af.decimals
                      costDecs := af.costDecs, gainVal := af.gainVal
                      annotated := af.annotated, annotDetails := af.annotDetails
-                     annotDate := af.annotDate, fixated := af.fixated
+                     annotDate := af.annotDate, lotExpr := af.lotExpr
+                     costExpr := af.costExpr, fixated := af.fixated
                      costPrec := af.costPrec, costAnnotated := af.costAnnotated
                      rawCost := af.rawCost, rawCostPrec := af.rawCostPrec
                      costVirtual := af.costVirtual
@@ -4168,6 +4330,27 @@ private def finalizeXact (st : St) (hline : Nat) (_header : String)
   let st := match uuid? with
     | some u => if dup then st else { st with uuids := u :: st.uuids }
     | none => st
+  -- a note of the transaction or of one of its postings, or an `apply tag`
+  -- in force, can give it the tag `Value` (`namesValueTag`), whose value
+  -- C++ attaches to the amount of each posting that takes it as it adds
+  -- the transaction to the journal (journal.cc:584-585,
+  -- post.cc:1064-1076), a transaction that it then drops for its UUID
+  -- included (journal.cc:593-596); `St.valueExprComms` records the
+  -- commodities of the transaction below (`Result.valueExprComms`)
+  let valueTagged := namesValueTag (noteText _header)
+    || rawPosts.any (fun (_, r) => namesValueTag (noteText r))
+    || st.applyTags.any (·.any namesValueTag)
+  -- an `expr` line of a dated transaction (`parsePosting`), which C++
+  -- evaluates as it reads the transaction, before any look-up of its UUID
+  -- (textual_xacts.cc:1107-1118), in a scope where an assignment defines a
+  -- name that a valuation can call, sets `St.valueExprAll`
+  -- (`Result.valueExprAll`): after `expr market(a, d, t) = 7` as a line of
+  -- a transaction, or of a duplicate of a UUID, `bal -X $` shows 7 for
+  -- every account on both C++ binaries
+  let st := if !periodic && rawPosts.any (fun (_, r) =>
+      (stripStatus (trimS (splitNote r).1)).startsWith "expr ") then
+    { st with valueExprAll := true }
+  else st
   -- parse postings, learning styles as we go; standalone comments
   -- after a posting append to ITS note (append_note, 783/2268), the
   -- ones before any posting to the transaction's
@@ -4203,8 +4386,13 @@ private def finalizeXact (st : St) (hline : Nat) (_header : String)
       match parsePosting stv ln raw periodic with
       | .ok r => pure r
       | .error e =>
+          -- a duplicate of a UUID with a posting that is not read: where
+          -- it can take the tag `Value` (`valueTagged`), the commodities
+          -- that it writes are not all known, and `St.valueExprAll`
+          -- stands for them
           if dup then
-            return { st with priceIssues := ("unread-price", "") :: st.priceIssues }
+            return { st with priceIssues := ("unread-price", "") :: st.priceIssues
+                             valueExprAll := st.valueExprAll || valueTagged }
           else throw e
     -- the decimals of a balance assertion or assignment reach the
     -- commodity named as written, while C++ names it through the
@@ -4348,6 +4536,28 @@ private def finalizeXact (st : St) (hline : Nat) (_header : String)
     if periodic then []
     else ordered.filterMap fun p => (costPrice stv p).map fun (c, pr) =>
       (c, pr, p.noteDate <|> xactNoteDate)
+  -- the commodities that the value expressions of the transaction can
+  -- value (`Result.valueExprComms`): that of each amount or
+  -- balance-assignment target whose own annotation carries one
+  -- (`PostSpec.lotExpr`), a target in its reduced name alone, since C++
+  -- parses it reduced (textual_xacts.cc:757, amount.cc:1905-1908), that of
+  -- each cost whose own annotation carries one (`PostSpec.costExpr`), in
+  -- its reduced name alone, as C++ parses it (textual_xacts.cc:691), and,
+  -- where the transaction can take the tag `Value` (`valueTagged`), every
+  -- commodity of the amounts and costs that it writes and of its flows
+  -- below, since a posting without the tag takes that of its transaction
+  -- (post.cc:88-94). The record of a periodic template is discarded with
+  -- its state (`flushPending`), since C++ adds none of its postings to the
+  -- journal
+  let lotExprComms := ordered.flatMap fun p =>
+    (if p.lotExpr then
+      ((p.rawAmount <|> p.assignTarget).map (valueExprNames stv ·.comm)).getD []
+    else [])
+      ++ (if p.costExpr then (p.rawCost.map (·.comm)).toList else [])
+  let valueComms := lotExprComms ++ (if valueTagged then
+      ordered.flatMap (fun p => (p.rawAmount.map (valueExprNames stv ·.comm)).getD []
+        ++ (p.rawCost.map (·.comm)).toList)
+    else [])
   -- a transaction whose UUID has been seen writes these points alone, to
   -- the state before it (the comment on `dup`), with those of the costs
   -- that its implicit exchange computes and of the lot prices beside them
@@ -4365,6 +4575,20 @@ private def finalizeXact (st : St) (hline : Nat) (_header : String)
         | _ => ([], false)
     let (exPoints, exIssues) := exchangePoints stv ordered cands od xactNoteDate
     let st := recordCostPoints st _header (costPoints ++ exPoints)
+    let st := recordValueExprComms st valueComms
+    -- an automated transaction in force can generate postings in the
+    -- duplicate, in commodities that it does not write, which C++ extends
+    -- with the tag `Value` before it drops the duplicate
+    -- (journal.cc:581-585, 595), in place where their commodity is
+    -- annotated (post.cc:1101-1102), so that `St.valueExprAll` stands for
+    -- them where the duplicate can take the tag: with
+    -- `P 2026/02/01 BBB $170` and a rule `= /Assets:A/` with
+    -- `(Budget)  10 BBB {$150}`, a duplicate under `; Value: 200` of a
+    -- transaction that the rule matches twice makes `bal -X $` show 2000
+    -- for a later `10 BBB {$150}` and 4000 for `Budget` on both C++
+    -- binaries, against $1700 and $3400 without the tag
+    let st := if valueTagged && !st.autos.isEmpty then
+      { st with valueExprAll := true } else st
     return { st with priceIssues := exIssues.reverse ++ st.priceIssues }
   -- assignments: sequential against running balance + this xact so far
   let mut resolved : List PostSpec := []
@@ -4963,6 +5187,8 @@ private def finalizeXact (st : St) (hline : Nat) (_header : String)
       xactNoteDate
   stv := recordCostPoints stv _header (costPoints ++ exPoints)
   stv := { stv with priceIssues := exIssues.reverse ++ stv.priceIssues }
+  stv := recordValueExprComms stv
+    (valueComms ++ if valueTagged then flows.map (·.1.commodity) else [])
   pure { stv with gens := flows :: stv.gens }
 
 /-- Split on a separator word at paren/quote depth zero. -/
@@ -5291,6 +5517,15 @@ private def finalizeAuto (st : St) (rawPosts : List (Nat × String)) :
   | (branches, nm) :: rest => do
       let mut posts : List AutoPost := []
       let mut noteTag := ""
+      -- the value expressions of the rule (`Result.valueExprAll`,
+      -- `Result.valueExprComms`): a line whose note can give the tag
+      -- `Value` to the postings that the rule matches or generates, an
+      -- `expr` or `eval` line (`exprAll`, below), and the commodity of a
+      -- template amount whose own annotation carries one
+      -- (`PostSpec.lotExpr`)
+      let valueAll := rawPosts.any fun (_, raw) => namesValueTag (noteText raw)
+      let mut lotComms : List String := []
+      let mut exprAll := false
       for (ln, raw) in rawPosts do
         let rawT := trimS raw
         if rawT.startsWith ";" then
@@ -5305,7 +5540,30 @@ private def finalizeAuto (st : St) (rawPosts : List (Nat × String)) :
         if content.startsWith "assert " || content.startsWith "check "
             || content.startsWith "expr " || content.startsWith "eval "
             || content.startsWith "note " || content.startsWith "format " then
-          continue  -- checks/eval/metadata: verified or report-time only
+          -- an `expr` or `eval` line, which C++ evaluates against each
+          -- posting that the rule matches (textual_xacts.cc:252-267,
+          -- xact.cc:1505-1508), in a scope where an assignment defines a
+          -- name that a valuation can call, sets `St.valueExprAll`, whether
+          -- the rule matches or not (conservative): under `= /Broker/`,
+          -- `eval market(a, d, t) = 7` makes `bal -X $` show 7 for every
+          -- account on both C++ binaries, and leaves `10 AAPL @ $150` at
+          -- $1700 under a rule that matches nothing. C++ verifies `assert`
+          -- and `check` lines against the same postings (xact.cc:1509-1520):
+          -- an assignment inside a check, or inside an assertion that
+          -- holds, is a limit that `Result.valueExprAll` states, and an
+          -- assertion that fails makes C++ reject the journal, which is
+          -- accepted here (fail-open). An automated transaction has no
+          -- `note` or `format` line in C++, which reads such a line as a
+          -- template posting to an account of that name
+          -- (textual_xacts.cc:268-275), and the line is skipped here: under
+          -- `= /Broker/` with `(Budget)  1`, both C++ binaries reject
+          -- `note something here` and `format %(account)`, which have no
+          -- amount (xact.cc:1529-1531), and `note  1`, whose posting to
+          -- `note` leaves the transaction unbalanced, while each of these
+          -- journals is accepted here (fail-open)
+          if content.startsWith "expr " || content.startsWith "eval " then
+            exprAll := true
+          continue
         let (acctField, amtField) := splitField content
         -- the template keeps its account as written. C++ registers it
         -- when the rule is read, under the `apply account` stack and
@@ -5371,15 +5629,20 @@ private def finalizeAuto (st : St) (rawPosts : List (Nat × String)) :
               -- C++ derives from the lot price (xact.cc:1613-1627)
               let ann ← annotLoop st.amt ln r.amount r.tail none none
               let ownLot := ann.ownLot && r.amount.comm != ""
+              if ann.lotExpr && r.amount.comm != "" then
+                lotComms := lotComms ++ valueExprNames st
+                  ((st.commAliases.lookup r.amount.comm).getD r.amount.comm)
               posts := { account := name, kind, fixed := some r.amount, mult := 1
                          cost := ann.cost
                          costPrec := if ann.perUnit then ann.costDecs + r.decimals
                            else ann.costDecs
                          lotUnit := if ownLot then ann.lot.map (·.1) else none
                          lotTotal := ownLot && ann.lotLit.any (·.2) } :: posts
+      let st := recordValueExprComms st lotComms
       pure { st with
         autos := st.autos ++ [⟨branches, posts.reverse, nm, true, noteTag⟩]
-        autoPred := rest }
+        autoPred := rest
+        valueExprAll := st.valueExprAll || valueAll || exprAll }
 
 /-! ## Directives -/
 
@@ -5890,8 +6153,15 @@ private def handleDirective (st : St) (n : Nat) (t : String) :
       -- written, where C++ names the resolved path.
       if restS.isEmpty then err n "directive 'include' requires an argument"
       else err n s!"file to include was not found: {restS}"
-  | "define" => defineDirective st restS
-  | "def" => defineDirective st restS
+  | "define" | "def" =>
+      -- C++ reads `def` and `define`, as it reads `expr` and `eval`, with
+      -- `eval_directive`, which evaluates the text in the scope of the
+      -- report (textual_directives.cc:911-914, 1081-1094; journal.cc:718-719,
+      -- global.cc:99), where it can define a function that a valuation
+      -- calls, so that each of the four sets `St.valueExprAll`
+      -- (`Result.valueExprAll`)
+      let st ← defineDirective st restS
+      pure { st with valueExprAll := true }
   | "P" =>
       -- price observations: plain `bal` never converts, but an
       -- unseen price commodity picks up a TENTATIVE precision from
@@ -6020,8 +6290,22 @@ private def handleDirective (st : St) (n : Nat) (t : String) :
       pure { st with defaultYear := restS.toNat?.map Int.ofNat }
   | "assert" => pure st  -- checked by the C++ side; positive tests pass
   | "check" => pure st
-  | "eval" => pure st    -- side-effect-free in the positive corpus
-  | "value" => pure st   -- valuation expression: reports only
+  | "expr" | "eval" =>
+      -- no flows. C++ reads both words, as it reads `define` and `def`,
+      -- with `eval_directive` (textual_directives.cc:1091-1092), and the
+      -- flag is set as it is for those (the arm above). The text is not
+      -- read here as `defineDirective` reads that of `define`, so that a
+      -- name that it defines is unknown to a later amount expression, a
+      -- departure that fails closed: after `expr x = $5`, both C++
+      -- binaries read `Assets:A  (x * 2)` against `Equity` as $10, as they
+      -- do after `define x = $5`, and the engine rejects the journal for
+      -- the unknown variable `x`
+      pure { st with valueExprAll := true }
+  | "value" =>
+      -- the value expression of the journal, which C++ gives each posting
+      -- read after it that no other expression values
+      -- (textual_directives.cc:935-936, post.cc:1091-1092): no flows
+      pure { st with valueExprAll := true }
   | "import" => pure st  -- python import: only reachable in _py tests
   | "payee" => pure st   -- payee declarations: labels only
   | "capture" =>
@@ -6071,8 +6355,6 @@ private def handleDirective (st : St) (n : Nat) (t : String) :
           | none => pure st
         else
           pure st
-      else if word == "expr" || word == "eval" then
-        pure st          -- evaluate-and-discard
       else if word.startsWith "P" then
         -- C++ reads a line that begins with `P` and holds no word
         -- directive as a price directive, from the first character after
@@ -6331,6 +6613,188 @@ structure Result where
       cost, of a journal that C++ reads, either writes to the table the
       point that C++ records or has an entry here -/
   priceIssues : List (String × String)
+  /-- the commodities that a value expression can value, each once, in
+      the order in which they are first recorded. C++ values an amount
+      through a value expression before it consults the price graph: the
+      expression of the annotation of the amount's commodity, unless a
+      fixated lot price comes first (annotate.cc:400-405, 417-418), and
+      otherwise that of the commodity itself (commodity.cc:206-207). As
+      it adds each posting of a transaction to the journal it gives the
+      annotation of the posting's amount, where that holds no expression,
+      the first that it finds among the value of the posting's `Value`
+      tag, the expression of its account, the account expression of the
+      journal, that of its commodity, the commodity expression of the
+      journal and the expression of the journal (`extend_post`,
+      post.cc:1056-1105; journal.cc:584-585), and it does so in place
+      where the amount's commodity is annotated already, so that every
+      amount of that annotated commodity takes the expression: with
+      `P 2026/02/01 AAPL $170`, after `10 AAPL @ $150` on 2026/01/05, a
+      second `10 AAPL @ $150` on that day with `; Value: 200` makes
+      `bal -X $` at 2026/03/01 show 2000 for each of the two postings, on
+      both C++ binaries. C++ can thus value an amount of a commodity of
+      this list, and where `valueExprAll` holds an amount of any
+      commodity, through an expression rather than through the dated
+      price table (`prices`). The commodity of a posting amount, of a
+      template amount and of a `commodity` block is named through the
+      commodity aliases, and is recorded again reduced through the
+      commodity equivalences where that differs (`valueExprNames`); that
+      of the target of a balance assignment, which C++ parses reduced
+      (textual_xacts.cc:757, amount.cc:1905-1906), and that of a cost or
+      of a flow, which the engine keeps reduced, appear in their reduced
+      names alone. The null commodity is never recorded
+      (`recordValueExprComms`). The list holds:
+      - the commodity of a posting amount whose own annotation carries a
+        value expression, and of the target of a balance assignment
+        whose own annotation carries one, which C++ keeps in the amount
+        that it computes (`PostSpec.lotExpr`), and that of a fixed
+        amount of a template posting of an automated transaction that
+        carries one, which C++ keeps on every posting generated from the
+        template (xact.cc:1545-1549): under `= /Broker/` with
+        `(Budget)  10 AAPL ((200))`, `bal -X $` shows 2000 for `Budget` on
+        both C++ binaries;
+      - the commodity of a cost whose own annotation carries a value
+        expression, which C++ adds to the balance of the transaction in
+        that annotated commodity, so that an elided posting or the
+        bucket's takes the expression (`PostSpec.costExpr`): with
+        `P 2026/02/01 EUR $1.1`, `bal -X $` shows -280000 for an elided
+        `Assets:Cash` against `10 AAPL @ 140 EUR ((200))` on both C++
+        binaries. The cost of a template posting of an automated
+        transaction records nothing, since C++ generates the posting after
+        the transaction balances (journal.cc:576-581): under `= /Broker/`,
+        `(Budget)  5 XYZ @ 3 EUR ((200))` leaves `Budget` at $15;
+      - the commodity of a `commodity` block with a `value`
+        subdirective, whose expression C++ reads wherever the block
+        stands: `commodity AAPL` with `value 200` makes `bal -X $` show
+        2000 for `10 AAPL @ $150` written before it as after it;
+      - every commodity of a transaction with a date in which a note of
+        the transaction or of one of its postings, or the text of an
+        `apply tag` in force, holds `value:` in any case and so can set
+        the tag `Value` (`namesValueTag`), which a posting without one of
+        its own takes from its transaction (post.cc:88-94): the
+        commodities of its flows and of the amounts and costs that it
+        writes. With `P 2026/02/01 AAPL $170`, `bal -X $` shows 2000 for
+        `10 AAPL @ $150` under `; Value: 200` as the note of its posting,
+        of a line after it, of the header or of a line before the
+        postings, under `; value: 200` and under `apply tag Value: 200`,
+        $20 under `; Value:: $20`, an amount that C++ divides by the
+        quantity (post.cc:1070-1073), 2000 for an elided posting under
+        `; Value: 200` that `-10 AAPL` completes, and $1700 under
+        `; Value:` with no value, on both C++ binaries. C++ attaches the
+        value of the tag to the postings of a transaction dropped for its
+        UUID before it drops it (journal.cc:576-596), so that a kept
+        posting of the same annotated commodity takes it, and such a
+        transaction records the commodities of the amounts and costs that
+        it writes; where it holds a posting that `parsePosting` does not
+        read, or where an automated transaction is in force, whose
+        postings C++ generates in it before it drops it
+        (journal.cc:581-585), `valueExprAll` is set in place of
+        commodities that are not all known.
+
+      A periodic template records nothing, since C++ adds none of its
+      postings to the journal (`flushPending`): a template of
+      `10 AAPL @ $150  ; Value: 200`, or of `10 AAPL {$150} ((200))`,
+      leaves a later `10 AAPL @ $150`, or `10 AAPL {$150}`, at $1700. The
+      list leaves out the commodity of a price directive whose price is
+      an expression, which C++ makes the value expression of the
+      commodity where the expression yields more than one commodity
+      (pool.cc:589-614, test/regress/1101.test), since every such
+      directive carries the issue `price-expr` in place of its point
+      (`priceIssues`). C++ parses each of these expressions as it reads
+      it and rejects one that it cannot read, as `((x--))`, `value x--`
+      in a `commodity` block and `; Value: x--` on both C++ binaries,
+      while the engine reads each such journal (fail-open). The list can
+      also miss a smaller unit of a commodity that it names: C++ values an
+      amount whose commodity has no price through each of its larger
+      units in turn (amount.cc:1301-1320), and so through the expression
+      of a larger unit (commodity.cc:206-207), while `valueExprNames`
+      reduces a name only through the equivalences read before it is
+      recorded. After `commodity KB` with `value 200` and then
+      `C 1 KB = 1024 B`, `bal -X $` shows 200 for `(Assets:A)  1 KB`, a
+      flow of 1024 B here, on both C++ binaries, and the list names KB
+      alone, where it names KB and B when the `C` directive comes first;
+      `equivs` holds the equivalence in either case -/
+  valueExprComms : List String
+  /-- a value expression that can value any commodity has been read: a
+      `value` directive, which sets the expression of the journal
+      (textual_directives.cc:935-936, 1131-1132); a `value` subdirective of
+      an `account` block, which sets that of the account
+      (textual_directives.cc:647-648, 739-740); an `eval` or `expr`
+      subdirective of an `account` block, which C++ evaluates at once in a
+      scope that passes each definition on to that of the report
+      (textual_directives.cc:677-681, scope.h:250-254), as it evaluates the
+      directives below; an automated transaction a line of which holds
+      `value:` in any case (`namesValueTag`), whose notes C++ gives to each
+      posting that it matches and to those that it generates
+      (xact.cc:1496-1503, 1658-1667), in any commodity, a virtual posting
+      that `applyAutos` does not match among them; a `define`, `def`, `expr`
+      or `eval` directive, which C++ evaluates in the scope of the report,
+      where it can define a function that a valuation calls
+      (textual_directives.cc:911-914, 1081-1094; journal.cc:718-719,
+      global.cc:99); an `expr` line of a transaction with a date, which C++
+      evaluates as it reads the transaction (textual_xacts.cc:1107-1118),
+      and an `expr` or `eval` line of an automated transaction, which it
+      evaluates against each posting that the rule matches
+      (xact.cc:1505-1508); a check-in or check-out line of a timelog whose
+      note holds `value:` in any case, since C++ gives the transaction that
+      it makes of the entry the note of one of the two
+      (timelog.cc:52-53, 138-139); and a transaction dropped for its UUID
+      that can take the tag `Value`, where it holds a posting that
+      `parsePosting` does not read or where an automated transaction is in
+      force (`valueExprComms`). With `P 2026/02/01 AAPL $170`, `bal -X $` at
+      2026/03/01 shows 2000 for `10 AAPL @ $150` after `value 200` and under
+      `account Assets:Broker` with `value 200`, 2000 for a virtual
+      `(Assets:Broker)  10 AAPL` under `= /Broker/` with `; Value: 200` and
+      `(Budget)  1`, and 200 for the holding under `expr Value = 200` as a
+      line of its transaction or of a rule that matches it, an amount that
+      C++ divides by the quantity (post.cc:1070-1073), while after
+      `define market(a, d, t) = 7`, or the same text after `def`, `expr` or
+      `eval`, after `account Assets:Other` with `eval market(a, d, t) = 7` or
+      `expr market(a, d, t) = 7`, after the same `expr` line in a
+      transaction and under `= /Broker/` with `eval market(a, d, t) = 7`, it
+      shows 7 for every account, and with `P 2026/02/01 s $0.01` it shows
+      1440000 for a timelog entry of two hours checked in under
+      `; Value: 200`, on both C++ binaries. The flag is set wherever such a
+      source stands and whatever it defines (conservative): `value 200`
+      after the transaction, which C++ gives no posting read before it
+      (post.cc:1091-1092), `define x = 5` and an `expr` line of a rule that
+      matches nothing leave the holding at $1700. An in-file `--value-expr`,
+      `--account-value-expr` or `--commodity-value-expr` line sets nothing,
+      since C++ gives the journal these options before it reads any file
+      (session.cc:210-217, 240-262): `--value-expr 200` in the journal
+      leaves the holding at $1700 on both C++ binaries. Given on the command
+      line of C++, as test/baseline/opt-value-expr.test gives
+      `--value-expr`, these options give postings a value expression
+      (post.cc:1082-1092), and the engine, which does not read that command
+      line, records nothing for them.
+
+      An assignment in another expression that C++ evaluates as it reads the
+      journal defines a name as well, and is not recorded. On both C++
+      binaries, `check market(a, d, t) = 7`, or
+      `assert (market(a, d, t) = 7) | 1`, an assertion that holds, as a
+      directive, as a subdirective of an `account` block, which C++
+      evaluates against each posting to the account
+      (textual_directives.cc:656-676), or of a `tag` block, which it
+      evaluates against each item that carries the tag
+      (textual_directives.cc:901-904, journal.cc:463-472), or as a line of
+      a transaction, or of an automated transaction, which it evaluates
+      against each posting that the rule matches (xact.cc:1505-1520),
+      `= expr 'market(a, d, t) = 7'` as the predicate of an automated
+      transaction, and `Foo:: market(a, d, t) = 7` as a note of a
+      transaction, of an `account` block or of a posting of a periodic
+      template, or as the text of an `apply tag`, each make `bal -X $` show
+      7 for every account, while such a block of an account that no
+      posting names, or such a line of a rule that matches nothing, leaves
+      the holding at $1700. The engine reads each of these journals, and a
+      valuation that relies on this record fails open there; it rejects an
+      amount expression that assigns, such as
+      `((market(a, d, t) = 7) + $-1500)`, for its unknown name. An
+      assertion that fails, as `assert market(a, d, t) = 7` does in each of
+      the five places named for a check, since a definition yields null
+      (op.cc:250-268), makes C++ reject the journal
+      (textual_directives.cc:922-924, textual_xacts.cc:1119-1121,
+      xact.cc:1509-1511, journal.cc:477-479), which is accepted here,
+      since the engine evaluates no such assertion (fail-open) -/
+  valueExprAll : Bool
 
 private def flushPending (st : St) : Except String St := do
   match st.pending with
@@ -6910,12 +7374,35 @@ def run (input0 : String) (dcDefault : Bool := false)
             -- account_default_directive ignores any argument
             -- (textual_directives.cc:649-650)
             st := { st with bucket := some name }
-          -- tag lines and the note, value, assert, check, eval and expr
-          -- subdirectives: labels, report-time only, or verified by the
-          -- C++ side (953)
+          else if kw == "value" then
+            -- the value expression of the account, which C++ gives the
+            -- amount of each posting to the account read after it, in any
+            -- commodity, where the amount carries no expression and the
+            -- posting takes none from a `Value` tag
+            -- (textual_directives.cc:647-648, 739-740; post.cc:1061-1080):
+            -- no flows
+            st := { st with valueExprAll := true }
+          else if kw == "eval" || kw == "expr" then
+            -- C++ evaluates the argument at once, in a scope bound to the
+            -- account whose `define` passes each definition on to the
+            -- scope of the report (textual_directives.cc:677-681,
+            -- scope.h:250-254), as it evaluates an `eval` or `expr`
+            -- directive (`handleDirective`): after `account Assets:Other`
+            -- with `eval market(a, d, t) = 7`, `bal -X $` shows 7 for
+            -- every account on both C++ binaries. No flows
+            st := { st with valueExprAll := true }
+          -- tag lines and the note, assert and check subdirectives:
+          -- labels, or verified by the C++ side (953) against each posting
+          -- to the account (textual_directives.cc:656-676); an assignment
+          -- in a check, or in an assertion that holds, is a limit that
+          -- `Result.valueExprAll` states
           continue
-      | .commBlock comm =>
+      | .commBlock comm sym =>
           let body := trimS t
+          -- the keyword ends at the first space or tab (next_element,
+          -- textual_directives.cc:822-823), as in an `account` block
+          let kw := String.ofList
+            (body.toList.takeWhile fun c => c != ' ' && c != '\t')
           if body.startsWith "alias " then
             -- the alias name now denotes the block's commodity
             -- (textual_directives.cc:844-849). Where the name already
@@ -6951,6 +7438,22 @@ def run (input0 : String) (dcDefault : Bool := false)
                 -- formats may show styles we infer elsewhere; the C++
                 -- side still validates the journal itself
                 pure ()
+          else if kw == "value" then
+            -- the value expression of the commodity, which C++ reads
+            -- whenever it values an amount of it, wherever the block
+            -- stands (textual_directives.cc:830-831, 852-853;
+            -- commodity.cc:206-207; post.cc:1085-1086): no flows. It is
+            -- recorded under the block's name as this reader keeps it,
+            -- and under the symbol that C++ reads from the directive text
+            -- (`commodityDirectiveSymbol`), which differs where this
+            -- reader keeps text after the symbol, as in
+            -- `commodity AAPL ; note`, each named through the commodity
+            -- aliases (`Result.valueExprComms`); for `commodity "AAPL 2"`
+            -- both are `AAPL 2`, the one commodity that both C++ binaries
+            -- value through the block's `value 200`
+            let names := [comm, sym].map
+              fun c => (st.commAliases.lookup c).getD c
+            st := recordValueExprComms st (names.flatMap (valueExprNames st ·))
           let _ := comm
           continue
       | .ignoreBlock => continue
@@ -6985,6 +7488,25 @@ def run (input0 : String) (dcDefault : Bool := false)
           err n "cannot double check-in to the same account"
         st := { st with
           clockIn := st.clockIn ++ [(secs, acct, payee?.getD "")] }
+        -- C++ gives the transaction that it makes of the entry the note of
+        -- the check-in line, or, where that has none, that of the check-out
+        -- line (timelog.cc:52-53, 138-139), parsing its tags, and gives each
+        -- posting of it, the bucket's included, the value of its tag `Value`
+        -- as it adds it to the journal (timelog.cc:93, journal.cc:584-585),
+        -- while an `apply tag` does not reach it: with
+        -- `P 2026/02/01 s $0.01`, `bal -X $` shows 1440000 for `Work` after
+        -- `i 2026/01/05 10:00:00 Work  Client  ; Value: 200` and a check-out
+        -- at 12:00, or after a check-in without a note and
+        -- `o 2026/01/05 12:00:00 Work  Client  ; Value: 200`, on both C++
+        -- binaries, and $72.00 without the note or under
+        -- `apply tag Value: 200`. A check-in or check-out line whose note can
+        -- give the tag a value (`namesValueTag`) sets `St.valueExprAll`
+        -- (`Result.valueExprAll`), conservative where C++ reads no note from
+        -- the line, as where no payee precedes the `;`
+        -- (textual_directives.cc:92-99, 121-128), and where it keeps the
+        -- note of the check-in line in place of that of the check-out line
+        if namesValueTag (noteText t) then
+          st := { st with valueExprAll := true }
       else if t.startsWith "o " || t.startsWith "O " then
         let body := (splitNote (trimS (t.drop 2).toString)).1
         let dateS := String.ofList (body.toList.takeWhile (· != ' '))
@@ -6993,6 +7515,10 @@ def run (input0 : String) (dcDefault : Bool := false)
         let rest2 := trimS (rest1.drop timeS.length).toString
         let (named, desc?) := splitField rest2
         let stop ← parseDateTime n dateS timeS
+        -- a note that can give the tag `Value` a value: the comment on the
+        -- check-in branch above
+        if namesValueTag (noteText t) then
+          st := { st with valueExprAll := true }
         -- clock_out_from_timelog: a single open entry closes no
         -- matter what account the o line names (723); with several,
         -- the entry is the one whose check-in named the account that
@@ -7103,7 +7629,8 @@ def run (input0 : String) (dcDefault : Bool := false)
         st := { st with pending := .acctBlock [(0, nm)] }
       else if t.startsWith "@commodity " || t.startsWith "!commodity " then
         let nm := trimS (t.drop "@commodity ".length).toString
-        st := { st with pending := .commBlock ((unquote nm).getD nm) }
+        let sym := commodityDirectiveSymbol nm
+        st := { st with pending := .commBlock ((unquote nm).getD nm) sym }
       else if t.startsWith "account " || t.startsWith "account\t" then
         -- account_directive registers the block's name under the
         -- `apply account` stack, unless an alias fires
@@ -7116,7 +7643,8 @@ def run (input0 : String) (dcDefault : Bool := false)
         st := { st with pending := .acctBlock [(0, nm)] }
       else if t.startsWith "commodity " || t.startsWith "commodity\t" then
         let nm := trimS (t.drop "commodity ".length).toString
-        st := { st with pending := .commBlock ((unquote nm).getD nm) }
+        let sym := commodityDirectiveSymbol nm
+        st := { st with pending := .commBlock ((unquote nm).getD nm) sym }
       else if t.startsWith "payee " || t.startsWith "tag " then
         st := { st with pending := .ignoreBlock }  -- label declarations
       else if t.startsWith "@" || t.startsWith "!" then
@@ -7149,7 +7677,8 @@ def run (input0 : String) (dcDefault : Bool := false)
   | none => pure ()
   pure ⟨st.gens.reverse, st.rewrites, st.equivs, st.precisions,
         st.amt.styles, st.flowStats, st.signStats, st.lotFanout,
-        priceTable st.priceLog, st.primary.reverse, st.priceIssues.reverse⟩
+        priceTable st.priceLog, st.primary.reverse, st.priceIssues.reverse,
+        st.valueExprComms.reverse, st.valueExprAll⟩
 
 /-- Apply report-time account rewrites (`account-rewrite`,
     `capture`) to a name. -/
