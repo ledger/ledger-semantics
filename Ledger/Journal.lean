@@ -394,10 +394,10 @@ private def takeBalanced (opn cls : Char) : List Char → Option (List Char × L
 /-- Consume the annotation/cost/assertion tail of an amount:
     `{lot} [date] (note) @ P / @@ T / = ASSERT` in any order. -/
 private partial def annotLoop (ctx : AmtCtx) (line : Nat) (a : Amount)
-    (tail : String) (lot : Option (Amount × Bool)) (cost : Option Amount)
+    (tail : String) (lot : Option (Amount × Bool × Nat)) (cost : Option Amount)
     (teach : List (String × Nat) := []) (afterCost : Bool := false)
     (costDecs : Nat := 0) :
-    Except String (Option (Amount × Bool) × Option Amount ×
+    Except String (Option (Amount × Bool × Nat) × Option Amount ×
       List (String × Nat) × Nat) := do
   let t := trimS tail
   if t.isEmpty || t == "." then
@@ -428,7 +428,7 @@ private partial def annotLoop (ctx : AmtCtx) (line : Nat) (a : Amount)
       if afterCost then lot
       else match lot with
         | some l => some l
-        | none => some (lotAmt, fixated)
+        | none => some (lotAmt, fixated, pr.decimals)
     annotLoop ctx line a (String.ofList rest) lot' cost teach afterCost costDecs
   else if t.startsWith "[" then
     match takeBalanced '[' ']' t.toList with
@@ -501,35 +501,39 @@ private def parseAmountField (ctx : AmtCtx) (line : Nat) (field : String) :
             let innerS := if innerS.startsWith "=" then
                 trimS (innerS.drop 1).toString else innerS
             let pr ← parseAmount ctx line innerS
-            pure (some pr.amount, trimS (String.ofList rest))
+            pure (some (pr.amount, pr.decimals), trimS (String.ofList rest))
         | none => err line s!"unclosed leading lot in '{field}'"
       else pure (none, field)
     let r ← parseAmount ctx line field
     let a := r.amount
     let (lot, cost, teach, costDecs) ←
-      annotLoop ctx line a r.tail (preLot.map (·, true)) none
+      annotLoop ctx line a r.tail (preLot.map fun (p, d) => (p, true, d)) none
     -- xact.cc phase 4/6: a fixated lot with no cost derives the cost
-    -- from the annotation; a lot WITH a cost books the rounded
-    -- gain/loss (basis - cost, rounded at commodity precision plus
-    -- the amount's decimals) into the effective cost
+    -- from the annotation; a lot WITH a cost books the gain/loss
+    -- (basis - cost) into the effective cost, so the posting balances
+    -- at its lot basis exactly, whatever display precision the
+    -- commodity has learned (regress/3258, regress/1773).  C++ rounds
+    -- away only the residue of a per-unit price that it rounded out of
+    -- a total (regress/2975); `{{TOTAL}}` divides exactly here, so
+    -- this model has no such residue
     let gainVal := match lot, cost with
-      | some (p, _), some c =>
-          if p.comm == c.comm then
-            let gl := (p.q * a.q) - c.q
-            some (Amount.mk c.comm
-              (roundAt ((ctx.precs.lookup c.comm).getD 0 + r.decimals) gl))
+      | some (p, _, _), some c =>
+          if p.comm == c.comm then some (Amount.mk c.comm ((p.q * a.q) - c.q))
           else none
       | _, _ => none
     let costVal := match lot, cost with
-      | some (p, _), some c =>
-          if p.comm == c.comm then
-            let basis := p.q * a.q
-            let gl := basis - c.q
-            let glR := roundAt ((ctx.precs.lookup c.comm).getD 0 + r.decimals) gl
-            some (Amount.mk c.comm (c.q + glR))
+      | some (p, _, _), some c =>
+          if p.comm == c.comm then some (Amount.mk c.comm (p.q * a.q))
           else some c
       | _, _ => cost
-    let lotVal := lot.map fun (p, _) => Amount.mk p.comm (p.q * a.q)
+    -- absorbing a nonzero gain widens the cost to the decimals of the
+    -- lot basis, and COST_PREC tagging reads the widened cost
+    -- (xact.cc `*post->cost += gain_loss`, regress/1773)
+    let costDecs := match lot, gainVal with
+      | some (_, _, lotDecs), some g =>
+          if g.q != 0 then max costDecs (lotDecs + r.decimals) else costDecs
+      | _, _ => costDecs
+    let lotVal := lot.map fun (p, _, _) => Amount.mk p.comm (p.q * a.q)
     pure (some a, costVal, lotVal, none, r.learned, r.decimals,
           field.startsWith "(", teach, costDecs, gainVal)
 

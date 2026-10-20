@@ -118,9 +118,10 @@ citing the regression test or the C++ source location that forced
 it. These conventions cover number parsing, display precision,
 automated transactions, commodity equivalences, and balancing
 tolerances, and a few of them depart from the exact-rounding rule in
-witnessed places. One example is the rounded gain that a posting
-carrying both a lot price and a cost books into its effective cost,
-and the code marks each such departure with the test that pins it.
+witnessed places. One example is the balancing tolerance that accepts
+a transaction whose residual is explained by rounding each per-unit
+cost to the precision in which it was written, and the code marks
+each such departure with the test that pins it.
 This layer is considerably larger than the theory, which is itself a
 lesson worth having in writing: the invariants of double-entry
 accounting are small, while the surface conventions of twenty years
