@@ -103,6 +103,34 @@ theorem netFlow_trial_balance (flows : S.Gen → Account → ℚ)
   | tensor f g ihf ihg => simp [netFlow, Finset.sum_add_distrib, ihf, ihg]
   | add f g ihf ihg => simp [netFlow, Finset.sum_add_distrib, ihf, ihg]
 
+/-- The value at rational prices `p` of a term's flows over a list of
+    accounts: the sum, over `accts`, of each account's net flow times
+    the price of its commodity, computed as `netFlow` is, with plain
+    functions and exact rationals. An account listed twice is counted
+    twice, and an account not listed is not counted. Over a list
+    without duplicates that holds every account at which the term's
+    flow is nonzero, and when the flows of the generators are vectors
+    of `PacioliGroup` read pointwise (as the flows `flowsFor` of
+    `Driver` are, by `coe_flowsFin`), it is `priceDot`, the scalar
+    product of the price vector with the term's ledger-wide property
+    vector, which is Ellerman's valuation of property at a price
+    vector (p. 498). The join module `Ledger/Market.lean` proves this
+    as `netValue_eq_priceDot`, so that this module, which is on the
+    oracle's run path, need not import `Ledger/PriceVector.lean`. -/
+def netValue (flows : S.Gen → Account → ℚ) (accts : List Account)
+    (p : Commodity → ℚ) {A B : Object} (f : S.FreeMor A B) : ℚ :=
+  (accts.map fun a => netFlow flows f a * p a.commodity).sum
+
+/-- The value at rational prices `p` of a term's flows at the accounts
+    of `accts` named `n`: `netValue` over those accounts alone. Under
+    the conditions on `accts` and on the flows stated for `netValue`,
+    it is `valueHom`, the value of account name `n`'s property vector,
+    as Ellerman values the assets vector of p. 498; the join module
+    `Ledger/Market.lean` proves this as `netValueAt_eq_valueHom`. -/
+def netValueAt (flows : S.Gen → Account → ℚ) (accts : List Account)
+    (p : Commodity → ℚ) (n : AccountName) {A B : Object} (f : S.FreeMor A B) : ℚ :=
+  netValue flows (accts.filter fun a => a.name = n) p f
+
 end GenSpec
 
 /-! ## The demo journal (`test/semantic/demo.dat`) -/
