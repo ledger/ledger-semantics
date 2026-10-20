@@ -1159,8 +1159,11 @@ private def compileConj (st : St) (n : Nat) (conj : List String) :
       | .ok rx => spec := { spec with commentRx := some rx }
       | .error e => err n e
     else if term.startsWith "commodity ==" then
+      -- the commodity's symbol, or that symbol in the double quotes a
+      -- journal writes around one that needs them (regress/3241;
+      -- value.cc: find_named_commodity)
       let r := unquoteAny (trimS (term.drop "commodity ==".length).toString)
-      spec := { spec with commodityEq := some r }
+      spec := { spec with commodityEq := some ((unquote r).getD r) }
     else if term.startsWith "account =~" then
       let r := unslash (trimS (term.drop "account =~".length).toString)
       match compileRegex r with
