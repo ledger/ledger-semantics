@@ -1605,8 +1605,10 @@ def run (input0 : String) (dcDefault : Bool := false)
             continue
           else if body.startsWith "format " then
             -- the format subdirective DECLARES the display precision
-            -- and locks it against migration (opt-round, 1795, 628)
-            let sample := trimS (body.drop "format ".length).toString
+            -- and locks it against migration (opt-round, 1795, 628);
+            -- it may spell the block's symbol bare (3312)
+            let sample :=
+              quoteBareSymbol (trimS (body.drop "format ".length).toString) comm
             match (parseAmount st.amt n sample) with
             | .ok r =>
                 st := lockPrecision st
