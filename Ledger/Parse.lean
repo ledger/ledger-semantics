@@ -314,6 +314,46 @@ def resolveCommodity (line : Nat) (raw : String) : Except String String := do
       if validCommodity raw then pure raw
       else err line s!"malformed commodity '{raw}'"
 
+/-- Does an amount have to quote this symbol? The C++ table, not this
+    reader's `validCommodity`: commodity.cc `invalid_chars`, the
+    characters that end a bare symbol there. -/
+def symbolNeedsQuotes (s : String) : Bool :=
+  s.toList.any fun c =>
+    c.isDigit || c == ' ' || c == '\t' || c == '\n' || c == '\r'
+      || c.toNat == 127 || "!&()*+,-./:;<=>?@[]^{|}~".toList.contains c
+
+/-- Would a bare symbol and a number that meet at characters `a` and
+    `b` run together? Only when both are characters `parse_quantity`
+    reads as part of a number (amount.cc). -/
+def runsTogether (a b : Char) : Bool :=
+  let inNumber (c : Char) : Bool :=
+    c.isDigit || c == '.' || c == ',' || c == '\''
+  inNumber a && inNumber b
+
+/-- A `format` sample may spell its block's symbol bare, as the
+    `commodity` header does, though an amount must quote it:
+    `commodity N1` with `format 1,000.00 N1` (regress/3312;
+    textual_directives.cc `quote_bare_symbol`). The bare symbol is
+    quoted at either end of the sample, unless the sample quotes
+    already or the symbol runs into the number (`N11,000.00`), where
+    nothing marks where it ends. -/
+def quoteBareSymbol (sample sym : String) : String :=
+  if !symbolNeedsQuotes sym || sample.contains '"' then sample else
+  let s := sample.toList
+  let y := sym.toList
+  let n := y.length
+  let quoted := "\"" ++ sym ++ "\""
+  let touches (a b : Option Char) : Bool :=
+    match a, b with
+    | some a, some b => runsTogether a b
+    | _, _ => false
+  if s.take n == y && !touches y.getLast? (s.drop n).head? then
+    quoted ++ String.ofList (s.drop n)
+  else if s.length > n && s.drop (s.length - n) == y
+      && !touches (s.take (s.length - n)).getLast? y.head? then
+    String.ofList (s.take (s.length - n)) ++ quoted
+  else sample
+
 /-! ## Amounts -/
 
 /-- Style/definition context threaded through amount parsing. -/
