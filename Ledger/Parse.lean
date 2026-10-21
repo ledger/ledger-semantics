@@ -297,6 +297,41 @@ def unquote (s : String) : Option String :=
       else none
   | _ => none
 
+/-- The commodity that a `commodity` header names: a quoted symbol up
+    to its closing quote, or else the leading run of characters up to
+    whitespace or a `;`, which begins a comment. As in an amount, a
+    backslash puts the character after it into the run, so `A\;B` names
+    `A;B`, and the rest of the line is ignored (C++
+    `commodity_t::parse_symbol(char*&)`, regress/3313). -/
+def headerSymbol (s : String) : String :=
+  match s.toList with
+  | '"' :: rest => String.ofList (rest.takeWhile (· != '"'))
+  | cs =>
+      let rec go : List Char → List Char
+        | [] => []
+        | '\\' :: c :: rest => c :: go rest
+        | c :: rest =>
+            if c == ' ' || c == '\t' || c == ';' then [] else c :: go rest
+      String.ofList (go cs)
+
+/-- Cut the comment from the argument of a commodity block's `alias`
+    line. It begins at the first `;` that is neither inside a quoted
+    symbol nor escaped with a backslash, the only places that a
+    commodity symbol can hold one (C++ `strip_commodity_comment` in
+    textual_directives.cc, regress/3313_2). -/
+def stripCommodityComment (s : String) : String :=
+  let rec go (quoted : Bool) : List Char → List Char
+    | [] => []
+    | '"' :: rest => '"' :: go (!quoted) rest
+    | ';' :: rest => if quoted then ';' :: go quoted rest else []
+    | '\\' :: rest =>
+        if quoted then '\\' :: go quoted rest
+        else match rest with
+          | c :: rest' => '\\' :: c :: go quoted rest'
+          | [] => ['\\']
+    | c :: rest => c :: go quoted rest
+  String.ofList (go false s.toList)
+
 /-- Time-unit commodities canonicalize to seconds. -/
 def timeFactor (s : String) : Option ℚ :=
   if s == "s" then some 1
