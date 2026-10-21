@@ -1599,7 +1599,9 @@ def run (input0 : String) (dcDefault : Bool := false)
       | .commBlock comm =>
           let body := trimS t
           if body.startsWith "alias " then
-            let al := trimS (body.drop "alias ".length).toString
+            -- a `;` outside quotes begins a comment (regress/3313_2)
+            let al := trimS (stripCommodityComment
+              (body.drop "alias ".length).toString)
             let al := (unquote al).getD al
             st := { st with commAliases := (al, comm) :: st.commAliases }
             continue
@@ -1749,14 +1751,17 @@ def run (input0 : String) (dcDefault : Bool := false)
         let nm := trimS (t.drop "@account ".length).toString
         st := { st with pending := .acctBlock [(0, (unquote nm).getD nm)] }
       else if t.startsWith "@commodity " || t.startsWith "!commodity " then
+        -- read as a plain `commodity` header (regress/3313)
         let nm := trimS (t.drop "@commodity ".length).toString
-        st := { st with pending := .commBlock ((unquote nm).getD nm) }
+        st := { st with pending := .commBlock (headerSymbol nm) }
       else if t.startsWith "account " || t.startsWith "account\t" then
         let nm := trimS (t.drop "account ".length).toString
         st := { st with pending := .acctBlock [(0, (unquote nm).getD nm)] }
       else if t.startsWith "commodity " || t.startsWith "commodity\t" then
+        -- the symbol is the first token, and a `;` ends a bare one
+        -- (regress/3313)
         let nm := trimS (t.drop "commodity ".length).toString
-        st := { st with pending := .commBlock ((unquote nm).getD nm) }
+        st := { st with pending := .commBlock (headerSymbol nm) }
       else if t.startsWith "payee " || t.startsWith "tag " then
         st := { st with pending := .ignoreBlock }  -- label declarations
       else if t.startsWith "@" || t.startsWith "!" then
