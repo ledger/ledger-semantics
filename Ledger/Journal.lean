@@ -176,6 +176,14 @@ private def canonAmt (st : St) (a : Amount) : Amount :=
   let (f, base) := resolveEquiv st.equivs comm
   ⟨base, a.q * f⟩
 
+/-- Whether a literal teaches its commodity a display precision. A zero
+    written without decimals teaches nothing, being written that way in
+    every currency (amount.cc `parse`: `set_precision_learned` only when
+    the literal has decimals or a nonzero digit, from ledger/ledger#3278;
+    regress/3237-cost-precision-zero). -/
+private def literalTeaches (q : ℚ) (d : Nat) : Bool :=
+  d > 0 || q != 0
+
 private def bumpPrecision (st : St) (comm : String) (d : Nat) : St :=
   -- migrating parses raise the commodity's precision to the maximum
   -- observed (amount.cc: `prec > commodity().precision()`); a price
@@ -468,7 +476,8 @@ private partial def annotLoop (ctx : AmtCtx) (line : Nat) (a : Amount)
     -- assertion: the C++ side checks it; positive tests pass it, but
     -- the literal still teaches display precision (1699)
     let pr ← parseAmount ctx line (trimS (t.drop 1).toString)
-    let teach := if pr.decimals <= 6 then
+    let teach :=
+      if pr.decimals <= 6 && literalTeaches pr.amount.q pr.decimals then
         (pr.amount.comm, pr.decimals) :: teach else teach
     annotLoop ctx line a pr.tail lot cost teach afterCost costDecs
   else
@@ -490,7 +499,8 @@ private def parseAmountField (ctx : AmtCtx) (line : Nat) (field : String) :
     let r ← parseAmount ctx line (trimS (field.drop 1).toString)
     let _ ← annotLoop ctx line r.amount r.tail none none
     pure (none, none, none, some r.amount, r.learned, r.decimals, false,
-          (if r.decimals <= 6 then [(r.amount.comm, r.decimals)] else []),
+          (if r.decimals <= 6 && literalTeaches r.amount.q r.decimals
+           then [(r.amount.comm, r.decimals)] else []),
           0, none)
   else do
     let (preLot, field) ←
@@ -732,11 +742,22 @@ private def finalizeXact (st : St) (hline : Nat) (_header : String)
     | some (c, b) =>
         stv := { stv with amt := { stv.amt with styles := (c, b) :: stv.amt.styles } }
     | none => pure ()
-    let _ := isExpr
+    -- C++ teaches from each literal of a posting's amount expression,
+    -- which it parses without PARSE_NO_MIGRATE (textual_xacts.cc
+    -- parse_post, token.cc); this reader does not see those literals
+    -- apart, so the expression's result teaches as one literal would
+    let litTeaches : Bool :=
+      match p? with
+      | some p =>
+          match p.amount with
+          | some a => literalTeaches a.q decs
+          | none => true
+      | none => true
+    let teaches := isExpr || litTeaches
     match comm? with
     | some c =>
         let c := (stv.commAliases.lookup c).getD c
-        stv := bumpPrecision stv c decs
+        if teaches then stv := bumpPrecision stv c decs
     | none => pure ()
     match p? with
     | some p =>
@@ -1405,7 +1426,8 @@ private def handleDirective (st : St) (n : Nat) (t : String) :
             -- the directive's literals teach display precision
             -- (`C 1.00s = 100c` gives s two decimals)
             let st := bumpPrecision st l.amount.comm l.decimals
-            let st := bumpPrecision st r.amount.comm r.decimals
+            let st := if literalTeaches r.amount.q r.decimals
+              then bumpPrecision st r.amount.comm r.decimals else st
             -- a user redefinition of `s` supersedes the built-in time
             -- chain (C++ time units are internal, not commodity
             -- equivalences)
