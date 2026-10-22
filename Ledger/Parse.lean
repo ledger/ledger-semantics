@@ -183,6 +183,24 @@ def splitField (s : String) : String × Option String :=
 
 def trimS (s : String) : String := s.trimAscii.toString
 
+/-- The account that an `account` line names: the text up to the first
+    `;` that follows a hard separator (a tab, or two or more spaces),
+    which begins a comment, as a note begins after a transaction's
+    payee. A `;` after a single space, or after none, is part of the
+    name, as it is in a posting (C++ `split_inline_note` in utils.h,
+    called by `account_directive_body`; regress/3320). -/
+def headerAccount (s : String) : String :=
+  let rec go (spaces : Nat) (tab : Bool) : List Char → List Char
+    | [] => []
+    | ';' :: rest =>
+        if tab || spaces ≥ 2 then [] else ';' :: go 0 false rest
+    | ' ' :: rest => ' ' :: go (spaces + 1) tab rest
+    | '\t' :: rest => '\t' :: go spaces true rest
+    | c :: rest => c :: go 0 false rest
+  -- the scan starts at the name, as C++ skips the blanks before it
+  let cs := s.toList.dropWhile fun c => c == ' ' || c == '\t'
+  trimS (String.ofList (go 0 false cs))
+
 /-! ## Numbers under commodity styles -/
 
 private def digitsVal (cs : List Char) : ℕ :=
