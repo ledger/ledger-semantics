@@ -48,8 +48,8 @@ inductive PostKind where
 structure PostSpec where
   line : Nat
   inferred : Bool := false
-  amtDecs : Nat := 0
   costDecs : Nat := 0
+  costPrec : Nat := 0
   gainVal : Option Amount := none
   account : String
   kind : PostKind
@@ -404,12 +404,12 @@ private def takeBalanced (opn cls : Char) : List Char → Option (List Char × L
 private partial def annotLoop (ctx : AmtCtx) (line : Nat) (a : Amount)
     (tail : String) (lot : Option (Amount × Bool)) (cost : Option Amount)
     (teach : List (String × Nat) := []) (afterCost : Bool := false)
-    (costDecs : Nat := 0) :
+    (costDecs : Nat := 0) (inFull : Bool := false) :
     Except String (Option (Amount × Bool) × Option Amount ×
-      List (String × Nat) × Nat) := do
+      List (String × Nat) × Nat × Bool) := do
   let t := trimS tail
   if t.isEmpty || t == "." then
-    pure (lot, cost, teach, costDecs)
+    pure (lot, cost, teach, costDecs, inFull)
   else if t.startsWith "{" then
     -- `{{total}}` and `{per-unit}` lot prices, possibly `{=fixated}`;
     -- lots parse with PARSE_NO_MIGRATE — no precision teaching
@@ -438,15 +438,18 @@ private partial def annotLoop (ctx : AmtCtx) (line : Nat) (a : Amount)
         | some l => some l
         | none => some (lotAmt, fixated)
     annotLoop ctx line a (String.ofList rest) lot' cost teach afterCost costDecs
+      inFull
   else if t.startsWith "[" then
     match takeBalanced '[' ']' t.toList with
     | some (_, rest) =>
         annotLoop ctx line a (String.ofList rest) lot cost teach afterCost costDecs
+          inFull
     | none => err line s!"unclosed lot date in '{t}'"
   else if t.startsWith "(" && !(t.startsWith "(@") then
     match takeBalanced '(' ')' t.toList with
     | some (_, rest) =>
         annotLoop ctx line a (String.ofList rest) lot cost teach afterCost costDecs
+          inFull
     | none => err line s!"unclosed lot note in '{t}'"
   else if t.startsWith "(@@)" || t.startsWith "@@" then
     let off := if t.startsWith "(@@)" then 4 else 2
@@ -458,7 +461,7 @@ private partial def annotLoop (ctx : AmtCtx) (line : Nat) (a : Amount)
     let mag := if pr.amount.q < 0 then -pr.amount.q else pr.amount.q
     let signed := if a.q < 0 then -mag else mag
     annotLoop ctx line a pr.tail lot (some ⟨pr.amount.comm, signed⟩) teach true
-      (max costDecs pr.decimals)
+      (max costDecs pr.decimals) true
   else if t.startsWith "(@)" || t.startsWith "@" then
     -- per-unit costs round at the cost literal's own precision,
     -- posting by posting (regress/1125); `@ =` fixates (1794); cost
@@ -471,7 +474,7 @@ private partial def annotLoop (ctx : AmtCtx) (line : Nat) (a : Amount)
     let pr ← parseAmount ctx line rest0
     annotLoop ctx line a pr.tail lot
       (some ⟨pr.amount.comm, pr.amount.q * a.q⟩) teach true
-      (max costDecs pr.decimals)
+      (max costDecs pr.decimals) false
   else if t.startsWith "=" then
     -- assertion: the C++ side checks it; positive tests pass it, but
     -- the literal still teaches display precision (1699)
@@ -479,7 +482,7 @@ private partial def annotLoop (ctx : AmtCtx) (line : Nat) (a : Amount)
     let teach :=
       if pr.decimals <= 6 && literalTeaches pr.amount.q pr.decimals then
         (pr.amount.comm, pr.decimals) :: teach else teach
-    annotLoop ctx line a pr.tail lot cost teach afterCost costDecs
+    annotLoop ctx line a pr.tail lot cost teach afterCost costDecs inFull
   else
     err line s!"trailing junk after amount '{t}'"
 
@@ -488,11 +491,11 @@ private partial def annotLoop (ctx : AmtCtx) (line : Nat) (a : Amount)
 private def parseAmountField (ctx : AmtCtx) (line : Nat) (field : String) :
     Except String (Option Amount × Option Amount × Option Amount ×
       Option Amount × Option (String × Bool) × Nat × Bool ×
-      List (String × Nat) × Nat × Option Amount) := do
+      List (String × Nat) × Nat × Nat × Option Amount) := do
   -- returns (amount, balancing, assignTarget, learnedStyle, decimals)
   let field := trimS field
   if field.isEmpty then
-    pure (none, none, none, none, none, 0, false, [], 0, none)
+    pure (none, none, none, none, none, 0, false, [], 0, 0, none)
   else if field.startsWith "=" then
     -- balance assignment (amountless posting); lot annotations on the
     -- target are parsed and dropped (1603)
@@ -501,7 +504,7 @@ private def parseAmountField (ctx : AmtCtx) (line : Nat) (field : String) :
     pure (none, none, none, some r.amount, r.learned, r.decimals, false,
           (if r.decimals <= 6 && literalTeaches r.amount.q r.decimals
            then [(r.amount.comm, r.decimals)] else []),
-          0, none)
+          0, 0, none)
   else do
     let (preLot, field) ←
       if field.startsWith "{" then
@@ -516,7 +519,7 @@ private def parseAmountField (ctx : AmtCtx) (line : Nat) (field : String) :
       else pure (none, field)
     let r ← parseAmount ctx line field
     let a := r.amount
-    let (lot, cost, teach, costDecs) ←
+    let (lot, cost, teach, costDecs, inFull) ←
       annotLoop ctx line a r.tail (preLot.map (·, true)) none
     -- xact.cc phase 4/6: a fixated lot with no cost derives the cost
     -- from the annotation; a lot WITH a cost books the rounded
@@ -540,8 +543,14 @@ private def parseAmountField (ctx : AmtCtx) (line : Nat) (field : String) :
           else some c
       | _, _ => cost
     let lotVal := lot.map fun (p, _) => Amount.mk p.comm (p.q * a.q)
+    -- the places of the cost C++ keeps: a total (@@) as written
+    -- (POST_COST_IN_FULL), and a per-unit price multiplied out by the
+    -- quantity, which adds the quantity's places to the price's
+    -- (textual_xacts.cc `*post->cost *= post->amount`, amount.cc
+    -- `multiply`; regress/3237-cost-precision-inferred)
+    let costPrec := if inFull then costDecs else costDecs + r.decimals
     pure (some a, costVal, lotVal, none, r.learned, r.decimals,
-          field.startsWith "(", teach, costDecs, gainVal)
+          field.startsWith "(", teach, costDecs, costPrec, gainVal)
 
 private def parsePosting (st : St) (line : Nat) (raw : String) :
     Except String (Option PostSpec × Option (String × Bool) ×
@@ -562,9 +571,9 @@ private def parsePosting (st : St) (line : Nat) (raw : String) :
     | none => pure (some { line, account, kind, note }, none, none, 0, false, [])
     | some f => do
         let (amount, costVal, lotVal, assignTarget, learned, decs, isExpr,
-             teach, costDecs, gainVal) ← parseAmountField st.amt line f
+             teach, costDecs, costPrec, gainVal) ← parseAmountField st.amt line f
         pure (some { line, account, kind, note, amount, costVal, lotVal,
-                     assignTarget, amtDecs := decs, costDecs, gainVal },
+                     assignTarget, costDecs, costPrec, gainVal },
               learned, amount.map (·.comm), decs, isExpr, teach)
 
 /-! ## Transaction finalization -/
@@ -887,16 +896,16 @@ private def finalizeXact (st : St) (hline : Nat) (_header : String)
                 else
                   err hline s!"unbalanced transaction (residual in {residualExact.length} commodities)"
     | [e] =>
-        -- COST_PREC tagging: only when the inferred value fits the
-        -- recovered price precision (set_cost_prec_if_needed, 2174)
+        -- COST_PREC tagging: only when the inferred value fits a
+        -- precision recovered from a cost in its commodity, either the
+        -- places of the price as written or the places of the cost
+        -- itself (xact.cc `set_cost_prec_if_needed`, regress/2174 and
+        -- regress/3237-cost-precision-inferred); every value that fits
+        -- the former fits the latter, which is never fewer places
         let pricePrec := fun (c : String) =>
           pool.foldl (init := (0 : Nat)) fun acc p =>
             match p.costVal with
-            | some cv =>
-                if cv.comm == c && p.costDecs > 0 then
-                  max acc (if p.costDecs > p.amtDecs then
-                    p.costDecs - p.amtDecs else p.costDecs)
-                else acc
+            | some cv => if cv.comm == c then max acc p.costPrec else acc
             | none => acc
         let comps := residualExact.map fun (c, s) =>
           let pp := pricePrec c
