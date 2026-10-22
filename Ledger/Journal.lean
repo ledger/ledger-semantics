@@ -147,6 +147,11 @@ structure St where
   errFlag : Bool := false
   tentativePrec : List String := []
   lockedPrec : List String := []
+  /-- commodities that a price directive priced or an `N` directive
+      named, which C++ marks COMMODITY_KNOWN, so that a later price
+      directive leaves their precision alone (pool.cc
+      parse_price_directive; regress/3237-price-precision) -/
+  knownComms : List String := []
   dfmt : Option (List Char) := none
   /-- (account, commodity) → (flows, inferred flows): drives the
       BIGINT_COST_PREC display rule for lone inferred balances -/
@@ -230,6 +235,32 @@ private def lockPrecision (st : St) (comm : String) (d : Nat) : St :=
     tentativePrec := st.tentativePrec.filter (· != comm)
     lockedPrec := comm :: st.lockedPrec }
   { st with amt := { st.amt with precs := st.precisions } }
+
+/-- A price directive gives the commodity that its price is written in
+    the precision of that price, tentatively, while that commodity's
+    precision is 0, a precision that an amount taught included, and no
+    directive has declared the commodity or locked its format (pool.cc
+    parse_price_directive: `precision() == 0`, not COMMODITY_KNOWN, not
+    COMMODITY_STYLE_NO_MIGRATE; regress/3237-price-precision). -/
+private def priceTeaches (st : St) (comm : String) (d : Nat) : St :=
+  if comm == "" || (st.precisions.lookup comm).getD 0 != 0
+      || st.knownComms.contains comm || st.lockedPrec.contains comm then st
+  else
+    { st with
+      precisions := (comm, d) :: st.precisions.filter (fun (c, _) => c != comm)
+      tentativePrec := comm :: st.tentativePrec.filter (· != comm) }
+
+/-- The symbol at the head of space-separated fields, where a quoted
+    symbol may span several fields (commodity.cc `parse_symbol`). -/
+private def headSymbol : List String → Option String
+  | [] => none
+  | t :: rest =>
+      if t.startsWith "\"" && !(t.length ≥ 2 && t.endsWith "\"") then
+        let inner := rest.takeWhile (fun f => !f.endsWith "\"")
+        let close := (rest.drop inner.length).head?
+        let raw := String.intercalate " " (t :: inner ++ close.toList)
+        some ((unquote raw).getD raw)
+      else some ((unquote t).getD t)
 
 private def bumpBal (st : St) (acct comm : String) (dq : ℚ) : St :=
   let key := (acct, comm)
@@ -1394,36 +1425,40 @@ private def handleDirective (st : St) (n : Nat) (t : String) :
   | "define" => defineDirective st restS
   | "def" => defineDirective st restS
   | "P" =>
-      -- price observations: plain `bal` never converts, but an
-      -- unseen price commodity picks up a TENTATIVE precision from
-      -- the price literal (pool.cc: COMMODITY_PRECISION_FROM_PRICE)
+      -- price observations: plain `bal` never converts, but the price
+      -- commodity may take a TENTATIVE precision from the price literal
+      -- (priceTeaches, COMMODITY_PRECISION_FROM_PRICE), and the
+      -- commodity priced is declared: DATE [TIME] SYMBOL PRICE, where a
+      -- second field that starts with a digit is a time and a first one
+      -- that does not is the symbol of a dateless directive (pool.cc
+      -- parse_price_directive, which marks it COMMODITY_KNOWN after
+      -- setting the precision; regress/3237-price-precision)
       let toks := (restS.splitOn " ").filter (!·.isEmpty)
+      let startsDigit := fun (f : String) => f.toList.head?.any Char.isDigit
+      let afterDate := match toks with
+        | d :: t :: rest =>
+            if startsDigit t then rest
+            else if startsDigit d then t :: rest
+            else toks
+        | _ => toks
+      let declare := fun (st : St) =>
+        match headSymbol afterDate with
+        | some sym => { st with knownComms := sym :: st.knownComms }
+        | none => st
       match toks.reverse with
       | last :: _ =>
           (match parseAmount st.amt n last with
-           | .ok r =>
-               if r.amount.comm != ""
-                   && (st.precisions.lookup r.amount.comm).isNone then
-                 pure { st with
-                   precisions := (r.amount.comm, r.decimals) :: st.precisions
-                   tentativePrec := r.amount.comm :: st.tentativePrec }
-               else pure st
+           | .ok r => pure (declare (priceTeaches st r.amount.comm r.decimals))
            | .error _ =>
                -- SYM PRICE tail split across two tokens
                match toks.reverse with
                | amtTok :: symTok :: _ =>
                    (match parseAmount st.amt n (symTok ++ " " ++ amtTok) with
                     | .ok r =>
-                        if r.amount.comm != ""
-                            && (st.precisions.lookup r.amount.comm).isNone then
-                          pure { st with
-                            precisions := (r.amount.comm, r.decimals)
-                              :: st.precisions
-                            tentativePrec := r.amount.comm :: st.tentativePrec }
-                        else pure st
-                    | .error _ => pure st)
-               | _ => pure st)
-      | _ => pure st
+                        pure (declare (priceTeaches st r.amount.comm r.decimals))
+                    | .error _ => pure (declare st))
+               | _ => pure (declare st))
+      | _ => pure (declare st)
   | "C" => do
       -- commodity equivalence: `C 1.00s = 100c`
       match restS.splitOn "=" with
@@ -1471,7 +1506,14 @@ private def handleDirective (st : St) (n : Nat) (t : String) :
               pure { st with amt := { st.amt with styles := (c, b) :: st.amt.styles } }
           | none => pure st
       | .error _ => pure st
-  | "N" => pure st       -- no-market flag: valuation reports only
+  | "N" =>
+      -- no-market flag: valuation reports only, but it also declares
+      -- the commodity, which keeps a price directive from setting its
+      -- precision (textual_directives.cc nomarket_directive,
+      -- COMMODITY_KNOWN; regress/3237-price-precision)
+      match headSymbol ((restS.splitOn " ").filter (!·.isEmpty)) with
+      | some sym => pure { st with knownComms := sym :: st.knownComms }
+      | none => pure st
   | "Y" =>
       pure { st with defaultYear := restS.toNat?.map Int.ofNat }
   | "year" =>
