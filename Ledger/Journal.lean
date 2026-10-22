@@ -1571,7 +1571,9 @@ def run (input0 : String) (dcDefault : Bool := false)
           let frames := frames.filter fun (i, _) => i < ind
           let name := ((frames.head?).map (·.2)).getD ""
           if body.startsWith "account " then
-            let nm := trimS (body.drop "account ".length).toString
+            -- a nested name ends before a hard-separated `;` comment, as
+            -- a top-level one does (regress/3320)
+            let nm := headerAccount (body.drop "account ".length).toString
             let nm := (unquote nm).getD nm
             let full := if name.isEmpty then nm else name ++ ":" ++ nm
             st := { st with pending := .acctBlock ((ind, full) :: frames) }
@@ -1746,13 +1748,16 @@ def run (input0 : String) (dcDefault : Bool := false)
           || t.startsWith "b " then
         continue  -- historical timelog compatibility: ignored
       else if t.startsWith "@account " || t.startsWith "!account " then
-        let nm := trimS (t.drop "@account ".length).toString
+        -- read as a plain `account` header (regress/3320_3)
+        let nm := headerAccount (t.drop "@account ".length).toString
         st := { st with pending := .acctBlock [(0, (unquote nm).getD nm)] }
       else if t.startsWith "@commodity " || t.startsWith "!commodity " then
         let nm := trimS (t.drop "@commodity ".length).toString
         st := { st with pending := .commBlock ((unquote nm).getD nm) }
       else if t.startsWith "account " || t.startsWith "account\t" then
-        let nm := trimS (t.drop "account ".length).toString
+        -- the name ends before a `;` that follows a hard separator,
+        -- which begins a comment (regress/3320, regress/3320_3)
+        let nm := headerAccount (t.drop "account ".length).toString
         st := { st with pending := .acctBlock [(0, (unquote nm).getD nm)] }
       else if t.startsWith "commodity " || t.startsWith "commodity\t" then
         let nm := trimS (t.drop "commodity ".length).toString
