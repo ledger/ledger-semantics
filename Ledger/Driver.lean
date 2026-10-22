@@ -89,6 +89,21 @@ def displayAmount (equivs : List (String × ℚ × String))
         | some p => (comm, roundAt p q)
         | none => (comm, q)
 
+/-- Whether a base-commodity total displays as zero, and so is left
+    out of the report: when it lies within half a unit of the
+    commodity's display precision, an exact half included, because a
+    transaction may leave that much over and still balance (amount.cc
+    `is_zero` and `cmp_half_unit`; regress/3237-cost-precision-ties).
+    A total in a commodity without a display precision, and a bare
+    total, shows in full, so only zero itself is zero. -/
+def displaysAsZero (precisions : List (String × Nat)) (comm : String)
+    (q : ℚ) : Bool :=
+  if comm == "" then q == 0
+  else
+    match precisions.lookup comm with
+    | none => q == 0
+    | some p => (if q < 0 then -q else q) * ((10 ^ p : ℕ) : ℚ) * 2 ≤ 1
+
 /-- The generator specification of an evaluated journal. -/
 def specFor (arr : Array (List (Account × ℚ))) : GenSpec where
   Gen := Fin arr.size
@@ -133,6 +148,9 @@ def balancesOf (decimalComma : Bool) (nowSecs : Option ℚ)
         else (t, i)
   let rows := merged.filterMap fun (a, v) =>
     let (dispComm, dispQ) := displayAmount res.equivs res.precisions a.commodity v
+    let zero := if dispComm == a.commodity
+      then displaysAsZero res.precisions a.commodity v
+      else dispQ == 0
     -- a lone inferred balance renders at its recovered precision when
     -- it would otherwise show as zero (BIGINT_COST_PREC, amount.cc
     -- `widened_to_cost_precision`, issues #1692/#1773); a learned
@@ -141,11 +159,11 @@ def balancesOf (decimalComma : Bool) (nowSecs : Option ℚ)
     -- (regress/3237-cost-precision-learned); sums drop the widening
     let (tot, inf) := statFor a.name a.commodity
     if tot == 1 && inf == 1 && dispComm == a.commodity
-        && a.commodity != "" && dispQ == 0 then
+        && a.commodity != "" && zero then
       if v = 0 then none
       else some s!"{a.commodity}|{ratToCanonical v}|{a.name}"
     else
-    if dispQ = 0 then none
+    if zero then none
     else some s!"{dispComm}|{ratToCanonical dispQ}|{a.name}"
   let styleRows := res.styles.filterMap fun (c, dc) =>
     if dc then some (if c == "" then "%% dc *" else s!"%% dc {c}") else none
