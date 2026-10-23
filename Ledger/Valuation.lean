@@ -143,8 +143,9 @@ instance : Add (ValuationFunctor T) := ⟨add⟩
 @[simp] theorem add_V (W₁ W₂ : ValuationFunctor T) {A B : Object}
     (f : T.Hom A B) : (W₁ + W₂).V f = W₁.V f + W₂.V f := rfl
 
-/-- Sum of a finite family of valuation functors — the vehicle for
-    "sum over all accounts" statements (trial balance, Pacioli). -/
+/-- Sum of a finite family of valuation functors, the vehicle for
+    "sum over all accounts" statements (the trial balance and the
+    balance-sheet equation). -/
 def finsetSum {ι : Type*} (s : Finset ι) (Ws : ι → ValuationFunctor T) :
     ValuationFunctor T where
   V f := ∑ i ∈ s, (Ws i).V f

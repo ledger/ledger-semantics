@@ -9,21 +9,21 @@ import Ledger.Prices
 
 The laws with downstream force from the design worksheet §3, stated
 over the abstract `𝕋` and proved from `𝕋Laws`, the valuation-functor
-laws, and — where the theorem is genuinely about *journals* rather
-than arbitrary models — the `Generated` induction principle.
+laws and, where the theorem is genuinely about *journals* rather
+than arbitrary models, the `Generated` induction principle.
 
 ## The shape of the double-entry results
 
 Phase 1 stated `double_entry_invariant` for a bare `𝕋` and could not
 prove it: nothing in `𝕋Laws` prevents a model with an unbalanced
 generator. The missing hypothesis is the one every accountant states
-first: **the journal's atomic entries balance**. Formally: `T` is
+first: **the journal's atomic entries balance**. Formally, `T` is
 generated (`𝕋.Generated`) and each generator is annihilated by the
 valuation. The master theorem `balanced_generators_balance` then
-propagates balance through every operation — that propagation is
-exactly what the valuation functor laws are *for* — and the named
-invariants (double-entry, trial balance, Pacioli, roll-up
-preservation) are corollaries.
+propagates balance through every operation, because zero added to
+zero is zero; that propagation is exactly what the valuation functor
+laws are *for*. The named invariants (double entry, trial balance,
+the balance-sheet equation, roll-up preservation) are corollaries.
 
 Every Phase 1 `sorry` and every `True`-stub is gone; each theorem
 below is a real statement with a checked proof.
@@ -58,10 +58,20 @@ theorem balanced_generators_balance (L : 𝕋Laws T)
   · simp only [W.V_tensor, hf, hg, add_zero]
   · simp only [W.V_add, hf, hg, add_zero]
 
-/-- **The double-entry invariant** (worksheet §1, identity test): a
-    transaction out of the empty account multiset — an "opening
-    balance with no offset" — moves nothing. The Phase 1 statement,
-    now a corollary of the master theorem. -/
+/-- **The double-entry invariant** (worksheet §1, identity test), in
+    its Phase 1 statement: when every generator is balanced, every
+    morphism out of the empty account multiset has valuation zero.
+    The proof is `balanced_generators_balance` applied to `f`, which
+    holds whatever the endpoints are, so the hypothesis that the
+    domain is `0` does no work here. The statement in which the
+    domain matters is `flow_eq_zero_of_isCoherent` in
+    `Ledger/TwoSides.lean`: in the free model, a morphism out of `0`
+    whose flow is coherent with its endpoints and balances in every
+    commodity has zero flow, the signed form of the fact that
+    `[x // 0]` is a zero-term only when `x = 0`. Under these hypotheses
+    the informal reading "an opening balance with no offset moves
+    nothing" holds account by account; composites need not be
+    coherent (`comp_breaks_coherence`). -/
 theorem double_entry_invariant (L : 𝕋Laws T)
     (hgen : ∀ {A B : Object} (f : T.Hom A B), G.IsGen f → W.V f = 0)
     {A : Object} (f : T.Hom 0 A) : W.V f = 0 :=
@@ -87,13 +97,21 @@ theorem trial_balance (L : 𝕋Laws T) {ι : Type*} (s : Finset ι)
     (fun f hf => by simpa using hgen f hf) f
   simpa using h
 
-/-- **The Pacioli equation**: Assets = Liabilities + Equity.
+/-- **The balance-sheet equation**: Assets = Liabilities + Equity.
 
-    Accounts are split into three classes; per-account flows are
-    measured debit-positive. Liabilities and equity are reported
-    credit-positive (the negations on the right). Given balanced
-    journal entries, the equation holds for every derived flow —
-    it is the trial balance, rearranged. -/
+    Accounts are split into three classes, and per-account flows are
+    measured debit-positive. The negations on the right decode the
+    credit-balance classes, liabilities and equity, through the
+    credit isomorphism `[d // c] ↦ c - d` (Ellerman 2014, pp. 486
+    and 496). The statement assumes balance of these three sums on
+    each generator; it does not require coverage or disjointness.
+    For the equation to be a balance sheet, the three Finsets must
+    cover, without overlap, every account the generators touch, and
+    revenue and expense accounts belong in `eqs` as temporary
+    sub-accounts of equity. Given the balance hypothesis on each
+    generator, the equation holds for every derived flow: it is the
+    trial balance, rearranged. It is the balance sheet at a date only
+    when `f` is the whole journal up to that date. -/
 theorem balance_sheet_equation (L : 𝕋Laws T) {ι : Type*}
     (assets liabs eqs : Finset ι) (Ws : ι → ValuationFunctor T)
     (hgen : ∀ {A B : Object} (f : T.Hom A B), G.IsGen f →

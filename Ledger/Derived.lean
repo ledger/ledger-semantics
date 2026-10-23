@@ -155,10 +155,12 @@ structure ClosesBooks (Wrev Wexp Weq : ValuationFunctor T)
   balanced : Wrev.V c + Wexp.V c + Weq.V c = 0
 
 /-- **Closing transfers exactly the net income into equity**: after
-    the closing entry, the equity measurement has grown by precisely
-    revenue + expense (net income, sign convention debit-positive).
-    Forced by the functor laws — there is no other amount a lawful
-    closing could transfer. -/
+    the closing entry, the equity measurement has changed by exactly
+    revenue + expense, both measured debit-positive. Revenue carries
+    credit balances, so for a profitable period that sum is negative
+    and equity, read credit-positive, grows by the net income.
+    The `ClosesBooks` conditions and the functor laws force this
+    amount. -/
 theorem closing_transfers_net_income
     {Wrev Wexp Weq : ValuationFunctor T} {A B C : Object}
     {f : T.Hom A B} {c : T.Hom B C}

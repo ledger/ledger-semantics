@@ -3,21 +3,26 @@ import Ledger.Labels
 import Ledger.Theorems
 
 /-!
-# The one-point model: every specification is inhabited
+# The one-point model: the core specification is inhabited
 
-Phase 1 shipped two uninhabitable specifications — `LabeledGroupoid`
+Phase 1 shipped two uninhabitable specifications, `LabeledGroupoid`
 (its `label_inv` law contradicted `inv_inv`) and `PriceAction` (its
-soundness law quantified over arbitrary valuation pairs) — and the
+soundness law quantified over arbitrary valuation pairs), and the
 vacuous build hid both. A specification no model can satisfy specifies
 nothing; its theorems are true for free and mean nothing.
 
-This module is the standing guard against that defect class: the
-**one-point model**, where every hom-set is `PUnit`, every valuation
-is `0`, and every rate is `1`, inhabits every structure of the
-design. It proves *consistency only* — the axioms have a model, so
-no theorem above is vacuously true of an empty subject. Adequacy (a
-model faithful to actual journals) is the free construction's job at
-L2 (Phase 5+).
+This module is a guard against that defect class. The **one-point
+model**, where every hom-set is `PUnit`, the valuation is `0`, and
+every rate is `1`, inhabits the following structures of the core
+specification: the transaction groupoid and its laws, generation,
+valuation functors, the labels fibration, the price groupoid and its
+action, and the account forest with its roll-up. Some structures
+introduced by later modules have inhabitants of their own;
+`ClosesBooks` (`Ledger/Derived.lean`), for example, is inhabited with
+nonzero revenue by `ClosingDemo.demo_closesBooks` in
+`Ledger/Closing.lean`. For the listed structures, these inhabitants
+establish satisfiability only. Adequacy, a model faithful to actual
+journals, is the work of the free construction at L2.
 
 Nothing here is kernel: these definitions are evidence about the
 kernel, not part of it.
