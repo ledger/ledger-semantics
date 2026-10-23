@@ -135,7 +135,12 @@ Output: `== PATH` opens each file's section; rows are
 `COMMODITY|AMOUNT|ACCOUNT`, sorted, amounts in canonical decimals;
 `%% dc COMM` declares a learned decimal-comma style (`*` names the
 null commodity); `!! ERROR reason` reports a rejected file and
-nothing else. Flags before a path apply to that file alone:
+nothing else. A rejection for transaction imbalance has a reason
+beginning `line N: unbalanced transaction`, prefixed by
+`periodic transaction: ` for a `~` template; N is the entry's header
+line number in the include-spliced text. That stem is part of the
+protocol. Other rejections name their cause freely.
+Flags before a path apply to that file alone:
 `--decimal-comma`, `--recursive-aliases`, `--now DATE`,
 `--input-date-format FORMAT`, `--gross`, and `--exchange COMM`. The
 last two are opt-in output flags. `--gross` adds after the net rows
@@ -165,8 +170,8 @@ known departures that the value lines inherit from the net totals, the
 price table and the learned display precisions, other than the
 precision that a price directive grants, which `price-precision`
 refuses, nor four further shapes. The docstring of `exchangeRows` says
-where these are recorded, and that some known departures of the net
-totals are recorded beside no rule. A `??` line is never a rejection,
+where these are recorded; those records are not an exhaustive account
+of differences from C++. A `??` line is never a rejection,
 and without these flags the output is byte-identical to the output
 described above. This protocol is a compatibility surface. The C++
 harness and any third-party comparator parse it, so changing it is a
@@ -243,10 +248,12 @@ pull request adding the rule with its witness.
 
 The oracle compares balances. Register rows, valuation at fixed
 prices, price-vector valuation, holding gains at dated prices, and
-lot refinement with its valuation are specified in the theory and
-are not bisimulated. Lot matching is not specified at all, and the
-oracle's flows do not distinguish lots. Do not claim coverage of any
-of these on the strength of this oracle.
+lot refinement and basis gain are specified in the theory and are not
+bisimulated. The opt-in `--gross` and `--exchange COMM` outputs compute
+gross totals and valuation in one commodity for a comparator to check;
+the C++ harness does not yet compare them. Lot matching is not specified
+at all, and the oracle's flows do not distinguish lots. Do not claim
+coverage of any of these on the strength of this oracle.
 
 ## Style for prose and commits
 

@@ -15,8 +15,8 @@ account, printing one canonical line per nonzero balance:
 
 sorted; report-time account rewrites are applied (merging flows) at
 output, and canonical-second time totals are displayed in the largest
-fitting unit (h/m/s) rounded to two decimals, as the C++ ledger does
-but for the minute, a departure that `displayAmount` records.
+fitting unit (h/m/s). The rounding rule and its departures from C++
+are recorded at `displayAmount`.
 
 Run through the **interpreter** (never a `lean_exe`):
 
@@ -77,19 +77,26 @@ abbrev roundAt := Parse.roundAt
 
 /-- Display a base-commodity total in the largest fitting equivalent
     unit (built-in time chain and `C` directives alike), rounded at
-    the unit's learned precision (default 2 for converted units, the
-    learned/0 precision for the base itself) as C++ prints an amount,
-    through `stream_out_mpq` (src/amount.cc:2055 and 208-245 at
+    the unit's learned precision, with a minimum of two places for a
+    converted unit and a default of zero for the base, through the C++
+    printing rule `stream_out_mpq` (src/amount.cc:2055 and 208-245 at
     76b9dc2b2, `cppRoundAt`): a total exactly half-way between two
     displayable values rounds as its binary expansion decides, so that
     at precision 1 a total of `0.35` shows as `0.3` and one of `0.45`
-    as `0.5`. The default of 2 departs from C++ for the minute, which C++
-    shows at the one place that its built-in conversion `1.0m` gives it
-    (session.cc:80 at 76b9dc2b2) unless an amount raises that precision
-    (amount.cc:1847-1848): after `Assets:Time  100s` against an elided
-    posting, `bal --flat` shows `1.7m` for `Assets:Time` on both C++
-    binaries, where this shows 1.67 (wrong rows). No journal of the
-    corpus shows it. -/
+    as `0.5`. The minimum of two places departs from C++ for a converted
+    unit whose precision is lower: the minute has the one place that
+    its built-in conversion `1.0m` gives it (session.cc:80 at 76b9dc2b2)
+    unless an amount raises that precision (amount.cc:1847-1848).
+    After `Assets:Time  100s` against an elided posting, `bal --flat`
+    shows `1.7m` for `Assets:Time` on both C++ binaries, where this shows
+    1.67; `1845s` shows as `30.8m` there and 30.75 here. Under
+    `C 1 Kb = 1000 b`, `1900 b` shows as `2 Kb` there and 1.9 here
+    (textual_directives.cc:183-188). These are departures in the rows.
+
+    A bare total is left exact. For `(1/3)` against an elided posting,
+    this renders `1/3` and `-1/3`, where C++ prints `0.333333` and
+    `-0.333333` at the internal precision of the quotient
+    (amount.cc:811-812, 882-891), another departure in the rows. -/
 def displayAmount (equivs : List (String × ℚ × String))
     (precisions : List (String × Nat)) (comm : String) (q : ℚ) :
     String × ℚ :=
@@ -128,8 +135,8 @@ def flowsFor (arr : Array (List (Account × ℚ)))
   (arr[i].filter fun p => p.1 = a).foldl (fun s p => s + p.2) 0
 
 /-- The row `COMMODITY|AMOUNT|ACCOUNT` of a total `v` at the account
-    `a`, displayed as C++ displays it, or none when the total shows as
-    zero. `stat` counts the flows that the total sums and the inferred
+    `a`, displayed through `displayAmount`, or none when the total shows
+    as zero. `stat` counts the flows that the total sums and the inferred
     ones among them. The total is displayed by `displayAmount`, except
     that a lone inferred amount renders at its recovered precision when
     the commodity has none, or when it would otherwise show as zero
@@ -387,14 +394,13 @@ def chainVerdict (es : List Journal.PricePoint) (c t : String) : ChainVerdict :=
     point; and those of the display precisions that the reader learns,
     but for the precision that a price directive grants, which the
     reason `price-precision` refuses. The comments of the reader and of
-    `displayRow` record departures of the first kind, the docstrings of
-    `Journal.Result.priceIssues`, `priceDirective`, `costPrice` and
+    `displayAmount` and `displayRow` record departures of the first kind;
+    the docstrings of `Journal.Result.priceIssues`, `priceDirective`,
+    `costPrice` and
     `exchangePoints` departures of the second, and the docstring of
-    `costPrice` lists departures of the third, but these records are
-    incomplete: some known departures of the net totals, among them
-    shapes that C++ rejects and the reader accepts, are recorded beside
-    no rule, so that a value row can depart from C++ where no comment
-    says so. A departure of the precision learned for the target reaches
+    `costPrice` lists departures of the third. These records describe
+    witnessed departures, not an exhaustive account of differences from
+    C++. A departure of the precision learned for the target reaches
     every value row, which shows at that precision, so that a value row
     can depart where the net rows agree: after
     `Assets:Cash  $10` against an elided `Equity`, an automated

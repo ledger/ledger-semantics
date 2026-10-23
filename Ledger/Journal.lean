@@ -160,8 +160,8 @@ structure PostSpec where
       before any cost or balance assertion: `{P}`, or `{{T}}` divided
       by the absolute quantity when that is nonzero. On a zero
       quantity C++ rejects `{{T}}` (a division by zero, amount.cc:1911)
-      and this keeps `T`. `impliedExchange` keys the amount by it, as
-      C++ keys an annotated amount by its per-unit price
+      and this keeps `T` (fail-open). `impliedExchange` keys the amount
+      by it, as C++ keys an annotated amount by its per-unit price
       (annotate.h:120-125), and a `{P}` survives a zero quantity, which
       `lotVal` does not. C++ rounds the quotient of `{{T}}`
       (amount.cc:1909-1923), where this keeps it exact and `lotPrice`
@@ -473,8 +473,8 @@ structure PostSpec where
       is an amount expression, by a fixated lot price, each a line that C++
       rejects: both C++ binaries reject `Assets:Broker  = 10 AAPL @ =$150`
       against an elided `Assets:Cash` ("Unexpected char '@'",
-      textual_xacts.cc:906-910), which this reader accepts, the departure
-      recorded at the assignment branch of `parseAmountField`. For that
+      textual_xacts.cc:906-910), which this reader accepts (fail-open),
+      as recorded at the assignment branch of `parseAmountField`. For that
       journal `finalizeXact` records AAPL, the commodity of the target, and
       not that of the cost, so that the Driver refuses its value rows,
       `?? exchange fixated-lot AAPL`, since a flow in AAPL is nonzero; where
@@ -1566,6 +1566,9 @@ private partial def annotLoop (ctx : AmtCtx) (line : Nat) (a : Amount)
     let fix := innerS.startsWith "="
     let innerS := if fix then trimS (innerS.drop 1).toString else innerS
     let pr ← parseAmount ctx line innerS
+    -- C++ divides a total lot price even when the quantity is zero
+    -- (amount.cc:1911), rejecting `0 AAPL {{$40}}` against an elided
+    -- posting. This keeps the total and accepts the journal (fail-open).
     let lotAmt := if total && a.q != 0 then
         Amount.mk pr.amount.comm (pr.amount.q / (if a.q < 0 then -a.q else a.q))
       else pr.amount
@@ -1608,6 +1611,12 @@ private partial def annotLoop (ctx : AmtCtx) (line : Nat) (a : Amount)
           (lotExpr := lotExpr) (costExpr := costExpr) (costFixated := costFixated)
     | none => err line s!"unclosed lot date in '{t}'"
   else if t.startsWith "(" && !(t.startsWith "(@") then
+    -- C++ balances parentheses only in a value expression beginning
+    -- `((`; a note ends at its first `)` (annotate.cc:203-257). This
+    -- balances every span, so `10 AAPL {$150} ( (200))` and
+    -- `10 AAPL (lot (a))` against `$-1500` are accepted here,
+    -- while C++ rejects the extra `)` (textual_xacts.cc:908-910), a
+    -- fail-open departure.
     match takeBalanced '(' ')' t.toList with
     | some (inner, rest) =>
         annotLoop ctx line a (String.ofList rest) lot cost teach afterCost costDecs
@@ -3312,9 +3321,9 @@ private structure PoolResult where
       shape listed there as accepted here and rejected by C++, no
       orientation is admissible for C++, and the candidate records only
       the oracle's own acceptance: `10 A {$1}` against `-10 A` has the
-      single empty candidate, while C++ rejects it. They include the
-      candidate of an orientation that the top posting's key decides
-      and in which Phase 3 makes no conversion, for which
+      single empty candidate, while C++ rejects it (fail-open). They
+      include the candidate of an orientation that the top posting's key
+      decides and in which Phase 3 makes no conversion, for which
       `impliedExchange` reports only `.declines`: under
       `format 1.00 A`, `0.004 A {$1}` against `-0.001 A` leaves
       `0.003 A` here, while C++ tests `0.004 A {$1}` and `-0.001 A`
@@ -3329,7 +3338,7 @@ private structure PoolResult where
       empty residual here, and C++ accepts it, but beside an automated
       transaction that adds `Assets:X 1` and `Assets:Y -1` to the
       `AAA` posting C++ rejects it with the remainder `$-50` and
-      `10 AAA {$5}` -/
+      `10 AAA {$5}`, while it is accepted here (fail-open) -/
   candidates : List PoolCandidate := [{}]
   /-- set when three conditions hold: the pool reaches the test of the
       implicit exchange, which it does only with no elided posting, a
@@ -3345,7 +3354,8 @@ private structure PoolResult where
       departures that `candidates` inherits: under `format 1.00 A`,
       `10 A {$1}` against `-10 A` beside bracket-virtual postings of
       `1 B {$1}` and `-1 B {$1}` is rejected by C++ with the lot first
-      and accepted with the plain units first. -/
+      and accepted with the plain units first (fail-open in the first
+      order). -/
   orderDependent : Bool := false
   /-- the candidate of the orientation opposite to the one that the top
       posting's key decides, when the implicit exchange accepts the pool
@@ -5014,6 +5024,14 @@ private def finalizeXact (st : St) (hline : Nat) (_header : String)
           resolved := { p with amount := some amt
                                assignTarget := none } :: resolved
         else
+        -- An annotated target restricts the C++ difference to its own
+        -- annotated commodity (textual_xacts.cc:807, 817, 827-831),
+        -- while this subtracts the whole base-commodity balance. After
+        -- `Assets:Broker  5 AAPL @ $150`, `= 15 AAPL {$150}` against
+        -- an elided `Assets:Other` leaves 20 AAPL in Assets:Broker and
+        -- -15 in Assets:Other in C++, but 15 and -10 here (wrong rows).
+        -- The same difference follows an unannotated 5 AAPL holding
+        -- when the target is `= 15 AAPL ((200))`.
         let key := (p.account, target.comm)
         let diff := target.q - curOf target.comm
         let p := { p with amount := some ⟨target.comm, diff⟩
@@ -5051,6 +5069,12 @@ private def finalizeXact (st : St) (hline : Nat) (_header : String)
   -- display-precision tolerance is only the final acceptance test.
   let balancePool : List PostSpec → Bool → Except String PoolResult :=
       fun pool isReal => do
+    -- C++ sums a cost under its annotated commodity (xact.cc:325-333),
+    -- which this sum merges with plain units. It therefore accepts
+    -- `10 AAPL @ $150 ((200))` against `$-1500`, and the same with a
+    -- cost note `(note)`, while C++ rejects each as unbalanced
+    -- (fail-open). With `@ 140 EUR ((200))` against `-1400 EUR` the
+    -- departure is the same.
     let sumsWith := fun (useLot : Bool) =>
       pool.foldl (init := ([] : List (String × ℚ))) fun acc p =>
         match p.amount with
@@ -5319,6 +5343,12 @@ private def finalizeXact (st : St) (hline : Nat) (_header : String)
                   accepted
                 else unbalanced
     | [e] =>
+        -- No completion is made for a commodity whose weights net to
+        -- zero. C++ keeps annotated keys apart, but drops exactly zero
+        -- amounts from a balance (balance.cc:122-123): `0 AAPL` and
+        -- `0 AAPL {$40}` leave its elided posting without an amount,
+        -- which it rejects (xact.cc:1014-1015). This accepts the journal
+        -- with no nonzero flow (fail-open).
         let comps := residualExact.map fun (c, s) =>
           { line := e.line, inferred := costTagged c s, note := e.note
             account := e.account, kind := e.kind
@@ -7375,9 +7405,13 @@ structure Result where
       2026/03/01 shows 2000 for `10 AAPL @ $150` after `value 200` and under
       `account Assets:Broker` with `value 200`, 2000 for a virtual
       `(Assets:Broker)  10 AAPL` under `= /Broker/` with `; Value: 200` and
-      `(Budget)  1`, and 200 for the holding under `expr Value = 200` as a
-      line of its transaction or of a rule that matches it, an amount that
-      C++ divides by the quantity (post.cc:1070-1073), while after
+      `(Budget)  1`, and 200 for the holding under `expr Value = 200`
+      before the transaction's postings, directly after the holding's
+      posting, or in a rule that matches it, an amount that C++ divides
+      by the quantity (post.cc:1070-1073). Such a line of a transaction
+      binds to the preceding posting, or to the transaction when none
+      precedes it (textual_xacts.cc:1095-1099, 1116); after the
+      counter-posting it leaves the holding at $1700. After
       `define market(a, d, t) = 7`, or the same text after `def`, `expr` or
       `eval`, after `account Assets:Other` with `eval market(a, d, t) = 7` or
       `expr market(a, d, t) = 7`, after the same `expr` line in a
@@ -7439,9 +7473,10 @@ structure Result where
       where that posting is a balance assignment, whose cost the reader
       drops, so that where a fixated cost, a cost with a fixated lot price
       or, after a target that is an amount expression, a fixated lot price
-      follows the target, each a line that C++ rejects, the fixated-lot
-      branch of the Driver does not refuse the value rows where no flow in
-      the commodity of the target is nonzero (as that docstring records);
+      follows the target, each a line that C++ rejects (fail-open), the
+      fixated-lot branch of the Driver does not refuse the value rows
+      where no flow in the commodity of the target is nonzero (as that
+      docstring records);
       and the commodity of a template amount of an automated transaction
       whose own lot price or cost is fixated, or which such a directive
       annotates, and that of its cost where the cost is fixated, which C++

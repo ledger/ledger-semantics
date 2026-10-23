@@ -387,7 +387,13 @@ in canonical decimal form and the rows sorted. A line of the form
 decimal-comma style, with `%% dc *` naming the null commodity, so
 that a comparator can normalize the other side's output. A rejected
 file prints `!! ERROR` with a reason and nothing else, which keeps
-failure visible. Flags given before a file path apply to that file
+failure visible. A rejection for transaction imbalance has a reason
+beginning `line N: unbalanced transaction`, prefixed by
+`periodic transaction: ` when the failing entry is a `~` template.
+Here N is the entry's header line number in the include-spliced text.
+That stem is part of the protocol, so that a comparator can check
+rejections for imbalance as well as balances; other rejections name
+their cause freely. Flags given before a file path apply to that file
 alone, and six are recognized: `--decimal-comma`,
 `--recursive-aliases`, `--now DATE`, `--input-date-format FORMAT`,
 and the opt-in output flags `--gross` and `--exchange COMM`, described
@@ -457,11 +463,10 @@ the oracle. No reason covers the known departures that the value lines
 inherit from the net totals, from the dated price table and from the
 display precisions that the oracle learns, other than the precision
 that a price directive grants, which `price-precision` refuses. The
-comments beside the rules of the oracle record such departures, but
-not all of them: some known departures of the net totals, among them
-shapes that the C++ program rejects and the oracle accepts, are
-recorded beside no rule, so that a value line can depart from the C++
-program where no comment says so. No reason covers four further
+comments beside the rules of the oracle record witnessed departures,
+including shapes that the C++ program rejects and the oracle accepts,
+as the provenance section explains. They are not an exhaustive account
+of differences from C++. No reason covers four further
 shapes either: a journal line that sets another report option or a
 session option that takes effect only once the C++ program has read
 the journal; a price read in a style other than the C++ program's; an
@@ -505,10 +510,10 @@ Every non-comparison is made visible. A file the oracle cannot yet
 read counts as a named skip and never as a pass, and the C++ harness
 exits with code 77 in that case so that its test runner reports the
 run as skipped. The goal is zero skips outside the inherently
-non-comparable bins, and the C++ suite has reached that goal. Of its
-4364 test files, 3796 are compared with zero divergence, 489 expect
-errors, 77 contain no journal, and 2 embed Python in the journal
-itself.
+non-comparable bins, and the C++ suite has reached that goal. At C++
+revision 76b9dc2b2, of its 4364 test files, 3796 are compared with
+zero divergence, 489 expect errors, 77 contain no journal, and 2
+embed Python in the journal itself.
 
 The comparator is also proved able to fail. Every run replays a
 fixture in which one side carries a known planted defect, and the
@@ -518,9 +523,10 @@ never been observed to fail provides no evidence when it passes.
 Finally, each result records what it compared, naming the source
 revisions of both sides, the binary, and the flags, and it states
 what the comparison does not cover. This oracle compares balances.
-It does not yet compare register report rows, market valuation, or
-lot matching, and a passing result is meaningful only together with
-a plain statement of such limits.
+It can also print gross debit and credit totals and valuation in one
+commodity for a comparator to check, but it does not compare register
+report rows, unrealized gains, or lot matching, and a passing result
+is meaningful only together with a plain statement of such limits.
 
 The divergences that a comparison surfaces are its value. Each one
 either exposes a defect in the implementation under test or exposes
@@ -559,9 +565,19 @@ builds of the C++ program require no Lean toolchain, because
 without the submodule the test is not registered, and a registered
 test without a toolchain reports itself skipped.
 
-The balance semantics is complete against the C++ suite as of
-August 2026. Register rows and time-indexed valuation are specified
-in the theory and remain to be bisimulated, by the same procedure.
+The balance semantics agrees with every comparable file of the C++
+suite at revision 76b9dc2b2. Known shapes that it accepts although C++
+rejects them are recorded beside their rules in comments marked
+`fail-open` or `fails open` in `Ledger/Journal.lean` and
+`Ledger/Parse.lean`. These include the docstrings of `impliedExchange`
+and `zeroTestPrec`, and the comments at the automated-transaction
+check. The command `git grep -n -E 'fail-open|fails open' -- Ledger`
+lists those comments together with other departures, including wrong
+rows and refusals that miss a case. Agreement with this corpus is not
+completeness for the journal language. Register rows, valuation at
+fixed and at dated prices, lot refinement and basis gain are specified
+in the theory and remain to be bisimulated by the same procedure;
+lot matching is not specified.
 
 ## License
 

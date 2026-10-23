@@ -437,6 +437,10 @@ private def combineAmt (line : Nat) (op : Char) (a b : Amount) :
       if a.comm == b.comm then pure a.comm
       else if a.comm == "" then pure b.comm
       else if b.comm == "" then pure a.comm
+      -- C++ multiplication and division keep the left commodity when it
+      -- has one (amount.cc:737-744, 811-815 at 76b9dc2b2), so it reads
+      -- `(2.5 EUR * $1 / 1 EUR)` as 2.5 EUR. This rejects that expression
+      -- as mixed commodities, a fail-closed departure.
       else err line s!"mixed commodities '{a.comm}'/'{b.comm}' in expression"
     match op with
     | '+' => pure ⟨comm, a.q + b.q⟩
@@ -495,6 +499,18 @@ private partial def exprPrimary (ctx : AmtCtx) (line : Nat) :
                 | [x, n] => pure (⟨x.comm, roundAt n.q.num.toNat x.q⟩, 0, rest)
                 | _ => err line "roundto expects two arguments"
               else if name == "truncated" then
+                -- C++ truncates toward zero at the amount's display
+                -- precision (report.cc:1159-1168, amount.cc:987-1025 at
+                -- 76b9dc2b2). In the ordinary posting amount below, the
+                -- literal first teaches its commodity its decimals
+                -- (token.cc:540-555); cost and balance assertion or
+                -- assignment expressions do not teach precision
+                -- (textual_xacts.cc:693-694, 759-760). This rounds at the
+                -- precision already recorded under the written name.
+                -- After `X 10.555 E`, `(truncated(1.23456 E))`
+                -- against `-1.235 E` is accepted here and rejected by
+                -- C++ (fail-open), as is `(truncated(1.23456))` against
+                -- `-1.235` after a bare `X 0.001`.
                 match args with
                 | [x] =>
                     let p := (ctx.precs.lookup x.comm).getD 0
@@ -511,6 +527,10 @@ private partial def exprPrimary (ctx : AmtCtx) (line : Nat) :
           | _ =>
             match ctx.defines.lookup name with
             | some a => pure (a, 0, rest)
+            -- C++ first tries an amount, including an alphabetic prefix
+            -- commodity (token.cc:540-555 at 76b9dc2b2). It accepts
+            -- `(EUR 1/3)`, which this treats as an unknown variable
+            -- `EUR` and rejects, a fail-closed departure.
             | none => err line s!"unknown variable '{name}' in amount expression"
         else do
           let symCs := prefixSymOf cs
