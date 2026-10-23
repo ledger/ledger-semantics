@@ -173,6 +173,30 @@ consists of `Parse`, `Journal`, `Oracle`, `Register`, and `Driver`,
 together with `Gen`, a seeded generator of property-test journals
 that never authors expected results.
 
+A set of leaf modules extends the specification. `TwoSides` reads
+generator endpoints as the two sides of an entry and shows where
+composition breaks sign coherence. `TAccount` builds Ellerman's pair
+construction of the group of differences, with the debit and credit
+isomorphisms onto the signed carrier in which the oracle computes.
+`Decoding` presents balances by balance side and account class, and
+shows that the choice of side governs presentation rather than truth.
+`PriceVector` values flows by a fixed price vector, and `HoldingGain`
+lets that vector change between instants, which is where holding gains
+arise. `Lots` refines commodities by lot and states which market
+valuations the oracle's lot-blind flows can support, `Conversion`
+completes cost-balanced entries with the equity leg that Ledger's cost
+syntax leaves implicit, `BasisGain` relates market value, basis, and
+that leg, and `Closing` closes temporary accounts into equity.
+
+Three join modules connect these leaves to the executable layer for
+proofs only: `DriverTwoSides` proves the oracle's generators coherent
+with their ends, `GrossLedger` identifies gross totals with
+T-accounts, and `Market` proves that executable valuation agrees with
+the price-vector valuation. The index `Ledger.lean` imports every
+module except `Gen`, which defines its own `main`. No executable
+module imports a leaf or a join module, so neither enters the
+oracle's run path, the import closure of `Driver`.
+
 ## The relation to Ellerman's algebra
 
 David Ellerman gives the algebra of double-entry bookkeeping as a

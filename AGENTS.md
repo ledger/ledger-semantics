@@ -17,32 +17,75 @@ specification, because that is what it is.
 
 ## The two layers, and the rule between them
 
-The specification layer defines meaning and proves laws:
+The specification layer defines meaning and proves laws. Each line
+below names a module and the `Ledger` modules it imports directly;
+the list records those imports, so an edit that adds or removes an
+import edits this list in the same commit:
 
-    Basic → Accounts → Groupoid → Labels, Hierarchy, Valuation
-          → Derivation, Prices → Theorems → Derived, Free, Trivial
-          → TimedPrices, and Free → Pacioli
+    Basic
+    Accounts     ← Basic
+    Groupoid     ← Accounts
+    Labels       ← Groupoid
+    Hierarchy    ← Groupoid
+    Valuation    ← Groupoid
+    Derivation   ← Valuation
+    Prices       ← Valuation
+    Theorems     ← Derivation, Hierarchy, Prices, Valuation
+    Derived      ← Theorems
+    Free         ← Theorems
+    Trivial      ← Labels, Theorems
+    TimedPrices  ← Derived
+    Pacioli      ← Free
 
 The executable layer reads journals and computes balances:
 
-    Basic → Parse → Journal, and Pacioli → Oracle → Register, Driver
+    Parse        ← Basic
+    Journal      ← Parse
+    Gen          ← Basic
+    Oracle       ← Pacioli
+    Register     ← Labels, Oracle
+    Driver       ← Journal, Oracle, Register
+
+Specification leaves extend the theory without entering the oracle.
+The index `Ledger.lean` imports every module listed here except `Gen`,
+which defines its own `main`. No executable module (`Parse`,
+`Journal`, `Gen`, `Oracle`, `Register`, `Driver`) imports a leaf, and
+the oracle's run path is the import closure of `Driver`:
+
+    TwoSides     ← Pacioli
+    TAccount     ← Pacioli
+    Decoding     ← Derived
+    PriceVector  ← Pacioli, TimedPrices
+    HoldingGain  ← PriceVector
+    Lots         ← PriceVector
+    Conversion   ← PriceVector
+    BasisGain    ← Conversion, Lots
+    Closing      ← Conversion
+
+Join modules connect the executable layer to a leaf for the sake of a
+proof:
+
+    DriverTwoSides ← Driver, TwoSides
+    GrossLedger    ← Register, TAccount
+    Market         ← Oracle, PriceVector
+
+A join module contains only definitions and theorems used for proofs,
+is imported only by `Ledger.lean`, and is never on the run path, so
+the interpreted oracle never loads a leaf.
 
 Apart from the index `Ledger.lean`, `Driver` is the only module
 that joins the two chains of the executable layer, the
 journal-reading chain of `Parse` and `Journal` and the evaluating
-chain that begins at `Oracle`. A module that imports an executable
-module together with a specification module only to state proofs,
-such as `DriverTwoSides`, is imported by no module on the oracle's
-run path, which is the import closure of `Driver`. The
-specification layer never imports the executable layer, and that
-direction must be preserved; it was verified by import scan and any
-change that reverses an edge is wrong regardless of whether it
-builds. `Journal.lean` is the largest file in the repository by
-design: it records the observed conventions of the C++
-implementation, while the theory above it stays small. Know which
-layer you are editing. A change to `Groupoid` or `Theorems` is a
-change to the mathematics and needs a proof. A change to `Parse` or
-`Journal` is a claim about C++ behavior and needs a witness.
+chain that begins at `Oracle`. The specification layer never
+imports the executable layer, and that direction must be preserved;
+it was verified by import scan and any change that reverses an edge
+is wrong regardless of whether it builds. `Journal.lean` is the
+largest file in the repository by design: it records the observed
+conventions of the C++ implementation, while the theory above it
+stays small. Know which layer you are editing. A change to `Groupoid`
+or `Theorems` is a change to the mathematics and needs a proof. A
+change to `Parse` or `Journal` is a claim about C++ behavior and needs
+a witness.
 
 ## Non-negotiables
 

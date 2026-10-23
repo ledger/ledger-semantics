@@ -17,6 +17,18 @@ import Ledger.Parse
 import Ledger.Journal
 import Ledger.Driver
 import Ledger.Trivial
+import Ledger.TwoSides
+import Ledger.DriverTwoSides
+import Ledger.TAccount
+import Ledger.Decoding
+import Ledger.PriceVector
+import Ledger.HoldingGain
+import Ledger.Lots
+import Ledger.Conversion
+import Ledger.BasisGain
+import Ledger.Closing
+import Ledger.GrossLedger
+import Ledger.Market
 
 /-!
 # Ledger: denotational semantics of double-entry accounting
@@ -60,29 +72,84 @@ one way.
 
 ## Module index
 
-- `Ledger.Basic`      — account names, commodities, the `Account` pair
-- `Ledger.Accounts`   — `Object := Multiset Account`, the free CMon
-- `Ledger.Groupoid`   — `𝕋`, `𝕋Laws`, `castHom`/`braiding`, `Path`,
-                        `Generated`
-- `Ledger.Valuation`  — `ValuationFunctor` (minimal law basis and the
-                        derived laws), static `Valuation`,
-                        `CommodityValuation`
-- `Ledger.Labels`     — metadata fibration, separate from the groupoid
-- `Ledger.Hierarchy`  — account forest, `ParentChain`, roll-ups
-- `Ledger.Derivation` — auto-xact derivation system and its soundness
-- `Ledger.Prices`     — price groupoid `𝓟`, its action, rate theorems
-- `Ledger.Theorems`   — the fundamental theorems (K3), all proved
-- `Ledger.Trivial`    — the one-point model: every structure is
-                        inhabited (consistency, not adequacy)
-- `Ledger.TimedPrices`— time-indexed price observations
-- `Ledger.Free`       — L2: the free construction (reified morphisms)
-- `Ledger.Pacioli`    — L1: per-account rational flows, `netFlow`,
-                        the degeneracy results
-- `Ledger.Derived`    — derived operations and their laws
-- `Ledger.Parse`      — amounts, numbers, regular expressions
-- `Ledger.Journal`    — the journal engine (C++-faithful conventions)
-- `Ledger.Oracle`     — the executable balance oracle
-- `Ledger.Register`   — register-report specification
-- `Ledger.Gen`        — seeded journal generator for property sweeps
-- `Ledger.Driver`     — the bisimulation driver (IO, output protocol)
+Every module under `Ledger/` is built by the lakefile's glob. This
+file imports all of them except `Ledger.Gen`, which defines its own
+`main` and so cannot share an environment with `Ledger.Driver`.
+
+Specification layer:
+
+- `Ledger.Basic`: account names, commodities, the `Account` pair
+- `Ledger.Accounts`: `Object := Multiset Account`, the free
+  commutative monoid
+- `Ledger.Groupoid`: `𝕋`, `𝕋Laws`, `castHom` and `braiding`, `Path`,
+  `Generated`
+- `Ledger.Valuation`: `ValuationFunctor` (the three-law basis and
+  the laws derived from it), static `Valuation`, `CommodityValuation`
+- `Ledger.Labels`: metadata fibration, separate from the groupoid
+- `Ledger.Hierarchy`: account forest, `ParentChain`, roll-ups
+- `Ledger.Derivation`: automated-transaction derivation system and
+  its soundness
+- `Ledger.Prices`: price groupoid `𝓟`, its action, rate theorems
+- `Ledger.Theorems`: the fundamental theorems (K3), all proved
+- `Ledger.Derived`: derived operations and their laws
+- `Ledger.Trivial`: the one-point model, which inhabits the structures
+  of the core specification (consistency, not adequacy)
+- `Ledger.TimedPrices`: time-indexed price observations
+- `Ledger.Free`: L2, the free construction (reified morphisms)
+- `Ledger.Pacioli`: L1, the signed carrier `PacioliGroup`, the
+  denotation `flow` and its commuting squares, the degeneracy results
+
+Executable layer:
+
+- `Ledger.Parse`: amounts, numbers, regular expressions
+- `Ledger.Journal`: the journal engine, witnessed C++ conventions
+  and recorded departures
+- `Ledger.Oracle`: the executable balance oracle `netFlow`, its
+  agreement with `flow`, the per-commodity trial balance, `netValue`,
+  and the kernel-checked Demo and Ellerman goldens
+- `Ledger.Register`: register-report specification, gross debit and
+  credit totals, and posting rows
+- `Ledger.Gen`: seeded generator of property-test journals, never
+  expected results
+- `Ledger.Driver`: the bisimulation driver (IO, output protocol)
+
+## Specification leaves
+
+These modules extend the specification. This index imports them. No
+executable module (`Parse`, `Journal`, `Gen`, `Oracle`, `Register`,
+and `Driver`) imports any of them. They may import one another, as
+the tables in AGENTS.md record. The oracle's run path is the import
+closure of `Driver`.
+
+- `Ledger.TwoSides`   : generator endpoints read as Ellerman's two
+                        sides, sign coherence, and where composition
+                        breaks it
+- `Ledger.TAccount`   : Ellerman's T-accounts, the group of differences,
+                        and the debit and credit isomorphisms onto
+                        `PacioliGroup`
+- `Ledger.Decoding`   : balance sides, the decoded balance-sheet
+                        equation, five account classes
+- `Ledger.PriceVector`: price-vector valuation, and the value and
+                        quantity readings of `CommodityValuation`
+- `Ledger.HoldingGain`: timed price vectors and the holding-gain
+                        identity
+- `Ledger.Lots`       : lots as property types, market vectors, and what
+                        lot-blind flows support
+- `Ledger.Conversion` : conversion legs and the completion projection
+- `Ledger.BasisGain`  : basis gain and the forced equity leg
+- `Ledger.Closing`    : the closing entry and an inhabitant of
+                        `ClosesBooks` with nonzero revenue
+
+## Join modules
+
+Each joins the executable layer to a specification leaf. They contain
+only definitions and theorems used for proofs, this index is the only
+module that imports them, and none is on the oracle's run path.
+
+- `Ledger.DriverTwoSides`: the oracle's generators are coherent with
+                           their ends (`Driver`, `TwoSides`)
+- `Ledger.GrossLedger`   : gross totals as T-accounts (`Register`,
+                           `TAccount`)
+- `Ledger.Market`        : the executable valuation agrees with the
+                           price vector (`Oracle`, `PriceVector`)
 -/
