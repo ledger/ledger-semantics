@@ -94,18 +94,37 @@ Output: `== PATH` opens each file's section; rows are
 null commodity); `!! ERROR reason` reports a rejected file and
 nothing else. Flags before a path apply to that file alone:
 `--decimal-comma`, `--recursive-aliases`, `--now DATE`,
-`--input-date-format FORMAT`, and `--gross`. The last is an opt-in
-output flag: after the net rows it adds sorted `>> dr ROW` and
-`>> cr ROW` lines, which give as positive magnitudes the gross debit
-and credit totals of each account, summed posting by posting, or, in
-place of those lines, the single line
+`--input-date-format FORMAT`, `--gross`, and `--exchange COMM`. The
+last two are opt-in output flags. `--gross` adds after the net rows
+sorted `>> dr ROW` and `>> cr ROW` lines, which give as positive
+magnitudes the gross debit and credit totals of each account, summed
+posting by posting, or, in place of those lines, the single line
 `?? gross lot-annotated-completion` when the oracle finds a
 completion that C++ may split by lot annotation, so that the totals
 of the completed account, or the way they show, can depart from those
 the oracle computes. The test behind that line refuses some files in
 excess and misses others, as the docstring of
-`Journal.Result.lotFanout` records. A `??` line is never a rejection,
-and without the flag the output is byte-identical to the output
+`Journal.Result.lotFanout` records. `--exchange COMM` adds after the
+net and gross lines sorted `>> value ROW` lines, which give the
+holdings of each account valued in `COMM` at the prices in effect at
+midnight of the `--now` date, each commodity priced through the only
+chain of recorded prices that links it to `COMM`, or, in place of
+those lines, the single line `?? exchange REASON`, with the commodity
+concerned after the reason where there is one, when the oracle cannot
+value the file as C++ does. The reason is the first that applies of
+`no-terminus`, `price-expr`, `unread-price`, `exchange-order`,
+`value-expression`, `posting-date`, `fixated-lot`, `equivalence`,
+`commodity-alias`, `price-precision`, `null-commodity`, `percent`,
+`time-unit`, `no-price-path`, `alternative-price-path`,
+`zero-inverse-price` and `rounds-to-zero`, each explained beside its
+branch of `exchangeRows` in `Ledger/Driver.lean`. No reason covers the
+known departures that the value lines inherit from the net totals, the
+price table and the learned display precisions, other than the
+precision that a price directive grants, which `price-precision`
+refuses, nor four further shapes. The docstring of `exchangeRows` says
+where these are recorded, and that some known departures of the net
+totals are recorded beside no rule. A `??` line is never a rejection,
+and without these flags the output is byte-identical to the output
 described above. This protocol is a compatibility surface. The C++
 harness and any third-party comparator parse it, so changing it is a
 breaking change to be made deliberately and announced, never as a

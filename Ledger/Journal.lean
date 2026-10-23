@@ -443,6 +443,45 @@ structure PostSpec where
       implicit exchange: the engine keeps no such annotation, a
       departure that the docstring of `impliedExchange` records -/
   rateFixed : Bool := false
+  /-- C++ gives the amount of the posting, the amount that its balance
+      assignment computes, or the amount in the commodity of its cost
+      with which an elided posting completes it, a fixated lot price that
+      neither `fixated` nor `rateFixed` records: a cost written fixated,
+      `@ =P` or `@@ =T` (POST_COST_FIXATED, textual_xacts.cc:712-713),
+      whose annotation price Phase 6 fixates (xact.cc:816-819); a fixated
+      lot price on the cost itself, which C++ adds to the balance of the
+      transaction in that annotated commodity (xact.cc:325-333); or a
+      fixated lot price on the target of a balance assignment, which C++
+      keeps in the amount that it computes (textual_xacts.cc:807,
+      855-858). With `P 2024/02/01 AAPL $170` and `P 2024/02/01 EUR $3`,
+      `bal -X $` shows $1500 for `10 AAPL @ =$150` against an elided
+      posting, $500 for `= 10 AAPL {=$50}` against an elided posting, and
+      $-100 for the elided posting that completes `10 AAPL @ 5 EUR {=$2}`,
+      on both C++ binaries. Balancing does not read it; `finalizeXact`
+      records in `St.fixatedLotComms` (`Result.fixatedLotComms`) the
+      commodities of both the amount and the cost of such a posting, or for
+      a balance assignment that of the target alone, since the assignment
+      branch of `parseAmountField` drops the cost (below). C++ fixates the
+      amount alone for a fixated cost (xact.cc:816-819) and the completion
+      in the commodity of the cost alone for a fixated lot price on the cost
+      (xact.cc:325-333), so that the record is conservative and can name a
+      commodity that C++ values through the price graph: of
+      `10 AAPL @ 5 EUR {=$2}` it records AAPL, which `bal -X $` values at
+      $1700 there, before EUR. It is set as well, where the target has a
+      commodity, for a balance assignment whose target is followed by a
+      fixated cost, by a cost with a fixated lot price or, where the target
+      is an amount expression, by a fixated lot price, each a line that C++
+      rejects: both C++ binaries reject `Assets:Broker  = 10 AAPL @ =$150`
+      against an elided `Assets:Cash` ("Unexpected char '@'",
+      textual_xacts.cc:906-910), which this reader accepts, the departure
+      recorded at the assignment branch of `parseAmountField`. For that
+      journal `finalizeXact` records AAPL, the commodity of the target, and
+      not that of the cost, so that the Driver refuses its value rows,
+      `?? exchange fixated-lot AAPL`, since a flow in AAPL is nonzero; where
+      no flow in the commodity of the target is nonzero, the fixated-lot
+      branch does not refuse them, and for `= 0 AAPL @ =150 EUR` after a
+      flow in EUR the Driver prints them, as that comment records -/
+  fixatedMark : Bool := false
   /-- the date that a note of the posting gives it, the last of its note
       lines that gives one (`noteDateOf`): `some (some d)` for the day
       `d`, and `some none` for a date that this reader does not read -/
@@ -718,13 +757,66 @@ structure St where
   /-- set once a value expression that can value any commodity has been
       read (`Result.valueExprAll`) -/
   valueExprAll : Bool := false
-  /-- set by an in-file `--now` line, after which the current time of
-      C++ is not known here: the option takes a time with its date
-      (report.h:1059-1074 at 76b9dc2b2), and the end of an included file
-      and `end apply year` restore the time that came before
-      (textual_directives.cc:424-446, 593-595), while `nowSecs` takes the
-      date alone and keeps it to the end of the journal
-      (`priceDirective`) -/
+  /-- the commodities of the amounts to which C++ gives a fixated lot
+      price, each once, the most recent first (`finalizeXact`,
+      `finalizeAuto`, `Result.fixatedLotComms`) -/
+  fixatedLotComms : List String := []
+  /-- set at an `alias` subdirective of a `commodity` block when a point
+      already recorded names the alias or the block's commodity
+      (`Result.aliasPrices`) -/
+  aliasPrices : Bool := false
+  /-- the commodities that C++ has marked known, so that a price directive
+      grants them no precision (pool.cc:628-634), each once, the most
+      recent first (`recordKnownComm`): the source of each price directive
+      whose price this reader reads as C++ does (`priceDirective`), which
+      C++ marks known once it has read the price, whether or not it
+      records it (pool.cc:645-647), recorded by `recordPriceGrant`; the
+      commodity of an `apply fixed` or `apply rate` directive, which C++
+      reads with the same function and records no price
+      (textual_directives.cc:530-541), recorded by the `apply` arm of
+      `handleDirective`; the commodity of an `N` directive
+      (`instance_t::nomarket_directive`, textual_directives.cc:202-209),
+      recorded by the `N` arm; and the commodity of a `commodity`
+      directive read while C++ checks commodities
+      (`St.commodityChecking`), which it then registers as a declared one
+      (textual_directives.cc:814, journal.cc:397-410), recorded where
+      `run` reads the directive. C++ marks known as well the commodity of
+      a `D` directive (textual_directives.cc:160), which it also locks
+      (textual_directives.cc:165), so that `St.lockedPrec` stands for it;
+      the source of a price directive whose price is an expression
+      (pool.cc:610, 647) or that this reader does not read, where the
+      issue `price-expr` or `unread-price` stands in place of a point
+      (`Result.priceIssues`); and the larger unit of a `C` directive, to
+      which C++ copies the flags of the smaller unit
+      (`amount_t::parse_conversion`, amount.cc:1984-1985), where the
+      directive stands in `Result.equivs`, which the Driver's reason
+      `equivalence` refuses. These are all the places at which C++ marks
+      a commodity known as it reads a journal (pool.cc, journal.cc,
+      textual_directives.cc and amount.cc at 76b9dc2b2) -/
+  knownComms : List String := []
+  /-- set by a journal line that sets `--strict`, `--pedantic`,
+      `--strict-commodity` or `--pedantic-commodity`, in any spelling that
+      C++ reads as one of them, with `_` for `-` (the in-file option branch
+      of `handleDirective`), which C++ reads as the option of its session
+      (textual.cc:299-300, textual_directives.cc:213-252) and after which
+      it checks commodities, each of the four setting the style of that
+      check to a warning or an error and no other option setting it back
+      (session.h:280-310 at 76b9dc2b2), so that it marks known the
+      commodity of each later `commodity` directive (`St.knownComms`) -/
+  commodityChecking : Bool := false
+  /-- the commodities of the prices of `P` directives at which the
+      precision that this reader grants departs from the one that C++
+      grants, each once, the most recent first (`recordPriceGrant`,
+      `Result.pricePrecisionComms`) -/
+  pricePrecisionComms : List String := []
+  /-- set by an in-file `--now`, `--now_` or `--now-` line, which C++
+      reads alike (the in-file option branch of `handleDirective`), after
+      which the current time of C++ is not known here: the option takes a
+      time with its date (report.h:1059-1074 at 76b9dc2b2), and the end of
+      an included file and `end apply year` restore the time that came
+      before (textual_directives.cc:424-446, 593-595), while `nowSecs`
+      takes the date of a `--now` line alone, and nothing from the other
+      two, and keeps it to the end of the journal (`priceDirective`) -/
   nowInFile : Bool := false
   /-- set where the year that C++ gives a date of a month and a day may
       differ from `defaultYear`: from the start in a journal into which
@@ -736,15 +828,36 @@ structure St where
       (`priceDirective`), of a transaction with a cost
       (`recordCostPoints`) or of a note (`noteDateOf`) -/
   yearUnsure : Bool := false
-  /-- set where an input date format is given, by `--input-date-format`
-      or an in-file line of it: C++ then tries that format before its
-      own readers of a date without a time, which no longer read `.` and
-      `-` as `/` (times.cc:229-243, 319-327, 2499-2502), while
+  /-- set where an input date format is given, by the Driver's
+      `--input-date-format` or by a journal line that sets that option in
+      any spelling that C++ reads as it (the in-file option branch of
+      `handleDirective`): C++ then tries that format before its own
+      readers of a date without a time, which no longer read `.` and `-`
+      as `/` (times.cc:229-243, 319-327, 2499-2502), while
       `parse_datetime`, which reads a date with a time, still does
-      (times.cc:429-432). `dfmt` does not record this: it keeps the
-      order of the fields alone, and nothing for a format that names no
-      field (`priceDay`) -/
+      (times.cc:429-432), so that `priceDay` reads no date. `dfmt` does
+      not record this: it keeps the order of the fields alone, nothing
+      for a format that names no field, and nothing for a journal line
+      in a spelling other than `--input-date-format`, a departure of the
+      dates of transactions that the in-file option branch records -/
   inputDateFormat : Bool := false
+  /-- set by a journal line `--decimal_comma`, which C++ reads as
+      `--decimal-comma` (`find_option`, option.cc:71-94, and `is_eq`,
+      option.h:450-461, at 76b9dc2b2) and after which it reads every
+      amount with a decimal comma (session.h:233, amount.cc:1714-1715),
+      where this reader does not read amounts so already
+      (`amt.dcDefault`, which the Driver's `--decimal-comma` sets, and a
+      line in the hyphenated spelling, the only one that the in-file
+      option branch of `handleDirective` applies). A price that
+      `priceDirective` reads after the line, and a cost or lot price that
+      `recordCostPoints` writes, can then be a point at a value that C++
+      does not hold, and the issue `unread-price` stands in place of each
+      such point. The display precisions that this reader learns from the
+      amounts read after the line can depart as well, and every value row
+      shows the target at the precision learned for it, so that the line
+      itself records that issue without a commodity, and every value row
+      of the journal is refused (the in-file option branch) -/
+  decimalCommaUnapplied : Bool := false
   inComment : Bool := false
 
 private def err {α} (line : Nat) (msg : String) : Except String α :=
@@ -1272,6 +1385,23 @@ private def recordValueExprComms (st : St) (cs : List String) : St :=
     if c.isEmpty || acc.contains c then acc else c :: acc
   { st with valueExprComms := comms }
 
+/-- `st` with each commodity of `cs` that `St.fixatedLotComms` does not
+    hold yet added to it, the null commodity left out, since C++ keeps no
+    annotation on an amount without a commodity (amount.cc:1908) and so
+    fixates no lot price of one (`Result.fixatedLotComms`). -/
+private def recordFixatedLotComms (st : St) (cs : List String) : St :=
+  let comms := cs.foldl (init := st.fixatedLotComms) fun acc c =>
+    if c.isEmpty || acc.contains c then acc else c :: acc
+  { st with fixatedLotComms := comms }
+
+/-- `st` with the commodity `c` added to `St.knownComms` where that list
+    does not hold it yet, the null commodity left out, which a price
+    directive never grants a precision, since C++ grants one only to a
+    price with a commodity (pool.cc:628). -/
+private def recordKnownComm (st : St) (c : String) : St :=
+  if c.isEmpty || st.knownComms.contains c then st
+  else { st with knownComms := c :: st.knownComms }
+
 /-! ## Posting-line parsing -/
 
 private def stripStatus (s : String) : String :=
@@ -1337,6 +1467,10 @@ private structure AnnotTail where
   costLot : Option String
   /-- `PostSpec.costVirtual` -/
   costVirtual : Bool
+  /-- the cost is fixated, `@ =P` or `@@ =T`, or its own annotation
+      carries a fixated lot price, `{=P}` or `{{=T}}`, written after the
+      cost and before any balance assertion (`PostSpec.fixatedMark`) -/
+  costFixated : Bool
 
 /-- Consume the annotation/cost/assertion tail of an amount:
     `{lot} [date] (note) @ P / @@ T / = ASSERT` in any order. -/
@@ -1349,7 +1483,8 @@ private partial def annotLoop (ctx : AmtCtx) (line : Nat) (a : Amount)
     (lotLit : Option (Nat × Bool) := none) (costAnnotated : Bool := false)
     (costLot : Option String := none) (costVirtual : Bool := false)
     (annotDetails : Bool := false) (annotDate : Bool := false)
-    (lotExpr : Bool := false) (costExpr : Bool := false) :
+    (lotExpr : Bool := false) (costExpr : Bool := false)
+    (costFixated : Bool := false) :
     Except String AnnotTail := do
   -- `annotated`, `fixated` and `ownLot`: an annotation met before any
   -- cost or assertion belongs to the posting's own amount; after a
@@ -1362,14 +1497,60 @@ private partial def annotLoop (ctx : AmtCtx) (line : Nat) (a : Amount)
   -- expression met while `own` holds, `annotDate` a date, and `lotExpr` a
   -- value expression, which opens with a `(` that a second `(` follows
   -- directly (annotate.cc:203-246, `PostSpec.lotExpr`); `costExpr`: a
-  -- value expression met where `costAnnotated` is set (`PostSpec.costExpr`)
+  -- value expression met where `costAnnotated` is set (`PostSpec.costExpr`);
+  -- `costFixated`: a fixated cost, `@ =P` or `@@ =T`, or a fixated lot
+  -- price met where `costAnnotated` is set (`PostSpec.fixatedMark`)
   let own := !afterCost && !afterAssert
   let onCost := afterCost && !afterAssert && cost.any (·.comm != "")
   let t := trimS tail
+  -- a lone `.` ends the tail as an empty one does. It is the decimal mark
+  -- that ends the number of a prefix amount or cost, which `numTokenOf`
+  -- leaves in the tail and C++ keeps in the quantity (`parse_quantity`,
+  -- amount.cc:1575-1579): both C++ binaries accept `$10.`, `AAPL 10.`,
+  -- `10 AAPL @ $150.` and `= $10.` and show them as the oracle does. The
+  -- test accepts as well every other tail that trims to a lone `.`, which
+  -- C++ rejects ("Unexpected char '.'", textual_xacts.cc:906-910): a `.`
+  -- that white space sets apart, as in `10 AAPL .`, `10 AAPL {$150} .`,
+  -- `10 AAPL @ $150 .`, `10 AAPL = 10 AAPL .`, `10 AAPL .  ; a note`,
+  -- `= 10 AAPL .` and `= $10 .`, and one written directly after a closing
+  -- `}`, `]`, `)` or `"`, as in `10 AAPL {$150}.`, `10 AAPL [2026/01/01].`,
+  -- `10 AAPL (note).`, `(10 AAPL).`, `10 AAPL @ $150 {$2}.`,
+  -- `10 AAPL @ ($150).`, `= 10 AAPL {$150}.`, `= (10 AAPL).` and
+  -- `10 "AAPL".`, each rejected by both C++ binaries and accepted here
+  -- (fail-open): with `P 2026/02/01 AAPL $170`, the oracle prints
+  -- `AAPL|10|Assets:Broker` and `AAPL|-10|Assets:Cash` for
+  -- `Assets:Broker  10 AAPL .` against an elided `Assets:Cash`, as it does
+  -- for `Assets:Broker  10 AAPL {$150}.`, and, under
+  -- `--now 2026/08/26 --exchange '$'`, `>> value $|1700|Assets:Broker` and
+  -- `>> value $|-1700|Assets:Cash` with no `??` line. Where the quantity
+  -- holds a separator before the mark that the test serves, the two sides
+  -- read it differently: C++ checks the punctuation of the quantity with
+  -- the mark in it (amount.cc:1724-1827), while the number that
+  -- `readNumToken` reads here lacks it, so that both binaries reject an
+  -- amount in which an earlier period, or a comma that C++ would otherwise
+  -- read as a decimal comma, precedes the mark, such as `$1.5.`
+  -- ("Too many periods in amount", amount.cc:1730) and `$1,23.`
+  -- ("Incorrect use of thousand-mark comma", amount.cc:1797), and under
+  -- the decimal comma one in which any comma precedes it, such as `$1,5.`
+  -- ("Too many commas in amount", amount.cc:1759), each accepted here
+  -- (fail-open): for `Assets:Broker  $1,23.` against an elided
+  -- `Assets:Cash` the oracle prints `%% dc $`, `$|1.23|Assets:Broker` and
+  -- `$|-1.23|Assets:Cash`, and under those flags the value rows $1.23 and
+  -- $-1.23 with no `??` line, while `$1,234.`, `$1,000.` and `$1'234.`
+  -- agree with C++. And the test serves the mark only where it ends the
+  -- field: where a cost, a lot price, date or note, or a balance assertion
+  -- follows the mark, the tail is no lone `.`, and the last branch below
+  -- rejects the journal ("trailing junk after amount"), while both
+  -- binaries read the mark and what follows it (fail-closed): each accepts
+  -- `$10. @ 5 EUR`, `AAPL 10. @@ $1500`, `$10. {EUR 5}`,
+  -- `$10. [2026/01/01]`, `$10. (lot note)`, `$10. = $10`,
+  -- `AAPL 10. @ $150`, `AAPL 10. {$150}` and `10 AAPL @ $150. {$2}`, and
+  -- for the first shows $10 and EUR-50 under `bal` and $10 and $-100
+  -- under `bal -X $`
   if t.isEmpty || t == "." then
     pure { lot, cost, teach, costDecs, annotated, annotDetails, annotDate, lotExpr,
            costExpr, fixated, ownLot, perUnit, lotLit, costAnnotated, costLot,
-           costVirtual }
+           costVirtual, costFixated }
   else if t.startsWith "{" then
     -- `{{total}}` and `{per-unit}` lot prices, possibly `{=fixated}`;
     -- lots parse with PARSE_NO_MIGRATE — no precision teaching
@@ -1414,6 +1595,7 @@ private partial def annotLoop (ctx : AmtCtx) (line : Nat) (a : Amount)
       (costLot := costLot') (costVirtual := costVirtual)
       (annotDetails := annotDetails) (annotDate := annotDate)
       (lotExpr := lotExpr) (costExpr := costExpr)
+      (costFixated := costFixated || (onCost && fix))
   else if t.startsWith "[" then
     match takeBalanced '[' ']' t.toList with
     | some (_, rest) =>
@@ -1423,7 +1605,7 @@ private partial def annotLoop (ctx : AmtCtx) (line : Nat) (a : Amount)
           (lotLit := lotLit) (costAnnotated := costAnnotated || onCost)
           (costLot := costLot) (costVirtual := costVirtual)
           (annotDetails := annotDetails || own) (annotDate := annotDate || own)
-          (lotExpr := lotExpr) (costExpr := costExpr)
+          (lotExpr := lotExpr) (costExpr := costExpr) (costFixated := costFixated)
     | none => err line s!"unclosed lot date in '{t}'"
   else if t.startsWith "(" && !(t.startsWith "(@") then
     match takeBalanced '(' ')' t.toList with
@@ -1436,13 +1618,14 @@ private partial def annotLoop (ctx : AmtCtx) (line : Nat) (a : Amount)
           (annotDetails := annotDetails || own) (annotDate := annotDate)
           (lotExpr := lotExpr || (own && inner.head? == some '('))
           (costExpr := costExpr || (onCost && inner.head? == some '('))
+          (costFixated := costFixated)
     | none => err line s!"unclosed lot note in '{t}'"
   else if t.startsWith "(@@)" || t.startsWith "@@" then
     let off := if t.startsWith "(@@)" then 4 else 2
     let rest0 := trimS (t.drop off).toString
     -- `@@ =` fixates the total cost (1794); balancing is unchanged
-    let rest0 := if rest0.startsWith "=" then trimS (rest0.drop 1).toString
-      else rest0
+    let fixC := rest0.startsWith "="
+    let rest0 := if fixC then trimS (rest0.drop 1).toString else rest0
     let pr ← parseAmount ctx line rest0
     let mag := if pr.amount.q < 0 then -pr.amount.q else pr.amount.q
     let signed := if a.q < 0 then -mag else mag
@@ -1453,6 +1636,7 @@ private partial def annotLoop (ctx : AmtCtx) (line : Nat) (a : Amount)
       (costLot := costLot) (costVirtual := t.startsWith "(@@)")
       (annotDetails := annotDetails) (annotDate := annotDate)
       (lotExpr := lotExpr) (costExpr := costExpr)
+      (costFixated := costFixated || (fixC && !afterAssert))
   else if t.startsWith "(@)" || t.startsWith "@" then
     -- per-unit costs round at the cost literal's own precision,
     -- posting by posting (regress/1125); `@ =` fixates (1794). A cost
@@ -1461,8 +1645,8 @@ private partial def annotLoop (ctx : AmtCtx) (line : Nat) (a : Amount)
     -- reach only `costDecs`
     let off := if t.startsWith "(@)" then 3 else 1
     let rest0 := trimS (t.drop off).toString
-    let rest0 := if rest0.startsWith "=" then trimS (rest0.drop 1).toString
-      else rest0
+    let fixC := rest0.startsWith "="
+    let rest0 := if fixC then trimS (rest0.drop 1).toString else rest0
     let pr ← parseAmount ctx line rest0
     annotLoop ctx line a pr.tail lot
       (some ⟨pr.amount.comm, pr.amount.q * a.q⟩) teach true
@@ -1472,6 +1656,7 @@ private partial def annotLoop (ctx : AmtCtx) (line : Nat) (a : Amount)
       (costLot := costLot) (costVirtual := t.startsWith "(@)")
       (annotDetails := annotDetails) (annotDate := annotDate)
       (lotExpr := lotExpr) (costExpr := costExpr)
+      (costFixated := costFixated || (fixC && !afterAssert))
   else if t.startsWith "=" then
     -- assertion: the C++ side checks it; positive tests pass it, but
     -- the literal still teaches display precision (1699). C++ parses
@@ -1501,7 +1686,7 @@ private partial def annotLoop (ctx : AmtCtx) (line : Nat) (a : Amount)
       (costAnnotated := costAnnotated) (costLot := costLot)
       (costVirtual := costVirtual) (annotDetails := annotDetails)
       (annotDate := annotDate)
-      (lotExpr := lotExpr) (costExpr := costExpr)
+      (lotExpr := lotExpr) (costExpr := costExpr) (costFixated := costFixated)
   else
     err line s!"trailing junk after amount '{t}'"
 
@@ -1554,6 +1739,8 @@ private structure AmountField where
   costLotComm : Option String := none
   /-- `PostSpec.amtPrec` -/
   amtPrec : Nat := 0
+  /-- `PostSpec.fixatedMark` -/
+  fixatedMark : Bool := false
 
 /-- Parse the amount field of a posting (everything after the
     account): amount, lot annotations, cost, assertion/assignment.
@@ -1570,16 +1757,60 @@ private def parseAmountField (ctx : AmtCtx) (line : Nat) (field : String)
     -- (the departure recorded at `PostSpec.fixated`), but for `lotExpr`,
     -- since C++ keeps the value expression of an annotated target in the
     -- amount that it computes (textual_xacts.cc:807, 855-858;
-    -- `PostSpec.lotExpr`). Its amount teaches as an assertion's does,
-    -- with the departures recorded at the `=` branch of `annotLoop`:
-    -- after `Assets:Cash  $1.00` against an elided `Equity` and
-    -- `Assets:Cash  = $1.0000000` against another, C++ prints a later
-    -- `($1/3)` against an elided `Equity` as `$0.3333333`, where it shows
-    -- as 0.33 here (wrong rows)
+    -- `PostSpec.lotExpr`), and for `fixatedMark`, set for a fixated lot
+    -- price on the target, which C++ keeps in that amount as well
+    -- (`PostSpec.fixatedMark`). C++ reads the target alone, a literal with its
+    -- annotations, each kind at most once (annotate.cc:157, 193, 213-214,
+    -- 249), or an amount expression without any (textual_xacts.cc:756-760),
+    -- and rejects whatever follows it but a note ("Unexpected char",
+    -- textual_xacts.cc:906-910), while `annotLoop` reads after the target a
+    -- cost, `@ P`, `@@ T`, `(@) P` or `(@@) T`, a balance assertion, `= A`,
+    -- and a lone `.`, as the comment at its test in `annotLoop` records, after
+    -- a literal a second lot price, date, note or value expression, as after a
+    -- posting amount (below), and after an amount expression its annotations
+    -- as well, all of which this branch drops but for the two flags: such a
+    -- journal is accepted here (fail-open). With `P 2026/02/01 AAPL $170`,
+    -- both C++ binaries reject `Assets:Broker  = 10 AAPL @ $150` against an
+    -- elided `Assets:Cash` ("Unexpected char '@'"), and the oracle prints
+    -- `AAPL|10|Assets:Broker` and `AAPL|-10|Assets:Cash` and, under
+    -- `--now 2026/08/26 --exchange '$'`, `>> value $|1700|Assets:Broker` and
+    -- `>> value $|-1700|Assets:Cash` with no `??` line, as it does with
+    -- `@@ $1500`, `(@) $150`, `{$150} @ $150`, `= 10 AAPL`, `{$150} {$160}`,
+    -- `{$150} {=$160}`, `[2026/01/01] [2026/01/02]`, `(a) (b)` or `.` in place
+    -- of `@ $150`, and for `= (10 AAPL) {$150}`, each rejected by both C++
+    -- binaries as well, those with a second annotation as
+    -- "Commodity specifies more than one price", "date" or "tag". Where the
+    -- target has a commodity, a fixated cost, `@ =$150` or `@@ =$1500` in that
+    -- place, a fixated lot price on the cost, as in `@ $150 {=$2}`, a first
+    -- lot price that is fixated, as in `{=$150} {$160}`, or a fixated lot
+    -- price after an amount expression, as in `= (10 AAPL) {=$50}`, sets
+    -- `fixatedMark` too (`AnnotTail.costFixated`, `AnnotTail.fixated`), and a
+    -- value expression after an amount expression, as in
+    -- `= (10 AAPL) ((200))`, or one of two, as in `((200)) ((300))`, sets
+    -- `lotExpr`. Since this branch drops the cost, `finalizeXact` records the
+    -- commodity of the target alone, for either flag, and never that of a
+    -- fixated cost, so that the fixated-lot and value-expression branches of
+    -- the Driver refuse the value rows of such a journal,
+    -- `?? exchange fixated-lot AAPL` or `?? exchange value-expression AAPL`,
+    -- while its net rows still print, only where a flow in that commodity is
+    -- nonzero, as in each shape above, written with 10 AAPL, and elsewhere do
+    -- not refuse them: with `P 2026/02/01 EUR $2` as well and a transaction
+    -- `Assets:Euro  100 EUR` against `Equity` before it,
+    -- `Assets:Broker  = 0 AAPL @ =150 EUR` against an elided `Assets:Cash`,
+    -- which both C++ binaries reject ("Unexpected char '@'"), gives
+    -- `>> value $|200|Assets:Euro` and `>> value $|-200|Equity` with no `??`
+    -- line, as do `= 0 AAPL @ 150 EUR {=$2}`, `= (0 AAPL) {=$50}` and
+    -- `= (0 AAPL) ((200))` in its place, each rejected by both binaries.
+    -- Its amount teaches as an assertion's does, with the departures
+    -- recorded at the `=` branch of `annotLoop`: after `Assets:Cash  $1.00`
+    -- against an elided `Equity` and `Assets:Cash  = $1.0000000` against
+    -- another, C++ prints a later `($1/3)` against an elided `Equity` as
+    -- `$0.3333333`, where it shows as 0.33 here (wrong rows)
     let r ← parseAmount ctx line (trimS (field.drop 1).toString)
     let ann ← annotLoop ctx line r.amount r.tail none none
     pure { assignTarget := some r.amount, learned := r.learned
            decimals := r.decimals, lotExpr := r.amount.comm != "" && ann.lotExpr
+           fixatedMark := r.amount.comm != "" && (ann.fixated || ann.costFixated)
            teach := if r.decimals <= 6 then [(r.amount.comm, r.decimals)] else [] }
   else do
     -- a leading lot `{P} AMT` has no witness: C++ rejects the form
@@ -1610,7 +1841,7 @@ private def parseAmountField (ctx : AmtCtx) (line : Nat) (field : String)
     -- keeps the first.
     let { lot, cost, teach, costDecs, annotated, annotDetails, annotDate, lotExpr,
           costExpr, fixated, ownLot, perUnit, lotLit, costAnnotated, costLot,
-          costVirtual } ←
+          costVirtual, costFixated } ←
       annotLoop ctx line a r.tail preLot none (annotated := preLot.isSome)
         (fixated := preLot.any (·.2)) (ownLot := preLot.isSome)
     -- the precision of the cost amount, for the widened zero test of
@@ -1753,7 +1984,7 @@ private def parseAmountField (ctx : AmtCtx) (line : Nat) (field : String)
            lotExpr := hasComm && lotExpr, costExpr
            fixated := hasComm && fixated, costPrec, costAnnotated
            rawCost := cost, rawCostPrec, costVirtual, costLotComm := costLot
-           amtPrec }
+           amtPrec, fixatedMark := costFixated }
 
 private def parsePosting (st : St) (line : Nat) (raw : String)
     (periodic : Bool := false) :
@@ -1796,7 +2027,8 @@ private def parsePosting (st : St) (line : Nat) (raw : String)
                      costPrec := af.costPrec, costAnnotated := af.costAnnotated
                      rawCost := af.rawCost, rawCostPrec := af.rawCostPrec
                      costVirtual := af.costVirtual
-                     costLotComm := af.costLotComm, amtPrec := af.amtPrec },
+                     costLotComm := af.costLotComm, amtPrec := af.amtPrec
+                     fixatedMark := af.fixatedMark },
               af.learned, af.amount.map (·.comm), af.decimals, af.isExpr,
               af.teach)
 
@@ -2226,7 +2458,16 @@ private def costPrice (st : St) (p : PostSpec) : Option (String × Amount) := do
     `posting-date`, which stands alone where `priceDay` does not read
     that date, or else of the transaction's date as `priceDay` reads it
     (`xactHeaderParts`), failing which the issue `unread-price` stands in
-    place of the point. C++ makes the commodity of each price primary
+    place of the point. That issue stands in place of every point after a
+    journal line `--decimal_comma` read where this reader does not read
+    amounts with a decimal comma already, under neither the Driver's
+    `--decimal-comma` nor an earlier line in the hyphenated spelling
+    (`St.decimalCommaUnapplied`), a line that C++ reads as
+    `--decimal-comma`: after such a line, `Assets:A  10 AAPL @ $1.500`
+    against an elided `Assets:Cash` prices AAPL at $1500 on both C++
+    binaries, which show `$-15000` under `Assets:Cash`, where this reader
+    reads $1.5.
+    C++ makes the commodity of each price primary
     (commodity.cc:72-78, commodity.h:237), as it is here whether the
     table holds the point or an issue stands in its place. -/
 private def recordCostPoints (st : St) (header : String)
@@ -2235,6 +2476,9 @@ private def recordCostPoints (st : St) (header : String)
   points.foldl (init := st) fun st (comm, price, noted) =>
     let st := if st.primary.contains price.comm then st
       else { st with primary := price.comm :: st.primary }
+    if st.decimalCommaUnapplied then
+      { st with priceIssues := ("unread-price", comm) :: st.priceIssues }
+    else
     match noted, xactDay with
     | some (some d), _ =>
         { st with priceLog := ⟨d * 86400, comm, price⟩ :: st.priceLog
@@ -4836,7 +5080,7 @@ private def finalizeXact (st : St) (hline : Nat) (_header : String)
     let elided := pool.filter fun p => p.amount.isNone && p.assignTarget.isNone
     -- COST_PREC tagging: an inferred amount is tagged only when it fits
     -- the price precision recovered from a cost in its commodity
-    -- (set_cost_prec_if_needed, xact.cc:195-231). Four departures are
+    -- (set_cost_prec_if_needed, xact.cc:195-231). Five departures are
     -- known. First, C++ scans every posting of the transaction
     -- (xact.cc:210) and this scans the pool alone: after `$1.00` in
     -- another account, with `Assets:B  1 FOO @ $0.0004` against an elided
@@ -4874,7 +5118,17 @@ private def finalizeXact (st : St) (hline : Nat) (_header : String)
     -- `C` in C++, while `Driver` shows the lone inferred balance
     -- unrounded, and `P 2024/01/01 FOO $0.0001` in place of the first
     -- transaction, with `X  $1.00` after the transaction of `C` in place
-    -- of the directive, does the same. Each of the four reaches the debit
+    -- of the directive, does the same. Fifth, C++ reads the precision of
+    -- a cost as the cost amount carries it (xact.cc:214-216), which for a
+    -- per-unit `@` adds the decimals of the amount to those of the price,
+    -- the cost being the price times the amount (textual_xacts.cc:701-707),
+    -- while `pricePrec` reads the decimals of the cost literal alone, so
+    -- that an inferred amount that C++ tags can be left untagged here
+    -- (wrong rows): `A  2.5 FOO @ $3` completes an elided `C` with a
+    -- tagged `$-7.5` in C++, which both C++ binaries show so, and with an
+    -- untagged one here, which shows as `$-8`, and `A  1.5 FOO @ $0.0004`
+    -- completes it with a tagged `$-0.0006` in C++ and an untagged one
+    -- here, which leaves no row for `C`. Each of the five reaches the debit
     -- and credit counts of `bumpStat` as well; `Result.lotFanout` is set
     -- for the third, where a tagged completion is in a commodity that
     -- `PoolResult.splitComms` lists. This omits as well the test by which
@@ -5189,6 +5443,19 @@ private def finalizeXact (st : St) (hline : Nat) (_header : String)
   stv := { stv with priceIssues := exIssues.reverse ++ stv.priceIssues }
   stv := recordValueExprComms stv
     (valueComms ++ if valueTagged then flows.map (·.1.commodity) else [])
+  -- the commodities of the amounts to which C++ gives a fixated lot price
+  -- (`Result.fixatedLotComms`): an amount whose own lot price is fixated,
+  -- one that an `apply fixed` or `apply rate` rate annotates, and the
+  -- amount and the cost of a posting that `PostSpec.fixatedMark` marks, or
+  -- the target alone of a balance assignment, which has no `rawCost`, since
+  -- `parseAmountField` drops its cost; a periodic template records nothing,
+  -- since C++ adds none of its postings to the journal
+  if !periodic then
+    stv := recordFixatedLotComms stv (ordered.flatMap fun p =>
+      if p.fixated || p.rateFixed || p.fixatedMark then
+        (((p.rawAmount <|> p.assignTarget).map (valueExprNames stv ·.comm)).getD [])
+          ++ (if p.fixatedMark then (p.rawCost.map (·.comm)).toList else [])
+      else [])
   pure { stv with gens := flows :: stv.gens }
 
 /-- Split on a separator word at paren/quote depth zero. -/
@@ -5525,6 +5792,7 @@ private def finalizeAuto (st : St) (rawPosts : List (Nat × String)) :
       -- (`PostSpec.lotExpr`)
       let valueAll := rawPosts.any fun (_, raw) => namesValueTag (noteText raw)
       let mut lotComms : List String := []
+      let mut fixComms : List String := []
       let mut exprAll := false
       for (ln, raw) in rawPosts do
         let rawT := trimS raw
@@ -5632,6 +5900,19 @@ private def finalizeAuto (st : St) (rawPosts : List (Nat × String)) :
               if ann.lotExpr && r.amount.comm != "" then
                 lotComms := lotComms ++ valueExprNames st
                   ((st.commAliases.lookup r.amount.comm).getD r.amount.comm)
+              -- a template amount whose own lot price or cost is fixated,
+              -- or which an `apply fixed` or `apply rate` rate annotates,
+              -- as for a posting (`PostSpec.rateFixed`), each of which C++
+              -- keeps on every posting generated from the template
+              -- (`Result.fixatedLotComms`), whether the rule matches or not
+              -- (conservative)
+              let tmplComm := (st.commAliases.lookup r.amount.comm).getD r.amount.comm
+              if r.amount.comm != "" && (ann.fixated || ann.costFixated
+                  || (!ann.annotated && st.fixatedComms.contains (some tmplComm))) then
+                fixComms := fixComms ++ valueExprNames st tmplComm
+                  ++ (if ann.costFixated then
+                        (ann.cost.map fun c => (canonAmt st c).comm).toList
+                      else [])
               posts := { account := name, kind, fixed := some r.amount, mult := 1
                          cost := ann.cost
                          costPrec := if ann.perUnit then ann.costDecs + r.decimals
@@ -5639,6 +5920,7 @@ private def finalizeAuto (st : St) (rawPosts : List (Nat × String)) :
                          lotUnit := if ownLot then ann.lot.map (·.1) else none
                          lotTotal := ownLot && ann.lotLit.any (·.2) } :: posts
       let st := recordValueExprComms st lotComms
+      let st := recordFixatedLotComms st fixComms
       pure { st with
         autos := st.autos ++ [⟨branches, posts.reverse, nm, true, noteTag⟩]
         autoPred := rest
@@ -5800,12 +6082,33 @@ private def cppPriceComm (s : String) : Option String :=
       else cppSymbolOf cs
   | [] => some ""
 
+/-- The price of a `P` directive as C++ reads it, where this reader reads
+    it so (`priceDirective`): the commodity of the price, named through
+    the commodity aliases and reduced through the equivalences, as C++
+    names the commodity of the amount that it parses (pool.cc:121-127,
+    617; amount.cc:1905-1906), and the decimals written; and the source
+    commodity, which C++ marks known once it has read the price, whether
+    or not it records it (pool.cc:645-647), none where it rejects the
+    directive first because the price is in that commodity
+    (pool.cc:639-642). `recordPriceGrant` reads it. -/
+private structure PriceRead where
+  /-- the commodity of the price -/
+  comm : String
+  /-- the decimals of the price as written -/
+  decimals : Nat
+  /-- the source commodity that C++ marks known -/
+  known : Option String
+
 /-- The state `st` once the price directive `P DATE [TIME] SYMBOL PRICE`,
     whose text after `P` is `rest`, has written its point to the price
     log, the directive read as `parse_price_directive` reads it
-    (pool.cc:548-652), or once an issue stands in place of that point.
-    `handleDirective` passes the text after a `P` that the first field
-    follows directly, as in `P2024/01/02 EUR $1.10`, as well.
+    (pool.cc:548-652), or once an issue stands in place of that point,
+    with the price as C++ reads it (`PriceRead`) where the point is
+    recorded, where the issue `undated-price` stands in its place, and
+    where C++ rejects a price in the commodity that it prices, and none
+    where another issue stands in its place. `handleDirective` passes
+    the text after a `P` that the first field follows directly, as in
+    `P2024/01/02 EUR $1.10`, as well.
 
     - A field ends at a space or a tab (`next_element`,
       utils.h:623-640). When the second field begins with a digit it is
@@ -5821,7 +6124,7 @@ private def cppPriceComm (s : String) : Option String :=
       does not move it (textual_directives.cc:561-567). The point is
       recorded here at the instant of the Driver's `--now`, and the issue
       `undated-price` stands in its place without that `--now` and after
-      an in-file `--now` line (`St.nowInFile`).
+      an in-file `--now`, `--now_` or `--now-` line (`St.nowInFile`).
     - The symbol of a dated directive is the next field, or the text
       between double quotes, after which C++ skips one character
       (`commodity_t::parse_symbol`, commodity.cc:438-455), so that the
@@ -5872,13 +6175,21 @@ private def cppPriceComm (s : String) : Option String :=
     Where a directive is not read as C++ reads it, the issue
     `unread-price` stands in place of its point: a date or a time that
     `priceDay` or `priceInstant` does not read, a symbol that is missing
-    or whose quote is not closed, and a price that `parseAmount` does not
+    or whose quote is not closed, a price that `parseAmount` does not
     read, that carries an annotation or whose commodity C++ reads
-    otherwise. C++ rejects the journal at most such directives
-    (pool.cc:551-552, 561-562; textual_directives.cc:195-200), and the
-    journal is read on here as before the table was kept (fail-open), so
-    that the issue changes no comparison; C++ reads the others, as it
-    reads `P 01/15 EUR $1.10` under no year directive and
+    otherwise, and a price that is an amount after a journal line
+    `--decimal_comma` read where this reader does not read amounts with
+    a decimal comma already, under neither the Driver's `--decimal-comma`
+    nor an earlier line in the hyphenated spelling
+    (`St.decimalCommaUnapplied`), a line that C++ reads as
+    `--decimal-comma`: after such a line, `P 2024/01/02 AAPL $1.500` is a
+    price of $1500 in C++, which values `10 AAPL` at $15000 on both
+    binaries, and would be one of $1.5 here. C++ rejects the journal at
+    most such directives (pool.cc:551-552, 561-562;
+    textual_directives.cc:195-200), and the journal is read on here as
+    before the table was kept (fail-open), so that the issue changes no
+    comparison; C++ reads the others, as it reads `P 01/15 EUR $1.10`
+    under no year directive and
     `P 2024/01/01 EUR 5 A!B`, and there the issue marks the point that
     the table lacks.
     Three departures are known, and in each the table holds a point that
@@ -5927,8 +6238,12 @@ private def cppPriceComm (s : String) : Option String :=
     After `D $1,000.00` and a posting of `$1,5`, `P 2024/01/04 Z $1,500`
     is a price of $1500 in C++ and of $1.5 here, and after a periodic
     template with a posting of `1.000,50 EUR`, `P 2024/01/04 Z 1,234 EUR`
-    is a price of 1.234 EUR in C++ and of 1234 EUR here. -/
-private def priceDirective (st : St) (n : Nat) (rest : String) : St := Id.run do
+    is a price of 1.234 EUR in C++ and of 1234 EUR here. The style that
+    a journal line `--decimal_comma` gives C++ alone is not among them,
+    since the issue `unread-price` stands in place of every point read
+    after it (above). -/
+private def priceDirective (st : St) (n : Nat) (rest : String) :
+    St × Option PriceRead := Id.run do
   let blank := fun (c : Char) => c == ' ' || c == '\t'
   let field := fun (s : String) => String.ofList (s.toList.takeWhile (!blank ·))
   let after := fun (s : String) =>
@@ -5938,7 +6253,7 @@ private def priceDirective (st : St) (n : Nat) (rest : String) : St := Id.run do
     { st with priceIssues := (i, c) :: st.priceIssues }
   let dateS := field rest
   let rest1 := after rest
-  if rest1.isEmpty then return issue "unread-price" ""
+  if rest1.isEmpty then return (issue "unread-price" "", none)
   -- the instant of the directive, `none` where it is not read or not
   -- known, whether it has a date, and the text that holds the symbol
   -- and the price, after the date and the time
@@ -5957,34 +6272,97 @@ private def priceDirective (st : St) (n : Nat) (rest : String) : St := Id.run do
           (cs.findIdx? (· == '"')).map fun i =>
             (String.ofList (cs.take i), String.ofList (cs.drop (i + 2)))
       | _ => some (field symPrice, after symPrice)
-  let some (sym, priceS) := symP | return issue "unread-price" ""
-  if sym.isEmpty then return issue "unread-price" ""
+  let some (sym, priceS) := symP | return (issue "unread-price" "", none)
+  if sym.isEmpty then return (issue "unread-price" "", none)
   let comm := (st.commAliases.lookup sym).getD sym
-  if dated && instant.isNone then return issue "unread-price" comm
+  if dated && instant.isNone then return (issue "unread-price" comm, none)
   let priceT := trimS priceS
-  if priceT.startsWith "(" then return issue "price-expr" comm
+  if priceT.startsWith "(" then return (issue "price-expr" comm, none)
+  -- an amount, which C++ reads with a decimal comma, after a journal line
+  -- `--decimal_comma` read where this reader does not read amounts with a
+  -- decimal comma already (`St.decimalCommaUnapplied`)
+  if st.decimalCommaUnapplied then return (issue "unread-price" comm, none)
   match parseAmount { st.amt with defines := [] } n priceT with
-  | .error _ => return issue "unread-price" comm
+  | .error _ => return (issue "unread-price" comm, none)
   | .ok r =>
       if r.tail.startsWith "{" || r.tail.startsWith "[" || r.tail.startsWith "(" then
-        return issue "unread-price" comm
+        return (issue "unread-price" comm, none)
       -- the commodity of the price must be the one that C++ reads
       -- (commodity.cc:331-349, 359-381, 404-436; amount.cc:1550-1580,
       -- 1617-1659): it reads `5 A!B` as 5 A, and `5 and` and `5, USD` as
       -- 5 in no commodity
       if cppPriceComm priceT != some r.amount.comm then
-        return issue "unread-price" comm
+        return (issue "unread-price" comm, none)
       let price := canonAmt st r.amount
-      if price.comm == comm then return st
+      let read := fun (known : Option String) =>
+        some { comm := price.comm, decimals := r.decimals, known : PriceRead }
+      if price.comm == comm then return (st, read none)
       let primary :=
         if st.primary.contains price.comm then st.primary
         else price.comm :: st.primary
       match instant with
       | some t =>
-          return { st with priceLog := ⟨t, comm, price⟩ :: st.priceLog, primary }
+          return ({ st with priceLog := ⟨t, comm, price⟩ :: st.priceLog, primary },
+            read (some comm))
       | none =>
-          return { st with
-            priceIssues := ("undated-price", comm) :: st.priceIssues, primary }
+          return ({ st with
+            priceIssues := ("undated-price", comm) :: st.priceIssues, primary },
+            read (some comm))
+
+/-- The state `st1`, which is `st0` once the `P` arm of `handleDirective`
+    has granted the precision `grant`, or none, after a price directive
+    whose price C++ reads as `read` gives (`priceDirective`), with the
+    commodity of that price added to `St.pricePrecisionComms` where the
+    precision that the directive leaves it here differs from the one that
+    it leaves it in C++, or else a commodity other than that of the price
+    to which a precision of one decimal or more is granted here; and with
+    the source that C++ marks known added to `St.knownComms`. C++ grants
+    the commodity of the price the decimals of the price where its
+    precision is 0 and it is neither known nor locked (pool.cc:628-634),
+    while the `P` arm grants a precision only to a commodity for which
+    none is recorded, and finds the price as the last field or the last
+    two. The precision that C++ holds before the directive is taken to be
+    the one recorded here, `St.lockedPrec` stands for a locked commodity
+    (COMMODITY_STYLE_NO_MIGRATE) and `St.knownComms` for a known one, so
+    that a precision that this reader learns otherwise than C++ before the
+    directive, a departure that the docstring of `costPrice` lists, is not
+    recorded here: after `apply fixed XYZ $1.123`, which gives `$` three
+    tentative places in C++ (pool.cc:628-634) and none here,
+    `P 2024/01/03 EUR $1.1111` leaves `$` three places in C++ and four
+    here, and `bal -X $` shows $3.333 for an account of `3 EUR` on both
+    C++ binaries, where the value row is $3.3333. Where the two precisions
+    agree, the mark of a tentative precision that one side alone sets
+    (COMMODITY_PRECISION_FROM_PRICE, `St.tentativePrec`) changes nothing
+    that follows: they can then differ only on a commodity of precision
+    0, whose precision a later amount with decimals sets to those
+    decimals whether it replaces the precision or raises it
+    (amount.cc:1839-1849, `bumpPrecision`). C++ marks the commodity of a
+    `commodity` directive known only while it checks commodities
+    (journal.cc:397-410), after `--strict`, `--pedantic` or their forms
+    for commodities alone, options that the Driver does not take and
+    that `St.commodityChecking` follows where a journal line sets them,
+    in any spelling that C++ reads as one of them.
+    Where `priceDirective` does not read the price, an issue stands in its
+    place (`Result.priceIssues`) and nothing is recorded here. -/
+private def recordPriceGrant (st0 st1 : St) (read : Option PriceRead)
+    (grant : Option (String × Nat)) : St :=
+  match read with
+  | none => st1
+  | some r =>
+      let precOf := fun (s : St) (c : String) => (s.precisions.lookup c).getD 0
+      let cppGrants := r.comm != "" && precOf st0 r.comm == 0
+        && !st0.knownComms.contains r.comm && !st0.lockedPrec.contains r.comm
+      let cppPrec := if cppGrants then r.decimals else precOf st0 r.comm
+      let departs := r.comm != "" && precOf st1 r.comm != cppPrec
+      let stray := grant.filter fun (g, d) => g != r.comm && d > 0
+      let st1 := match r.known with
+        | some k => recordKnownComm st1 k
+        | none => st1
+      match (if departs then some r.comm else stray.map (·.1)) with
+      | some c =>
+          if st1.pricePrecisionComms.contains c then st1
+          else { st1 with pricePrecisionComms := c :: st1.pricePrecisionComms }
+      | none => st1
 
 /-- The state `st` with an `apply` directive pushed, as the innermost,
     onto the three lists that hold one entry for each `apply` directive in
@@ -6112,7 +6490,16 @@ private def handleDirective (st : St) (n : Nat) (t : String) :
         -- directive without a date (textual_directives.cc:473-474,
         -- 530-540; pool.cc:548-572), whose first field names the
         -- commodity, through the commodity aliases, and which needs a
-        -- price after it (`St.fixatedComms`)
+        -- price after it (`St.fixatedComms`). C++ records no price for it
+        -- (do_not_add_price, textual_directives.cc:535) but marks the
+        -- commodity known (pool.cc:645-647), so that no later price
+        -- directive grants it a precision (`St.knownComms`): after
+        -- `apply fixed EUR $1.10` and `end apply fixed`,
+        -- `P 2024/01/01 FOO 1.25 EUR` leaves EUR at no decimal place, and
+        -- `bal -X EUR` shows `EUR12` for an account of `10 FOO` on both
+        -- C++ binaries. C++ also grants the commodity of the price a
+        -- tentative precision (pool.cc:628-634), which this reader omits,
+        -- a departure that the docstring of `zeroTestPrec` lists
         let arg := trimS (restS.drop kw.length).toString
         let sym := String.ofList
           (arg.toList.takeWhile fun c => c != ' ' && c != '\t')
@@ -6123,10 +6510,37 @@ private def handleDirective (st : St) (n : Nat) (t : String) :
           else none
         let tag := if kw != "tag" then none
           else if arg.contains ':' then some arg else some s!":{arg}:"
+        let st := match fixed with
+          | some c => recordKnownComm st c
+          | none => st
         pure { pushApply st none fixed tag with yearUnsure }
   | "end" =>
-      -- `end`, `end apply ...`, `end account`, `end tag` all close
-      -- the innermost apply; a stray `end test`/`end comment` does not
+      -- C++ takes the kind of the `apply` that an `end` line closes from
+      -- the text after the first word that follows `end`, whatever that
+      -- word is (`end_apply_directive`, textual_directives.cc:573-598 at
+      -- 76b9dc2b2), so that `end`, `end apply`, `end account`, `end tag`,
+      -- a stray `end test` or `end comment`, and `end WORD` for any one
+      -- word close the innermost `apply`, while `end apply KIND`, and
+      -- `end WORD KIND` alike, close it only where KIND is its label, the
+      -- label of `apply rate` being `fixed` (530-541), and C++ rejects the
+      -- journal otherwise, as it rejects an `end` that no `apply` encloses
+      -- (test/regress/coverage-wave11-end-apply-empty.test,
+      -- test/regress/coverage-wave11-end-apply-mismatch.test). This arm
+      -- closes the innermost entry, if there is one, where the text after
+      -- `end` is empty or begins with `apply`, `account`, `tag`, `fixed`,
+      -- `year` or `rate`, whatever follows, and nothing otherwise, and so
+      -- departs in both directions (fail-open). `end apply rate` after
+      -- `apply rate $ 2 GBP`, `end apply tag` or `end foo bar` after
+      -- `apply account Foo`, and an `end apply` or an `end foo` that no
+      -- `apply` encloses are rejected by both C++ binaries and accepted
+      -- here. And after `apply account Foo` and then `end foo`,
+      -- `end test` or `end foo account`, a posting of $5 to `Assets:Cash`
+      -- against an elided `Equity` shows under `Assets:Cash` on both C++
+      -- binaries and under `Foo:Assets:Cash` here, a departure that the
+      -- value rows inherit: with `10 AAPL` in its place and
+      -- `P 2024/01/02 AAPL $2`, `bal -X $` shows $20 under
+      -- `Assets:Broker` on both, and the value row is
+      -- `$|20|Foo:Assets:Broker`
       if restS.isEmpty || restS.startsWith "apply"
           || restS.startsWith "account" || restS.startsWith "tag"
           || restS.startsWith "fixed" || restS.startsWith "year"
@@ -6185,39 +6599,40 @@ private def handleDirective (st : St) (n : Nat) (t : String) :
       -- follows it: `P 2024/01/01 EUR $1.2345 ; note` gives an unseen `$`
       -- four tentative places in C++ and none here, so that a later
       -- `($1/3)` against an elided posting shows as `$0.3333` in C++ and
-      -- leaves no row here (wrong rows). The point of the directive, or
-      -- the issue that stands in its place, is recorded first, by
-      -- `priceDirective`, whose docstring records where its reading
-      -- departs from that of C++; the two touch different parts of the
-      -- state, so their order is immaterial
-      let st := priceDirective st n restS
+      -- leaves no row here (wrong rows). Each directive at which the
+      -- precision that this rule leaves the commodity of the price differs
+      -- from the one that C++ leaves it is recorded
+      -- (`recordPriceGrant`, `Result.pricePrecisionComms`). The point of
+      -- the directive, or the issue that stands in its place, is recorded
+      -- first, by `priceDirective`, whose docstring records where its
+      -- reading departs from that of C++; the two touch different parts
+      -- of the state, so their order is immaterial
+      let (st, read) := priceDirective st n restS
       let toks := (restS.splitOn " ").filter (!·.isEmpty)
-      match toks.reverse with
-      | last :: _ =>
-          (match parseAmount st.amt n last with
-           | .ok r =>
-               if r.amount.comm != ""
-                   && (st.precisions.lookup r.amount.comm).isNone then
-                 pure { st with
-                   precisions := (r.amount.comm, r.decimals) :: st.precisions
-                   tentativePrec := r.amount.comm :: st.tentativePrec }
-               else pure st
-           | .error _ =>
-               -- SYM PRICE tail split across two tokens
-               match toks.reverse with
-               | amtTok :: symTok :: _ =>
-                   (match parseAmount st.amt n (symTok ++ " " ++ amtTok) with
-                    | .ok r =>
-                        if r.amount.comm != ""
-                            && (st.precisions.lookup r.amount.comm).isNone then
-                          pure { st with
-                            precisions := (r.amount.comm, r.decimals)
-                              :: st.precisions
-                            tentativePrec := r.amount.comm :: st.tentativePrec }
-                        else pure st
-                    | .error _ => pure st)
-               | _ => pure st)
-      | _ => pure st
+      -- the price as this rule finds it: the last field, or the last two
+      -- where the last alone is not an amount (a SYM PRICE tail split
+      -- across two fields)
+      let found : Option (String × Nat) :=
+        match toks.reverse with
+        | last :: rest =>
+            match parseAmount st.amt n last with
+            | .ok r => some (r.amount.comm, r.decimals)
+            | .error _ =>
+                match rest with
+                | symTok :: _ =>
+                    match parseAmount st.amt n (symTok ++ " " ++ last) with
+                    | .ok r => some (r.amount.comm, r.decimals)
+                    | .error _ => none
+                | [] => none
+        | [] => none
+      let grant := found.filter fun (c, _) =>
+        c != "" && (st.precisions.lookup c).isNone
+      let granted := match grant with
+        | some (c, d) =>
+            { st with precisions := (c, d) :: st.precisions
+                      tentativePrec := c :: st.tentativePrec }
+        | none => st
+      pure (recordPriceGrant st granted read grant)
   | "C" => do
       -- commodity equivalence: `C 1.00s = 100c`
       match restS.splitOn "=" with
@@ -6283,7 +6698,12 @@ private def handleDirective (st : St) (n : Nat) (t : String) :
               pure { st with amt := { st.amt with styles := (c, b) :: st.amt.styles } }
           | none => pure st
       | .error _ => pure st
-  | "N" => pure st       -- no-market flag: valuation reports only
+  | "N" =>
+      -- no-market flag: valuation reports only. C++ also marks the
+      -- commodity known (textual_directives.cc:202-209), so that no price
+      -- directive grants it a precision (`St.knownComms`)
+      let sym := commodityDirectiveSymbol restS
+      pure (recordKnownComm st ((st.commAliases.lookup sym).getD sym))
   | "Y" =>
       pure { st with defaultYear := restS.toNat?.map Int.ofNat }
   | "year" =>
@@ -6322,15 +6742,167 @@ private def handleDirective (st : St) (n : Nat) (t : String) :
       if word.startsWith "Y" && (word.drop 1).toString.toList.all Char.isDigit then
         pure { st with defaultYear := (word.drop 1).toString.toNat?.map Int.ofNat }
       else if word.startsWith "--" then
-        -- in-file option lines: apply the parse-semantic ones,
-        -- ignore the report-time rest (the C++ reader accepts any)
+        -- in-file option lines, which C++ applies as it reads them, as options
+        -- of its session or of its report (textual.cc:299-300,
+        -- textual_directives.cc:213-252 at 76b9dc2b2), rejecting a line whose
+        -- name it does not know ("Illegal option",
+        -- textual_directives.cc:251-252): both C++ binaries reject
+        -- `--no-such-option`, a line accepted here (fail-open). The branches
+        -- below apply `--decimal-comma`, `--recursive-aliases`,
+        -- `--input-date-format` and `--now`, and record what the value rows of
+        -- the Driver read of four kinds of line: an input date format
+        -- (`St.inputDateFormat`), a time that `--now` sets (`St.nowInFile`),
+        -- the checking of commodities that four options start
+        -- (`St.commodityChecking`) and a decimal comma that this reader does
+        -- not apply (`St.decimalCommaUnapplied`). Every other line is ignored
+        -- here (fail-open), although C++ applies some of them as it reads the
+        -- journal, each departure measured on both C++ binaries:
+        -- `--no-aliases` stops the expansion of account aliases
+        -- (session.h:317-321, journal.cc:263-264), so that after
+        -- `alias A=Assets:Cash` and `--no-aliases`, a posting of $5 to `A`
+        -- shows under `A` there and under `Assets:Cash` here;
+        -- `--check-in-file-order` makes a balance assignment read the postings
+        -- that precede it in the file rather than those dated no later than it
+        -- (session.h:212-216, textual_xacts.cc:411-439), so that
+        -- `Assets:Cash  = $15` dated 2024/01/01, after $10 dated 2024/01/05,
+        -- posts $5 there and $15 here; `--day-break` splits a timelog entry at
+        -- midnight (session.h:223-227, timelog.cc:141-169), so that an
+        -- automated transaction on `date >= [2024/03/01]` books 2.00h of an
+        -- entry from 22:00 on 2024/02/29 to 02:00 on 2024/03/01 there and
+        -- nothing here; `--file` adds a journal to the list of files that C++
+        -- is reading, after clearing the list that it is walking
+        -- (session.h:246-255, global.cc:225, session.cc:241), and both C++
+        -- binaries then behave differently from one run to the next, exiting
+        -- with status 1 or 139 or printing the rows of the journal without the
+        -- added file; and `--check-payees` makes C++ reject, under
+        -- `--pedantic`, a payee that no directive declares
+        -- (journal.cc:353-375). `--permissive` sets the permissive checking
+        -- style at once (session.h:292-296), under which C++ accepts a
+        -- transaction that a balance assignment leaves unbalanced in one
+        -- commodity, adjusting the posting whose amount the assignment
+        -- computes (xact.cc:932-955, test/regress/2005.test), where this
+        -- reader rejects such a transaction (fail-closed; the docstring of
+        -- `impliedExchange`): after a line `--permissive`,
+        -- `Assets:Cash  $10` against `Equity` and then
+        -- `Assets:Cash  = $15` with `Expenses  $3`, both C++ binaries show
+        -- $7 under `Assets:Cash`, and reject the journal without the line,
+        -- while this reader rejects it either way; under the `--permissive`
+        -- that the harness gives on the command line, the line changes
+        -- nothing. C++ applies `--account-value-expr`,
+        -- `--commodity-value-expr`, `--value-expr`, `--time-round`,
+        -- `--lot-matching`, `--price-db`, `--master-account` and `--hashes`
+        -- before it reads the journal (session.cc:148-221, 265, 289-291), so
+        -- that a line of them changes nothing there either, as measured, and
+        -- `--explicit` changes nothing (session.cc:183-185). The report
+        -- options, `--time-colon` (session.h:236, amount.cc:281-283) and the
+        -- options of `--download` (global.cc:270-279, report.cc:193-205) take
+        -- effect only once C++ has read the journal, changing what it shows, a
+        -- shape that the docstring of the Driver's `exchangeRows` records. Two
+        -- report options act at once instead: `--now`, applied below, and
+        -- `--ignore-diacritics`, which sets the folding of accents that C++
+        -- applies to a pattern as it compiles it and to a text as it matches
+        -- it (report.h:988; mask.cc:362-371, mask.h:125-146), so that a
+        -- match that C++ makes after the line can differ wherever its
+        -- pattern was read, save that an automated transaction keeps the
+        -- result that its quick matcher recorded for an account before the
+        -- line (xact.cc:1466-1491). After a line `--ignore-diacritics`,
+        -- `= /Cafe/` with `(Budget)  $1` books $1 to `Budget` for a posting
+        -- of $5 to `Expenses:Café` on both C++ binaries, whether the
+        -- automated transaction comes before the line or after it, where
+        -- this reader books nothing, and `= /Café/` read before the line
+        -- books nothing for that posting on both and $1 here (fail-open);
+        -- where a posting to `Expenses:Café` that `= /Cafe/` tested comes
+        -- before the line, both book nothing for a later posting to that
+        -- account and $1 for one to `Expenses:Café:Dinner`, and this reader
+        -- nothing for either
         let base := (word.splitOn "=").headD word
         let val :=
           if (word.splitOn "=").length > 1 then
             String.intercalate "=" ((word.splitOn "=").drop 1)
           else restS
+        -- the name as C++ looks it up, each `-` read as `_`: `find_option`
+        -- does so and tries the name with a `_` appended before the name
+        -- itself (option.cc:71-94 at 76b9dc2b2), and `is_eq` matches a
+        -- declared name that ends in `_`, an option that takes an argument,
+        -- with or without that `_`, and any other declared name exactly
+        -- (option.h:450-461), so that `--strict_commodity` sets
+        -- `--strict-commodity`, `--now_ DATE` sets `--now` and
+        -- `--input-date-format- FORMAT` sets `--input-date-format`, while
+        -- both C++ binaries reject `--decimal-comma-` and `--permissive_`
+        -- ("Illegal option"). The four records that the value rows read,
+        -- `St.inputDateFormat`, `St.nowInFile`, `St.commodityChecking` and
+        -- `St.decimalCommaUnapplied`, follow every such spelling. The
+        -- branches that apply `--decimal-comma`, `--recursive-aliases`, the
+        -- format of `--input-date-format` (`dfmt`) and the date of `--now`
+        -- (`nowSecs`) read the spelling given alone, a departure that
+        -- predates the records, and each of the four can give wrong rows
+        -- (fail-open): with `--recursive_aliases`, `alias A=B` and
+        -- `alias B=C`, a posting of $5 to `A` shows under `C` on both C++
+        -- binaries and under `B` here; with `--decimal_comma`, `1.000 EUR`
+        -- is a thousand euros on both and one euro here; with
+        -- `--input_date_format %d/%m/%Y` and then
+        -- `= expr date >= [2024/02/01]` with `(Budget)  $1`, a transaction
+        -- dated `01/03/2024` gives `Budget` $2 on both and nothing here,
+        -- where its date is read as 2024/01/03, and `Assets:Cash  = $15`
+        -- dated `02/03/2024`, after $10 dated `05/01/2024`, posts $5 on
+        -- both and $15 here; and after `--now_ 2024/03/01`, a check-in at
+        -- 22:00 on 2024/02/29 that no check-out closes shows `2.00h` on
+        -- both, closed at that date, and is closed here at the Driver's
+        -- `--now`
+        let cppName := String.ofList
+          ((base.drop 2).toString.toList.map fun c => if c == '-' then '_' else c)
         if base == "--decimal-comma" then
+          -- once C++ has read the line, it shows every amount with a
+          -- decimal comma, whatever the style of its commodity
+          -- (amount.cc:308-310, 324-326 at 76b9dc2b2), while the Driver
+          -- declares a decimal comma only for a style that this reader
+          -- learns (`%% dc`), a missing declaration under either spelling,
+          -- which the value rows share where they are printed (the branch
+          -- below refuses them under the other spelling, unless this
+          -- reader reads amounts with a decimal comma already): after
+          -- `Assets:Cash  $10.50` against `Equity` and then the line, both
+          -- C++ binaries show `$10,50`, and the oracle prints
+          -- `$|10.5|Assets:Cash` with no `%% dc $` line; and after
+          -- `P 2024/01/02 AAPL $1.500`, the line and `10 AAPL`, `bal -X $`
+          -- shows `$15,000`, fifteen dollars, on both, and the value row is
+          -- `$|15|Assets:A`
           pure { st with amt := { st.amt with dcDefault := true } }
+        else if cppName == "decimal_comma" then
+          -- `--decimal_comma`, which C++ reads as `--decimal-comma` (above;
+          -- the lookup of session.cc:445 at 76b9dc2b2 names it
+          -- `decimal_comma`, and its handler makes C++ read every later
+          -- amount with a decimal comma, session.h:233,
+          -- amount.cc:1714-1715). Where this reader does not read amounts
+          -- so already, the amounts read after the line can depart in two
+          -- ways that reach the value rows where the net rows agree. A
+          -- price, a cost or a lot price can be a point at a value that C++
+          -- does not hold: with `10 AAPL` and then
+          -- `P 2024/01/02 AAPL $1.500`, `bal -X $` shows $15000 on both C++
+          -- binaries, where this reader would value at $15. And the
+          -- precision learned from an amount can depart, the precision at
+          -- which every value row in its commodity shows: with
+          -- `P 2024/01/01 EUR 3 AAPL` and `2 AAPL` before the line and
+          -- `1.500 EUR` against `-1.500 EUR` after it, `bal -X EUR` shows
+          -- `1 EUR` on both, which read 1500 at the precision 0, where the
+          -- value row would show 0.667 EUR. The line is recorded
+          -- (`St.decimalCommaUnapplied`) with the issue `unread-price`
+          -- without a commodity, so that every value row of the journal is
+          -- refused, those valued through a price read before the line
+          -- among them, in excess where neither an amount read after the
+          -- line nor what C++ shows departs, and that issue also stands in
+          -- place of every point that a price directive, a cost or a lot
+          -- price gives after the line; `amt.dcDefault` is left as it was,
+          -- the departure of the default rows above. Under the Driver's
+          -- `--decimal-comma`, or after a line in the hyphenated spelling,
+          -- C++ and this reader read every amount with a decimal comma
+          -- already, and the line changes nothing in either: under that
+          -- flag, after the line, `Assets:A  10 AAPL @ $1,5` against
+          -- `Assets:Cash` gives the value rows $15 and $-15 that both C++
+          -- binaries show
+          if st.amt.dcDefault || st.decimalCommaUnapplied then pure st
+          else pure { st with
+            decimalCommaUnapplied := true
+            priceIssues := ("unread-price", "") :: st.priceIssues }
         else if base == "--recursive-aliases" then
           pure { st with recursiveAliases := true }
         else if base == "--input-date-format" then
@@ -6341,6 +6913,30 @@ private def handleDirective (st : St) (n : Nat) (t : String) :
             else none
           pure { st with dfmt := if order.isEmpty then none else some order
                          inputDateFormat := true }
+        else if cppName == "input_date_format"
+            || cppName == "input_date_format_" then
+          -- `--input_date_format`, `--input-date-format-`,
+          -- `--input_date_format_` and the other spellings that C++ reads as
+          -- `--input-date-format` (above; the lookup of session.cc:461 at
+          -- 76b9dc2b2 names it `input_date_format_`, and its handler sets
+          -- the format in which C++ reads every later date without a time,
+          -- session.h:270-275, while it reads a date with a time without
+          -- it, times.cc:421-442): with `--input_date_format %Y/%d/%m`,
+          -- `1 AAPL`, `P 2024/01/01 AAPL $3` and `P 2024/03/01 AAPL $5`,
+          -- `bal -X $ --now 2024/02/01` shows $5 on both C++ binaries, which
+          -- date the second price 2024/01/03, where this reader, which does
+          -- not apply the format, would date it 2024/03/01 and value at $3;
+          -- and with `Y 2024`, `--input_date_format %d/%m`,
+          -- `P 01/03 AAPL $101`, `P 02/01 AAPL $102` and `2 AAPL`,
+          -- `bal -X $` shows $202 on both, where this reader would give
+          -- $204. It is recorded (`St.inputDateFormat`), so that `priceDay`
+          -- reads no date, and the value rows of a journal whose prices,
+          -- costs or notes it would date are refused, and `dfmt` is left as
+          -- it was, the departure above. Prices whose dates carry a time
+          -- are read as C++ reads them: with `P 2024/01/01 00:00:00 AAPL $3`
+          -- and `P 2024/03/01 00:00:00 AAPL $5` in place of the two above,
+          -- both C++ binaries and the value rows value `1 AAPL` at $3
+          pure { st with inputDateFormat := true }
         else if base == "--now" then
           -- `headerDate` reads a date of three fields alone, where C++
           -- also reads a time after the date, or a period
@@ -6353,6 +6949,32 @@ private def handleDirective (st : St) (n : Nat) (t : String) :
           match headerDate none (trimS val) with
           | some d => pure { st with nowSecs := some ((d * 86400 : Int) : ℚ) }
           | none => pure st
+        else if cppName == "now_" then
+          -- `--now_` and `--now-`, which C++ reads as `--now` (above; the
+          -- lookup of report.cc:1809 at 76b9dc2b2 names it `now_`): with
+          -- `P 2024/02/01 AAPL $4`, `P 2024/04/01 AAPL $5` and a line
+          -- `--now_ 2024/03/01` or `--now- 2024/03/01`,
+          -- `bal -X $ --now 2026/08/26` shows $4 for `1 AAPL` on both C++
+          -- binaries, as with `--now`. It is recorded (`St.nowInFile`), and
+          -- `nowSecs` is left as it was, the departure above
+          pure { st with nowInFile := true }
+        else if cppName == "strict" || cppName == "pedantic"
+            || cppName == "strict_commodity" || cppName == "pedantic_commodity" then
+          -- C++ checks commodities from here on (session.h:280-310 at
+          -- 76b9dc2b2), and so marks known the commodity of each later
+          -- `commodity` directive (journal.cc:397-410,
+          -- textual_directives.cc:814; `St.commodityChecking`): after
+          -- `--strict`, `commodity $` and `commodity AAPL`, with
+          -- `Assets:Broker  3 AAPL` against an elided `Equity`,
+          -- `P 2024/02/01 AAPL $170.25` leaves `$` at no decimal place, and
+          -- `bal -X $` shows $511 for `Assets:Broker` on both C++ binaries,
+          -- and $510.75 without the `--strict` line; with
+          -- `--strict_commodity` or `--pedantic_commodity` in its place both
+          -- show $511 as well (the lookup of session.cc:476-485 names the
+          -- four). The checks themselves are not modelled: under
+          -- `--pedantic` C++ rejects a posting to an account that no
+          -- directive declares, which is accepted here (fail-open)
+          pure { st with commodityChecking := true }
         else
           pure st
       else if word.startsWith "P" then
@@ -6364,8 +6986,10 @@ private def handleDirective (st : St) (n : Nat) (t : String) :
         -- (`priceDirective`), but the line is otherwise skipped as an
         -- unrecognized one, so that the tentative precision of the `P`
         -- arm is not granted, a known departure with the consequences
-        -- that the `P` arm describes (wrong rows, fail-open)
-        pure { priceDirective st n (trimS (t.drop 1).toString) with errFlag := true }
+        -- that the `P` arm describes (wrong rows, fail-open), recorded as
+        -- the `P` arm records its own (`recordPriceGrant`)
+        let (st', read) := priceDirective st n (trimS (t.drop 1).toString)
+        pure { recordPriceGrant st' st' read none with errFlag := true }
       else
         -- unrecognized word directive: the C++ reader warns and
         -- skips it (and its indented block) under --permissive
@@ -6559,8 +7183,11 @@ structure Result where
       a date whose instant is not known here. The issue `unread-price`
       stands for a directive that is not read as C++ reads it
       (`priceDirective`); for a cost in a transaction whose date
-      `priceDay` does not read, and for the lot price that Phase 6
-      records beside such a cost (`recordCostPoints`); and, once for each
+      `priceDay` does not read, or that follows a journal line
+      `--decimal_comma` read where this reader does not read amounts with
+      a decimal comma already (`St.decimalCommaUnapplied`), and for the
+      lot price that Phase 6 records beside such a cost
+      (`recordCostPoints`); and, once for each
       of its two commodities, for the costs of an implicit exchange whose
       prices this reader does not compute: in a transaction in which a
       balance assignment computes the amount of a must-balance posting in
@@ -6584,10 +7211,14 @@ structure Result where
       zero beside such an amount, whose rate has then a precision unknown
       here as well (`exchangePoints`). Without a commodity it also stands
       for a price directive whose symbol is missing or empty or whose
-      quote is not closed (`priceDirective`), and for a transaction
-      dropped for a UUID seen before with a posting that `parsePosting`
-      does not read (`finalizeXact`); elsewhere an entry without a
-      commodity names the null commodity. The issue `exchange-order`
+      quote is not closed (`priceDirective`), for a transaction dropped
+      for a UUID seen before with a posting that `parsePosting` does not
+      read (`finalizeXact`), and for the first journal line
+      `--decimal_comma` read where this reader does not read amounts with
+      a decimal comma already, after which the display precisions that it
+      learns can depart from those of C++ (`St.decimalCommaUnapplied`);
+      elsewhere an entry without a commodity names the null commodity.
+      The issue `exchange-order`
       stands, once for each of its two commodities, for the costs of an
       implicit exchange whose sides the order of the two entries of the
       balance decides (`exchangePoints`). The issue `posting-date` stands
@@ -6795,6 +7426,88 @@ structure Result where
       xact.cc:1509-1511, journal.cc:477-479), which is accepted here,
       since the engine evaluates no such assertion (fail-open) -/
   valueExprAll : Bool
+  /-- the commodities of the amounts to which C++ gives a fixated lot
+      price, each once, in the order in which they are first recorded:
+      in a transaction with a date that is not dropped for its UUID, the
+      commodity of a posting amount whose own lot price is fixated, `{=P}`
+      or `{{=T}}` (`PostSpec.fixated`), of one that an `apply fixed` or
+      `apply rate` directive annotates (`PostSpec.rateFixed`), and of the
+      amount and the cost of a posting that `PostSpec.fixatedMark` marks,
+      both, though C++ fixates one of them alone (conservative, as the
+      docstring of that field records, so that the commodity recorded can be
+      one that C++ values through the price graph), or of the target alone
+      where that posting is a balance assignment, whose cost the reader
+      drops, so that where a fixated cost, a cost with a fixated lot price
+      or, after a target that is an amount expression, a fixated lot price
+      follows the target, each a line that C++ rejects, the fixated-lot
+      branch of the Driver does not refuse the value rows where no flow in
+      the commodity of the target is nonzero (as that docstring records);
+      and the commodity of a template amount of an automated transaction
+      whose own lot price or cost is fixated, or which such a directive
+      annotates, and that of its cost where the cost is fixated, which C++
+      keeps on every posting generated from the template
+      (xact.cc:1545-1549), whether the rule matches or not
+      (conservative). C++ values an amount whose annotation price is
+      fixated at that price, before it consults the price graph
+      (amount.cc:1269-1273, 1323-1327; annotate.cc:403-405), so that the
+      dated price table (`prices`) does not give its value:
+      with `P 2024/02/01 AAPL $170`, `bal -X $` shows $1500 for
+      `10 AAPL {=$150}` against an elided posting, and as much under
+      `apply fixed AAPL $150` for `10 AAPL` against `$-1500`, on both C++
+      binaries. The commodity of an amount is named through the commodity
+      aliases, and again reduced through the commodity equivalences where
+      that differs (`valueExprNames`), and that of a cost is named through
+      the aliases and reduced, as C++ reduces a cost when it parses it
+      (`PostSpec.rawCost`). The null commodity is never recorded,
+      since C++ keeps no annotation on an amount without one
+      (amount.cc:1908), and a periodic template records nothing, since
+      C++ adds none of its postings to the journal (`flushPending`) -/
+  fixatedLotComms : List String
+  /-- a journal line sets `--now`, spelled `--now`, `--now_` or `--now-`
+      (`St.nowInFile`). C++ reads the line as the option of its report,
+      which sets the instant at which it values, its terminus, to the time
+      that the line gives (report.h:1059-1074 at 76b9dc2b2), after any
+      `--now` of its command line, so that this instant can differ from
+      the one that the Driver's `--now` gives: with `P 2024/02/01 AAPL $4`,
+      `P 2024/04/01 AAPL $5` and a line `--now 2024/03/01`,
+      `bal -X $ --now 2026/08/26` shows $4 for `1 AAPL` on both C++
+      binaries. After such a line, as without the Driver's `--now`, a
+      price directive without a date takes the issue `undated-price` in
+      place of its point (`priceIssues`) -/
+  nowInFile : Bool
+  /-- an `alias` subdirective of a `commodity` block was read after a
+      point of the table that names the alias or the block's commodity
+      (`St.aliasPrices`). Where the alias takes a name that C++ already
+      gives a commodity of its own, C++ retires that commodity and gives
+      its vertex of the price graph, with the prices recorded on it, to
+      the block's commodity, which no longer reads the prices recorded on
+      its own vertex (pool.cc:150-173, history.cc:336-349), while the
+      table keeps each point under the commodity that its directive
+      named, the departure recorded at `priceDirective`: after
+      `P 2024/01/01 E $1`, `P 2024/01/01 EUR $3` and then `commodity EUR`
+      with `alias E`, `bal -X $` values a later `10 EUR` at $10 on both
+      C++ binaries, where the table's point of `EUR` gives $30. It is set
+      wherever such a point comes before the alias, whether or not C++
+      retires a commodity there (conservative) -/
+  aliasPrices : Bool
+  /-- the commodities of the prices of `P` directives at which the
+      precision that this reader grants departs from the one that C++
+      grants (`recordPriceGrant`; the rule of the `P` arm of
+      `handleDirective`), each once, in the order in which they are first
+      recorded. Such a departure changes the display precision of the
+      commodity until an amount with decimals sets it, and with it the
+      rounding of the price that Phase 6 records for a cost in that
+      commodity (`costPrice`). After `Assets:Cash  $1000` against an
+      elided posting, `3 AAPL @ $170` against `Assets:Cash` and then
+      `P 2024/02/01 AAPL $170.25`, `bal -X $` shows $510.75 for the AAPL
+      account on both C++ binaries, where the precision kept here shows
+      $511; after `P 2024/01/01 EUR $1.2345` and
+      `P 2024/01/01 FOO 1.25 EUR`, `bal -X EUR` shows `EUR12` for an
+      account of 10 FOO, where the precision kept here shows 12.5 EUR; and
+      after `Expenses:X  $1419` against an elided posting and
+      `P 2024/01/02 XYZ $0.1182`, `2492 EUR @@ $4.073` records the price
+      $0.0016344302 in C++ and $0.001634 here -/
+  pricePrecisionComms : List String
 
 private def flushPending (st : St) : Except String St := do
   match st.pending with
@@ -7418,7 +8131,14 @@ def run (input0 : String) (dcDefault : Bool := false)
             -- rejected here as ambiguous (fail-closed)
             let al := trimS (body.drop "alias ".length).toString
             let al := (unquote al).getD al
-            st := { st with commAliases := (al, comm) :: st.commAliases }
+            -- a point already recorded on the alias name or on the block's
+            -- commodity: where C++ retires a commodity here, the table then
+            -- departs from its price graph (`Result.aliasPrices`)
+            let priced := st.priceLog.any fun pt =>
+              pt.comm == al || pt.price.comm == al || pt.comm == comm
+                || pt.price.comm == comm
+            st := { st with commAliases := (al, comm) :: st.commAliases
+                            aliasPrices := st.aliasPrices || priced }
             continue
           else if body.startsWith "format " then
             -- the format subdirective DECLARES the display precision
@@ -7628,9 +8348,13 @@ def run (input0 : String) (dcDefault : Bool := false)
         let nm := resolveAccount st ((unquote nm).getD nm)
         st := { st with pending := .acctBlock [(0, nm)] }
       else if t.startsWith "@commodity " || t.startsWith "!commodity " then
+        -- read as `commodity` is read, below
         let nm := trimS (t.drop "@commodity ".length).toString
         let sym := commodityDirectiveSymbol nm
-        st := { st with pending := .commBlock ((unquote nm).getD nm) sym }
+        let st' := if st.commodityChecking then
+            recordKnownComm st ((st.commAliases.lookup sym).getD sym)
+          else st
+        st := { st' with pending := .commBlock ((unquote nm).getD nm) sym }
       else if t.startsWith "account " || t.startsWith "account\t" then
         -- account_directive registers the block's name under the
         -- `apply account` stack, unless an alias fires
@@ -7644,11 +8368,28 @@ def run (input0 : String) (dcDefault : Bool := false)
       else if t.startsWith "commodity " || t.startsWith "commodity\t" then
         let nm := trimS (t.drop "commodity ".length).toString
         let sym := commodityDirectiveSymbol nm
-        st := { st with pending := .commBlock ((unquote nm).getD nm) sym }
+        -- while C++ checks commodities it registers the directive's
+        -- commodity, found through the commodity aliases
+        -- (pool.cc:121-135), as a declared one and marks it known
+        -- (textual_directives.cc:808-814, journal.cc:397-410;
+        -- `St.commodityChecking`, `St.knownComms`)
+        let st' := if st.commodityChecking then
+            recordKnownComm st ((st.commAliases.lookup sym).getD sym)
+          else st
+        st := { st' with pending := .commBlock ((unquote nm).getD nm) sym }
       else if t.startsWith "payee " || t.startsWith "tag " then
         st := { st with pending := .ignoreBlock }  -- label declarations
       else if t.startsWith "@" || t.startsWith "!" then
-        -- historical directive prefixes
+        -- historical directive prefixes, which C++ drops as well before it
+        -- tries the word directives and then those of one letter
+        -- (textual.cc:321-372 at 76b9dc2b2), among which no line begins
+        -- with `-`, so that it rejects an option line after the prefix,
+        -- which the in-file option branch of `handleDirective` reads here
+        -- (fail-open): both C++ binaries reject
+        -- `!--input_date_format %Y/%d/%m` and `@--input_date_format %Y/%d/%m`
+        -- ("Unrecognized source line", textual.cc:372) and `!--permissive`
+        -- ("Directive '--permissive' requires an argument",
+        -- textual_directives.cc:1035-1037)
         st ← handleDirective st n (t.drop 1).toString
       else if isCommentStart c then
         continue
@@ -7678,7 +8419,8 @@ def run (input0 : String) (dcDefault : Bool := false)
   pure ⟨st.gens.reverse, st.rewrites, st.equivs, st.precisions,
         st.amt.styles, st.flowStats, st.signStats, st.lotFanout,
         priceTable st.priceLog, st.primary.reverse, st.priceIssues.reverse,
-        st.valueExprComms.reverse, st.valueExprAll⟩
+        st.valueExprComms.reverse, st.valueExprAll, st.fixatedLotComms.reverse,
+        st.nowInFile, st.aliasPrices, st.pricePrecisionComms.reverse⟩
 
 /-- Apply report-time account rewrites (`account-rewrite`,
     `capture`) to a name. -/

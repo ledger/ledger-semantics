@@ -147,9 +147,10 @@ decimal-comma style, with `%% dc *` naming the null commodity, so
 that a comparator can normalize the other side's output. A rejected
 file prints `!! ERROR` with a reason and nothing else, which keeps
 failure visible. Flags given before a file path apply to that file
-alone, and five are recognized: `--decimal-comma`,
+alone, and six are recognized: `--decimal-comma`,
 `--recursive-aliases`, `--now DATE`, `--input-date-format FORMAT`,
-and the opt-in output flag `--gross`, described below.
+and the opt-in output flags `--gross` and `--exchange COMM`, described
+below.
 
 An output flag is opt-in. A file given without one prints exactly the
 output described above, byte for byte, so that a comparator that does
@@ -185,6 +186,52 @@ files in excess and misses others, and the docstring of
 conditions and the known cases, each with a journal. Such a file is
 not rejected: its net rows still print, and a `??` line never stands
 in for `!! ERROR`.
+
+`--exchange COMM` adds, after the net rows and any gross lines, sorted
+lines of the form `>> value COMM|AMOUNT|ACCOUNT`, one for each account
+whose holdings have a nonzero value in `COMM` at the prices in effect
+at the report date, which is midnight at the start of the `--now`
+date, as the C++ program's `-X` option values them. A commodity other
+than `COMM` is priced through the only chain of recorded prices that
+links it to `COMM`, at the product of the prices along the chain, and
+each value is displayed in `COMM` as a net row is. The value of an
+account is the sum of `netValueAt` in `Ledger/Oracle.lean` over the
+account names that the report-time rewrites merge into it, and
+`netValueAt_eq_valueHom` in `Ledger/Market.lean` proves `netValueAt`
+equal to the value of an account name's property vector at the price
+vector, Ellerman's valuation of property at prices (p. 498), over a
+list of accounts without duplicates that holds every account with a
+nonzero flow, as the driver's list does. Where the oracle cannot value
+a file as the C++ program does, the single line `?? exchange REASON`
+takes the place of the value lines, with the commodity concerned after
+the reason where there is one. The reason is the first that applies of
+`no-terminus`, `price-expr`, `unread-price`, `exchange-order`,
+`value-expression`, `posting-date`, `fixated-lot`, `equivalence`,
+`commodity-alias`, `price-precision`, `null-commodity`, `percent`,
+`time-unit`, `no-price-path`, `alternative-price-path`,
+`zero-inverse-price` and `rounds-to-zero`, and the comment beside each
+branch of `exchangeRows` in `Ledger/Driver.lean` gives the rule of the
+C++ program that forces it, or states that it marks a limitation of
+the oracle. No reason covers the known departures that the value lines
+inherit from the net totals, from the dated price table and from the
+display precisions that the oracle learns, other than the precision
+that a price directive grants, which `price-precision` refuses. The
+comments beside the rules of the oracle record such departures, but
+not all of them: some known departures of the net totals, among them
+shapes that the C++ program rejects and the oracle accepts, are
+recorded beside no rule, so that a value line can depart from the C++
+program where no comment says so. No reason covers four further
+shapes either: a journal line that sets another report option or a
+session option that takes effect only once the C++ program has read
+the journal; a price read in a style other than the C++ program's; an
+assignment in an expression that the C++ program evaluates as it reads
+the journal; and such an expression that values a commodity at the
+report date, which leaves in the C++ program's cache of prices a price
+that a later price on its chain does not always clear. For these the
+value lines can depart from the C++ program, and the docstring of
+`exchangeRows` says where each is recorded. Such a file is not
+rejected: its net rows still print, and a `??` line never stands in
+for `!! ERROR`.
 
 The driver runs under the Lean interpreter, and the build
 deliberately produces no native executable, so that what executes

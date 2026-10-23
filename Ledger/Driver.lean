@@ -15,7 +15,8 @@ account, printing one canonical line per nonzero balance:
 
 sorted; report-time account rewrites are applied (merging flows) at
 output, and canonical-second time totals are displayed in the largest
-fitting unit (h/m/s) rounded to two decimals, as the C++ ledger does.
+fitting unit (h/m/s) rounded to two decimals, as the C++ ledger does
+but for the minute, a departure that `displayAmount` records.
 
 Run through the **interpreter** (never a `lean_exe`):
 
@@ -23,14 +24,21 @@ Run through the **interpreter** (never a `lean_exe`):
 
 Flags apply to the next file only (mirroring a test's own flags) and
 reset after it: `--decimal-comma`, `--recursive-aliases`,
-`--now DATE`, `--input-date-format FORMAT`, and the opt-in output flag
-`--gross`, which adds `>> dr ROW` and `>> cr ROW` lines of gross
-totals, summed posting by posting, after the net rows, or, in place of
-those lines, the single line `?? gross lot-annotated-completion`
-(`grossRows`). Each file's block starts with `== PATH`; a rejection
-prints `!! ERROR ...` for that file (fail-closed, never silent), and a
-`??` line is never a rejection. A file given without an output flag
-prints exactly the default protocol that the README describes.
+`--now DATE`, `--input-date-format FORMAT`, and the opt-in output
+flags `--gross` and `--exchange COMM`. `--gross` adds `>> dr ROW` and
+`>> cr ROW` lines of gross totals, summed posting by posting, after
+the net rows, or, in place of those lines, the single line
+`?? gross lot-annotated-completion` (`grossRows`). `--exchange COMM`
+adds, after the net and gross lines, `>> value ROW` lines that give
+the holdings of each account valued in `COMM` at the prices in effect
+at 00:00 of the `--now` date, each computed through `netValueAt`, or,
+in place of those lines, the single line `?? exchange REASON`, with
+the commodity concerned after the reason where there is one, for a
+file that the oracle cannot value as C++ does (`exchangeRows`). Each
+file's block starts with `== PATH`; a rejection prints `!! ERROR ...`
+for that file (fail-closed, never silent), and a `??` line is never a
+rejection. A file given without an output flag prints exactly the
+default protocol that the README describes.
 -/
 
 namespace Ledger
@@ -75,7 +83,13 @@ abbrev roundAt := Parse.roundAt
     76b9dc2b2, `cppRoundAt`): a total exactly half-way between two
     displayable values rounds as its binary expansion decides, so that
     at precision 1 a total of `0.35` shows as `0.3` and one of `0.45`
-    as `0.5`. -/
+    as `0.5`. The default of 2 departs from C++ for the minute, which C++
+    shows at the one place that its built-in conversion `1.0m` gives it
+    (session.cc:80 at 76b9dc2b2) unless an amount raises that precision
+    (amount.cc:1847-1848): after `Assets:Time  100s` against an elided
+    posting, `bal --flat` shows `1.7m` for `Assets:Time` on both C++
+    binaries, where this shows 1.67 (wrong rows). No journal of the
+    corpus shows it. -/
 def displayAmount (equivs : List (String × ℚ × String))
     (precisions : List (String × Nat)) (comm : String) (q : ℚ) :
     String × ℚ :=
@@ -145,7 +159,10 @@ def displayRow (res : Journal.Result) (stat : Nat × Nat) (a : Account)
   -- nonzero (`print_amount_from_balance`, src/balance.cc:561), each
   -- time by `amount_t::is_zero`, which reads the amount as it prints
   -- at its display precision, the rounding `cppRoundAt` reproduces
-  -- (src/amount.cc:1374-1430)
+  -- (src/amount.cc:1374-1430). For a value that `exchangeRows` computes,
+  -- C++ reads the exact value instead where the precision that the value
+  -- carries is not above the display precision (src/amount.cc:1407-1408),
+  -- and the reason `rounds-to-zero` stands wherever the two can differ
   if dispQ = 0 then none
   else some s!"{dispComm}|{ratToCanonical dispQ}|{a.name}"
 
@@ -211,12 +228,467 @@ def grossRows (res : Journal.Result) (arr : Array (List (Account × ℚ)))
         (">> cr " ++ ·)).toList
   (rows.toArray.qsort (· < ·)).toList
 
+/-- The edges of the price graph that C++ searches at an instant, from
+    the points `pts` of the dated price table that are not after that
+    instant (`Journal.pricesAt`): one edge for each two commodities that
+    a point links, in either direction, which carries the latest of
+    those points. C++ keeps the prices of two commodities on one edge of
+    an undirected graph (history.cc:114-120, 351-369) and reads, of an
+    edge, the latest price that is not after the instant
+    (`recent_edge_weight`, history.cc:257-263). The table holds one
+    point at each instant on each two commodities
+    (`Journal.Result.prices`), so that the latest is unique. A point that
+    would link a commodity to itself, which C++ never records
+    (pool.cc:639-642, history.cc:353), is left out. -/
+def priceEdges (pts : List Journal.PricePoint) : List Journal.PricePoint :=
+  pts.foldl (init := []) fun acc pt =>
+    if pt.comm == pt.price.comm then acc else
+    let same := fun (e : Journal.PricePoint) =>
+      (e.comm == pt.comm && e.price.comm == pt.price.comm)
+        || (e.comm == pt.price.comm && e.price.comm == pt.comm)
+    match acc.find? same with
+    | some e =>
+        if pt.secs > e.secs then acc.map fun r => if same r then pt else r
+        else acc
+    | none => acc ++ [pt]
+
+/-- The commodities that an edge of `es` links to `c`, each with that
+    edge. -/
+def priceNeighbors (es : List Journal.PricePoint) (c : String) :
+    List (String × Journal.PricePoint) :=
+  es.filterMap fun e =>
+    if e.comm == c then some (e.price.comm, e)
+    else if e.price.comm == c then some (e.comm, e)
+    else none
+
+/-- The tree of a breadth-first search of the edges `es` from the
+    commodity `s`: each commodity that it reaches, other than `s`, with
+    the commodity and the edge by which it is first reached. Each round
+    reaches the commodities one edge further, so that as many rounds as
+    there are edges, and one more, reach every commodity that a path of
+    `es` links to `s`. -/
+def priceTree (es : List Journal.PricePoint) (s : String) :
+    List (String × String × Journal.PricePoint) := Id.run do
+  let mut seen : List String := [s]
+  let mut frontier : List String := [s]
+  let mut tree : List (String × String × Journal.PricePoint) := []
+  for _ in [0:es.length + 1] do
+    let mut next : List String := []
+    for u in frontier do
+      for (v, e) in priceNeighbors es u do
+        if !seen.contains v then
+          seen := v :: seen
+          next := next ++ [v]
+          tree := tree ++ [(v, u, e)]
+    frontier := next
+  return tree
+
+/-- The hops of the path from `s` to `t` in the tree `tree` that
+    `priceTree` grows from `s`, each as the commodity that it leaves, the
+    commodity that it reaches and its edge, in order from `s`, or none
+    when the tree does not reach `t`. -/
+def treePath (tree : List (String × String × Journal.PricePoint))
+    (s t : String) : Option (List (String × String × Journal.PricePoint)) :=
+  let rec back : Nat → String → List (String × String × Journal.PricePoint) →
+      Option (List (String × String × Journal.PricePoint))
+    | 0, _, _ => none
+    | n + 1, v, acc =>
+        if v == s then some acc
+        else match tree.find? (·.1 == v) with
+          | some (_, u, e) => back n u ((u, v, e) :: acc)
+          | none => none
+  back (tree.length + 1) t []
+
+/-- What the price graph of the edges `es` gives the commodity `c` in
+    the target `t` (`chainVerdict`). -/
+inductive ChainVerdict where
+  /-- the rate `q` of the only chain, through the commodities `via` -/
+  | rate (q : ℚ) (via : List String)
+  /-- no chain links `c` to `t` -/
+  | noPath
+  /-- more than one chain links `c` to `t` -/
+  | alternative
+  /-- the only chain crosses a price of zero against its direction -/
+  | zeroInverse
+
+/-- The rate at which the edges `es` value one unit of the commodity
+    `c` in the target `t`, when a single chain of edges links the two.
+    The oracle admits only a commodity whose path of prices to the target
+    is unique, since it does not model the choice that C++ makes among
+    several paths, the one whose oldest price is the most recent
+    (Dijkstra's search with `f_max`, history.cc:538-544). A breadth-first
+    search finds a path (`priceTree`, `treePath`), and the path is the
+    only one exactly when every hop of it is a bridge, an edge without
+    which its two commodities are no longer linked. The rate is the
+    product of the rates of the hops, each the price of its edge or,
+    against the direction of the edge, the price inverted, as C++
+    multiplies the prices along the path that `find_price` finds
+    (history.cc:503-617) with exact rationals, rounding none
+    (amount.cc:705-751, 909-917). A single chain is the path that C++'s
+    search returns, whatever the ages of its prices. -/
+def chainVerdict (es : List Journal.PricePoint) (c t : String) : ChainVerdict :=
+  match treePath (priceTree es c) c t with
+  | none => .noPath
+  | some hops =>
+      let bridge := fun (u v : String) (e : Journal.PricePoint) =>
+        !((priceTree (es.filter (· != e)) u).any (·.1 == v))
+      if hops.any (fun (u, v, e) => !bridge u v e) then .alternative
+      else
+        let step := fun (r : ℚ) (hop : String × String × Journal.PricePoint) =>
+          let (u, _, e) := hop
+          if e.comm == u then some (r * e.price.q)
+          else if e.price.q == 0 then none
+          else some (r / e.price.q)
+        match hops.foldlM step 1 with
+        | some q => .rate q (hops.map (·.2.1))
+        | none => .zeroInverse
+
+/-- The value rows of an evaluated journal `res`, whose generators are
+    `arr`, whose term is `term`, whose flows touch the accounts `accts`,
+    whose net totals after the report-time rewrites are `merged`, and
+    whose net rows `displayRow` shows with the counts `stats`, for the
+    opt-in flag `--exchange target` with the Driver's `--now` at the
+    instant `terminus` (00:00 of its date), as C++ `bal --flat -X target`
+    values each account (src/report.h:904-909 and 1035-1039, the
+    `value_date` of src/report.cc:2157 being the terminus, at 76b9dc2b2;
+    `value_t::exchange_commodities`, src/value.cc:1924-1937, and
+    `balance_t::value`, src/balance.cc:291-305). Each commodity other
+    than the target is valued at the rate of its single chain of prices
+    at the terminus (`priceEdges`, `chainVerdict`), the target at 1, and
+    for each account after the rewrites the line `>> value ROW` carries
+    the sum, over the account names that the rewrites merge into it, of
+    `netValueAt`, its flows times those rates, displayed in the target by
+    `displayRow` as a net row is. C++ shows a value in the target itself,
+    never in a larger unit (`report_t::display_value`,
+    src/report.cc:815-821), as `displayRow` shows a total in every target
+    but the second, which it shows in the largest unit that fits, a case
+    that the reason `time-unit` refuses, whose comment also gives the
+    precisions at which C++ shows the minute and the hour. The list of
+    accounts `accts` has no duplicates and holds every account at which a
+    flow is nonzero, so that each sum is Ellerman's value of the account's
+    property vector at a price vector (p. 498), as
+    `netValueAt_eq_valueHom` in `Ledger/Market.lean` proves. A lone
+    inferred amount in the target keeps its recovered precision where
+    nothing else is added to it, as C++ copies an amount of the target
+    unvalued (amount.cc:1279-1280) and drops the mark of that precision
+    from a sum (amount.cc:634-642). The lines are sorted.
+
+    Where the oracle cannot value a file as C++ does, the single line
+    `?? exchange REASON`, with the commodity concerned after the reason
+    where there is one, replaces the value lines, the first reason that
+    applies in the order of the branches below, each with the witness
+    that forced it. Such a file is not rejected: its net rows still
+    print.
+
+    No reason covers the known departures that the value rows inherit
+    from what they are computed from, and a value row can then depart
+    from C++ (fail-open): those of the net totals and of their display;
+    those of the dated price table where no issue stands in place of a
+    point; and those of the display precisions that the reader learns,
+    but for the precision that a price directive grants, which the
+    reason `price-precision` refuses. The comments of the reader and of
+    `displayRow` record departures of the first kind, the docstrings of
+    `Journal.Result.priceIssues`, `priceDirective`, `costPrice` and
+    `exchangePoints` departures of the second, and the docstring of
+    `costPrice` lists departures of the third, but these records are
+    incomplete: some known departures of the net totals, among them
+    shapes that C++ rejects and the reader accepts, are recorded beside
+    no rule, so that a value row can depart from C++ where no comment
+    says so. A departure of the precision learned for the target reaches
+    every value row, which shows at that precision, so that a value row
+    can depart where the net rows agree: after
+    `Assets:Cash  $10` against an elided `Equity`, an automated
+    transaction `= /^NEVER/` with `(Budget)  $0.49`,
+    `P 2024/01/01 X $2` and `Assets:A  1.25 X` against an elided
+    `Equity`, `bal -X $` shows $2.50 for `Assets:A` on both C++
+    binaries, where the value row is $2, since the template teaches C++
+    alone two places for `$`. Among the departures of the dated price
+    table, `exchangePoints` records a price that the precision of an
+    amount expression rounds otherwise than C++: after
+    `Assets:Cash  $1.00` against an elided posting,
+    `Assets:A  (1.5 * 1.5 EUR)` against `Assets:B  $-10.00` and then
+    `Assets:C  1000000000 EUR` against an elided posting, `bal -X $`
+    shows $4444444444.40 for `Assets:C` on both C++ binaries, where the
+    value row is $4444444444.44. Four more shapes depart in the same
+    way. A journal line that sets a report option other than `--now`,
+    such as `--amount 7` or `--exchange EUR`, or a session option that
+    takes effect only once C++ has read the journal, changes what C++
+    shows while the reader ignores it (the in-file option branch of
+    Journal `handleDirective`), so that the value rows depart, with the
+    net rows or alone: `--download` makes C++ value through prices that
+    it fetches (src/global.cc:270-279, src/report.cc:193-205), and with
+    `--getquote` naming a script that quotes AAPL at $7, `bal -X $`
+    shows $70 for `10 AAPL` priced at $2 on both C++ binaries, where the
+    value row is $20. A price read in a style other than the one in
+    which C++ reads it is a point at a value that C++ does not hold
+    (`Journal.Result.priceIssues`): after `D $1,000.00` and a posting of
+    `$1,5`, `P 2024/01/04 Z $1,500` makes `bal -X $` show $1,500.00 for
+    a later `1 Z` on both C++ binaries, where the value row is $1.5. An
+    assignment in an expression that C++ evaluates as it reads the
+    journal, as in `check market(a, d, t) = 7` or in the note
+    `; Foo:: market(a, d, t) = 7`, defines a function that its valuation
+    calls, which `Journal.Result.valueExprAll` does not record (its
+    docstring lists the places): `bal -X $` then shows 7 for every
+    account on both C++ binaries. And an expression that C++ evaluates as
+    it reads the journal and that values a commodity at the terminus
+    leaves in the cache of prices that C++ keeps for that commodity
+    (`commodity_t::find_price`, src/commodity.cc:171-224) a price that the
+    report reads in place of the graph, though a later price of another
+    commodity on its chain changes it, since a new price clears the cache
+    of the commodity that it prices alone (src/commodity.cc:85): after
+    `P 2024/01/01 AAPL 100 EUR`, `P 2024/01/01 EUR $1`,
+    `Assets:Broker  3 AAPL` against an elided `Equity` with the line
+    `check market(1 AAPL, [2026/08/26], "$") > 0`, and then
+    `P 2024/01/03 EUR $2`, `bal -X $ --now 2026/08/26` shows $300 for
+    `Assets:Broker` on both C++ binaries, where the value row is $600. -/
+def exchangeRows (res : Journal.Result) (arr : Array (List (Account × ℚ)))
+    {A B : Object} (term : (specFor arr).FreeMor A B) (accts : List Account)
+    (merged : List (Account × ℚ)) (stats : String → String → Nat × Nat)
+    (target : String) (terminus : Option Int) : List String :=
+  let issue := fun (kind : String) =>
+    (res.priceIssues.find? (·.1 == kind)).map (·.2)
+  -- the commodities other than the target in which an account holds a
+  -- nonzero total, and those of a nonzero flow
+  let held := (((merged.filter fun (a, v) => v != 0 && a.commodity != target).map
+    (·.1.commodity)).eraseDups.toArray.qsort (· < ·)).toList
+  let flowComms := ((res.gens.flatten.filter fun (a, q) =>
+    q != 0 && a.commodity != target).map (·.1.commodity)).eraseDups
+  -- the graph at the terminus; without a terminus there is none, and the
+  -- branch no-terminus refuses first
+  let edges := match terminus with
+    | some t => priceEdges (Journal.pricesAt res.prices t)
+    | none => []
+  let verdicts := held.map fun c => (c, chainVerdict edges c target)
+  let firstWith := fun (pick : ChainVerdict → Bool) =>
+    (verdicts.find? (pick ·.2)).map (·.1)
+  let refusal : Option (String × String) :=
+    -- no-terminus: the rows value at 00:00 of the Driver's `--now`
+    -- date, as C++ sets its terminus from `--now` (report.h:1059-1074
+    -- at 76b9dc2b2; `Journal.pricesAt`). Without it the oracle has no
+    -- terminus, a limitation of the oracle's input rather than a rule
+    -- of C++, which then values at the current time (times.h:127-128).
+    -- A journal line that sets `--now`, spelled `--now`, `--now_` or
+    -- `--now-`, moves C++'s terminus to the date that it gives, at the
+    -- time of day that it gives where it has one (report.h:1065, 1070 at
+    -- 76b9dc2b2; `Journal.Result.nowInFile`), and the issue
+    -- `undated-price` stands for a price directive without a date, which
+    -- C++ dates at its current time (pool.cc:568-572) and which the
+    -- reader records only without the Driver's `--now` or after such a
+    -- line (`Journal.Result.nowInFile`), so that the branch refuses all
+    -- three, an oracle limitation each time
+    (if terminus.isNone || res.nowInFile || (issue "undated-price").isSome then
+      some ("no-terminus", "") else none)
+    -- price-expr: a price directive whose price is an expression, which
+    -- C++ evaluates and, for a result in several commodities, makes the
+    -- value expression of the commodity (pool.cc:589-615,
+    -- test/regress/1101.test), is not evaluated here and leaves no
+    -- point in the table; an oracle limitation
+    <|> (issue "price-expr").map ("price-expr", ·)
+    -- unread-price: a price directive, a cost or a lot price that the
+    -- reader does not read as C++ reads it, whose point the table lacks
+    -- (`Journal.Result.priceIssues`; the reader cascade of
+    -- times.cc:229-327, commodity.cc:331-349 and amount.cc:1617-1659 for
+    -- a directive), and, without a commodity, a journal line
+    -- `--decimal_comma` read where the reader does not read amounts with
+    -- a decimal comma already, after which C++ reads every amount with a
+    -- decimal comma (session.h:233, amount.cc:1714-1715), so that the
+    -- points and the display precisions that the reader takes from the
+    -- amounts read after it can depart
+    -- (`Journal.St.decimalCommaUnapplied`); an oracle limitation
+    <|> (issue "unread-price").map ("unread-price", ·)
+    -- exchange-order: the costs of an implicit exchange whose sides the
+    -- order of the two entries of the balance decides (xact.cc:386-393;
+    -- `Journal.Result.priceIssues`), whose points the table lacks; an
+    -- oracle limitation
+    <|> (issue "exchange-order").map ("exchange-order", ·)
+    -- value-expression: C++ values an amount through a value
+    -- expression before it consults the price graph: that of the
+    -- annotation of its commodity (annotate.cc:417-418, for a `((EXPR))`
+    -- lot), that of the commodity (commodity.cc:163-207), and the one
+    -- that `extend_post` gives a posting from its `Value` tag, its
+    -- account or the journal (post.cc:1040-1075); bare where an
+    -- expression can value any commodity (`Journal.Result.valueExprAll`),
+    -- and otherwise for the first commodity of
+    -- `Journal.Result.valueExprComms` in which a flow is nonzero
+    <|> (if res.valueExprAll then some ("value-expression", "") else none)
+    <|> (res.valueExprComms.find? flowComms.contains).map ("value-expression", ·)
+    -- posting-date: a cost, or a lot price recorded beside one, whose
+    -- price C++ records at the date that a note of its posting or of its
+    -- transaction, or an `apply tag`, gives (xact.cc:688-690, which
+    -- exchanges at `post->date()`): `2024/01/05 Buy` with
+    -- `Assets:Broker  1 AAPL @ $101  ; [2024/01/07]` records its price at
+    -- 2024/01/07. The table holds the point only where the reader reads
+    -- that date (`Journal.Result.priceIssues`), and the issue does not
+    -- say which, so that the branch refuses in excess where it does
+    <|> (issue "posting-date").map ("posting-date", ·)
+    -- fixated-lot: an amount whose lot price is fixated is valued at
+    -- that price, bypassing the price graph (annotate.cc:381-418,
+    -- ANNOTATION_PRICE_FIXATED at 403-405; amount.cc:1269-1273;
+    -- test/baseline/feat-fixated-prices.test), for the first commodity of
+    -- `Journal.Result.fixatedLotComms` in which a flow is nonzero. That
+    -- record is conservative for a posting of which C++ fixates the
+    -- amount alone or the completion in the commodity of the cost alone
+    -- (`Journal.PostSpec.fixatedMark`), so that the commodity named can be
+    -- one that C++ values through the graph: for `10 AAPL @ 5 EUR {=$2}`
+    -- against an elided posting, with `P 2024/02/01 AAPL $170`, the branch
+    -- names AAPL, which `bal -X $` values at $1700 on both C++ binaries
+    <|> (res.fixatedLotComms.find? flowComms.contains).map ("fixated-lot", ·)
+    -- equivalence: a `C` directive declares an equivalence that C++
+    -- applies while it parses (`price_conversion_directive`,
+    -- textual_directives.cc:174-191) and through which it records a
+    -- price that the table does not hold, valuing a commodity without a
+    -- price through its larger units (amount.cc:1301-1320); not
+    -- modelled, so any `C` directive refuses, the most recent one named
+    <|> (if res.equivs != ({} : Journal.St).equivs then
+          some ("equivalence", (res.equivs.head?.map (·.1)).getD "") else none)
+    -- commodity-alias: an `alias` subdirective of a `commodity` block
+    -- after a point that names the alias or the block's commodity
+    -- (`Journal.Result.aliasPrices`), where C++ can retire a commodity
+    -- and move its prices to the block's commodity (pool.cc:150-173,
+    -- history.cc:336-349): after `P 2024/01/01 E $1`,
+    -- `P 2024/01/01 EUR $3` and then `commodity EUR` with `alias E`,
+    -- `bal -X $` values a later `10 EUR` at $10 on both C++ binaries,
+    -- where the table's point of `EUR` gives $30; an oracle limitation,
+    -- refused in excess where C++ retires nothing
+    <|> (if res.aliasPrices then some ("commodity-alias", "") else none)
+    -- price-precision: C++ grants the commodity of the price of a price
+    -- directive the decimals of the price where the commodity's
+    -- precision is 0 and it is neither known nor locked
+    -- (pool.cc:628-634), a commodity becoming known at the places that
+    -- the docstring of `Journal.St.knownComms` lists, among them the
+    -- source of a price directive (pool.cc:645-647), while the reader
+    -- grants a precision only to a commodity for which none is recorded
+    -- (the `P` arm of Journal `handleDirective`). Where the two grants
+    -- from the precision recorded before the directive differ
+    -- (`Journal.Result.pricePrecisionComms`, the first commodity named),
+    -- the target can show at another precision, and a cost can record
+    -- its price at another one, since Phase 6 rounds the price at the
+    -- precision of the commodity of the cost (Journal `costPrice`): after
+    -- `Assets:Cash  $1000` against an elided posting, `3 AAPL @ $170`
+    -- against `Assets:Cash` and then `P 2024/02/01 AAPL $170.25`,
+    -- `bal -X $` shows $510.75 for the AAPL account on both C++
+    -- binaries, where the value row would be $511. A difference in any
+    -- commodity refuses, in excess where it shows in no value row; a
+    -- precision that the reader learns otherwise than C++ before the
+    -- directive is among the inherited departures of the docstring above
+    <|> (res.pricePrecisionComms.head?).map ("price-precision", ·)
+    -- null-commodity: C++ never values an amount without a commodity
+    -- (`has_commodity()`, amount.cc:1263) and shows it unvalued, so
+    -- that a target without one, or an account that holds a nonzero
+    -- total without one, has no value row in the target: after
+    -- `Assets:A  10` against an elided posting, `bal -X $` shows `10`
+    -- for `Assets:A` on both C++ binaries
+    <|> (if target == "" || held.contains "" then some ("null-commodity", "")
+          else none)
+    -- percent: C++ multiplies by an amount in `%` as by a hundredth of
+    -- it (amount.cc:727-740), when it values an amount in `%`
+    -- (amount.cc:1324-1325) and when a chain multiplies by a price in
+    -- `%` (history.cc:589-596), so that the target `%`, a holding in it
+    -- and a chain through it are refused
+    <|> (if target == "%" || held.contains "%"
+            || verdicts.any (fun (_, v) => match v with
+                | .rate _ via => via.contains "%" | _ => false) then
+          some ("percent", "") else none)
+    -- time-unit: a target that the built-in chain of time units names,
+    -- the second, the minute or the hour (session.cc:80-81 at
+    -- 76b9dc2b2), which, any `C` directive being refused above, are the
+    -- units of `Journal.Result.equivs`. C++ shows a value in the target
+    -- itself, since under `-X` it does not convert what it shows to a
+    -- larger unit (`report_t::display_value`, src/report.cc:815-821),
+    -- while `displayRow` shows a total in `s` in the largest unit that
+    -- fits it: after `Assets:Time  2h` against an elided posting,
+    -- `bal -X s` shows `7200s` for `Assets:Time` on both C++ binaries,
+    -- where the value row would show 2h. And C++ shows a value in the
+    -- minute or the hour at the precision that the built-in conversions
+    -- `1.0m` and `1.00h` give those units, one place and two, unless an
+    -- amount raises it (amount.cc:1847-1848), while `displayRow` shows a
+    -- total in either at the precision recorded for it, which is zero
+    -- where no amount sets one: with `P 2024/01/01 h 7 EUR` and
+    -- `Assets:Euro  10 EUR` against an elided posting, `bal -X h` shows
+    -- `1.43h` for `Assets:Euro` on both C++ binaries, where the value row
+    -- would show 1h
+    <|> (if res.equivs.any (fun (u, _, b) => u == target || b == target) then
+          some ("time-unit", "") else none)
+    -- no-price-path: no chain of prices at the terminus links the
+    -- commodity to the target, and C++ shows the holding unvalued,
+    -- unless it values the commodity through a larger unit
+    -- (amount.cc:1301-1320) or the account's total is one annotated
+    -- amount, which it values at its lot price where that price is in
+    -- the target (`report_t::fn_market`, src/report.cc:953-970 at
+    -- 76b9dc2b2): after `Assets:A  10 AAPL {$150}` against an elided
+    -- posting, with no price, `bal -X $` shows $1500 for `Assets:A` on
+    -- both C++ binaries; an oracle limitation stated as a refusal
+    <|> (firstWith (· matches .noPath)).map ("no-price-path", ·)
+    -- alternative-price-path: more than one chain links the commodity to
+    -- the target, a cycle or a diamond, and C++ takes the one whose
+    -- oldest price is the most recent (Dijkstra's search with `f_max`,
+    -- history.cc:538-544), which the oracle does not model, admitting a
+    -- single chain alone (`chainVerdict`); an oracle limitation
+    <|> (firstWith (· matches .alternative)).map ("alternative-price-path", ·)
+    -- zero-inverse-price: the chain crosses a price of zero against its
+    -- direction, which C++ leaves at zero where it has no inverse
+    -- (`in_place_invert`, amount.cc:909-917): with
+    -- `P 2024/01/01 EUR $0.00` and `Assets:Checking  $100` against an
+    -- elided posting, `bal -X EUR` shows nothing on both C++ binaries.
+    -- test/regress/1085.test crosses the same price in its direction,
+    -- under `-X '$'`, which the chain multiplies by zero
+    <|> (firstWith (· matches .zeroInverse)).map ("zero-inverse-price", ·)
+  match refusal with
+  | some (reason, comm) =>
+      [s!"?? exchange {reason}" ++ (if comm.isEmpty then "" else s!" {comm}")]
+  | none =>
+    let p : Commodity → ℚ := fun c =>
+      if c == target then 1
+      else match verdicts.lookup c with
+        | some (.rate q _) => q
+        | _ => 0
+    let names := (accts.map (·.name)).eraseDups
+    -- each account after the rewrites with its value and its row
+    let values := (names.map (Journal.applyRewrites res.rewrites ·)).eraseDups.map
+      fun n =>
+        let v := ((names.filter (Journal.applyRewrites res.rewrites · == n)).map
+          fun m => netValueAt (flowsFor arr) accts p m term).sum
+        -- the counts of the target's net row, where nothing else adds to
+        -- it: nothing does where every holding in another commodity is
+        -- valued at exactly zero, since C++ adds no amount of exactly zero
+        -- to a balance (`balance_t::operator+=`, src/balance.cc:122-123
+        -- at 76b9dc2b2), so that a lone inferred amount in the target keeps
+        -- its mark beside a holding priced at zero
+        let others := merged.any fun (a, w) =>
+          a.name == n && a.commodity != target && w * p a.commodity != 0
+        let stat := if others then (0, 0) else stats n target
+        (v, displayRow res stat (Account.mk n target) v)
+    -- rounds-to-zero: an account whose value is not zero but shows as
+    -- zero in the target. C++ shows an account by `amount_t::is_zero`,
+    -- which reads a value exactly where the precision that the value
+    -- carries is not above that of the target, and as it prints
+    -- otherwise (src/amount.cc:1374-1429 at 76b9dc2b2), a precision that
+    -- adds those of the prices and of the amount (amount.cc:705-751,
+    -- 909-917) and that the oracle does not model; and under `--flat` it
+    -- shows the total of a parent account none of whose children it
+    -- shows (`format_accounts::mark_accounts`, src/output.cc:312-330).
+    -- After `Assets:Cash  $10.00` against an elided posting,
+    -- `P 2024/01/01 $ 150 JPY` and `Assets:Yen  0.5 JPY` against an
+    -- elided posting, `bal -X $` shows `$0.00` for `Assets:Yen` on both
+    -- C++ binaries; and after `P 2024/01/01 AAPL $155.00`,
+    -- `Expenses:Food:Groceries  $50.00` and `Expenses:Auto:Gas  $35.00`,
+    -- each against an elided `Assets:Cash`, `bal --flat -X AAPL` shows
+    -- `AAPL1` for `Expenses` on both, where no value row would show
+    -- either account; an oracle limitation, refused in excess where C++
+    -- hides the account as well
+    if values.any (fun (v, row) => v != 0 && row.isNone) then
+      ["?? exchange rounds-to-zero"]
+    else
+      ((values.filterMap (·.2.map (">> value " ++ ·))).toArray.qsort (· < ·)).toList
+
 /-- Balances of an (include-spliced) journal text; `spliced` says that
-    a file was spliced into it (`splice`), and `gross` adds the gross
-    rows (`grossRows`) after the net rows. -/
+    a file was spliced into it (`splice`), `gross` adds the gross rows
+    (`grossRows`) after the net rows, and `exchange` the value rows in
+    that commodity (`exchangeRows`) after them. -/
 def balancesOf (decimalComma : Bool) (nowSecs : Option ℚ)
     (recAliases : Bool) (dfmt : Option String) (input : String)
-    (spliced : Bool := false) (gross : Bool := false) :
+    (spliced : Bool := false) (gross : Bool := false)
+    (exchange : Option String := none) :
     Except String (List String) := do
   let res ← Journal.run input decimalComma nowSecs recAliases dfmt spliced
   let arr := res.gens.toArray
@@ -252,7 +724,11 @@ def balancesOf (decimalComma : Bool) (nowSecs : Option ℚ)
   let styleRows := res.styles.filterMap fun (c, dc) =>
     if dc then some (if c == "" then "%% dc *" else s!"%% dc {c}") else none
   let net := styleRows ++ (rows.toArray.qsort (· < ·)).toList
-  pure (if gross then net ++ grossRows res arr term accts else net)
+  let grossLines := if gross then grossRows res arr term accts else []
+  let valueLines := match exchange with
+    | some c => exchangeRows res arr term accts merged statFor c (nowSecs.map (·.floor))
+    | none => []
+  pure (net ++ grossLines ++ valueLines)
 
 end Driver
 
@@ -499,6 +975,13 @@ def main (args : List String) : IO Unit := do
   let mut dfmt : Option String := none
   let mut dfmtPending := false
   let mut gross := false
+  let mut exch : Option String := none
+  let mut exchPending := false
+  -- A flag that takes a value takes the next argument that the tests
+  -- before its own pending test do not claim, so that `--exchange --gross
+  -- FILE` applies `--gross` and takes FILE as the target, reading no file;
+  -- `--input-date-format` and `--now` take their values in the same way.
+  -- A caller passes each value right after its flag.
   for arg in args do
     if arg == "--decimal-comma" then
       dc := true
@@ -506,6 +989,11 @@ def main (args : List String) : IO Unit := do
       rec_ := true
     else if arg == "--gross" then
       gross := true
+    else if arg == "--exchange" then
+      exchPending := true
+    else if exchPending then
+      exchPending := false
+      exch := some arg
     else if arg == "--input-date-format" then
       dfmtPending := true
     else if dfmtPending then
@@ -526,7 +1014,7 @@ def main (args : List String) : IO Unit := do
         let lines := ((toString e).splitOn "\n").map (·.trimAscii.toString)
         IO.println s!"!! ERROR {" ".intercalate (lines.filter (!·.isEmpty))}"
       | .ok (text, spliced) =>
-        match Ledger.Driver.balancesOf dc now rec_ dfmt text spliced gross with
+        match Ledger.Driver.balancesOf dc now rec_ dfmt text spliced gross exch with
         | .error e => IO.println s!"!! ERROR {e}"
         | .ok rows => for r in rows do IO.println r
       dc := false
@@ -534,3 +1022,4 @@ def main (args : List String) : IO Unit := do
       now := none
       dfmt := none
       gross := false
+      exch := none
