@@ -10,18 +10,17 @@ A valuation functor `W : 𝕋 → (ℝ, +, 0)` assigns to every morphism
 (transaction) a net flow, additively in every dimension the groupoid
 composes in. That every transaction balances is the statement that the
 per-account valuations sum to a functor that annihilates the
-generators — see `Theorems.lean`.
+generators; see `Theorems.lean`.
 
 ## Extraction (decision D12)
 
 Phase 1 baked a single `V_obj`/`V_hom` pair into the `𝕋` structure.
-That made multi-commodity impossible: the old `CommodityValuation`
-carried `respects_V_hom : V_hom_c f = T.V_hom f`, forcing every
-commodity's valuation to equal the global one — an uninhabitable
-specification for any journal with two commodities. The repair is to
-make valuation a *separate structure over* `𝕋`, of which there are
-many: one per commodity, one per budget scenario, one per account
-(the per-account family is what reports consume).
+That prevented distinct commodity measurements: the old
+`CommodityValuation` carried `respects_V_hom : V_hom_c f = T.V_hom f`,
+forcing every commodity's valuation to equal the global one. The
+repair is to make valuation a *separate structure over* `𝕋`, of which
+there are many: one per commodity, one per budget scenario, one per
+account (the per-account family is what reports consume).
 
 `V_obj` is deleted. The object part of a valuation is derived from a
 static account assignment (`Valuation.ofObject` below), and no law
@@ -40,14 +39,14 @@ ends. The free model has a nonzero valuation, which shows that the
 difference-form refutation is not vacuous
 (`GenSpec.endpoint_law_refuted` in `Pacioli.lean`).
 
-## The minimal law basis (solved, not verified)
+## The law basis (solved, not verified)
 
 Only three laws are structure: `V_comp`, `V_tensor`, `V_add`. The
 remaining Phase 1 laws are **derived**:
 
-- `V_id`   — from `V_comp` at `id ∘ id = id`;
-- `V_zero` — from `V_add` at `0 + 0 = 0`;
-- `V_inv`  — from `V_comp` and `V_id` at `f ∘ f⁻¹ = id`.
+- `V_id`: from `V_comp` at `id ∘ id = id`;
+- `V_zero`: from `V_add` at `0 + 0 = 0`;
+- `V_inv`: from `V_comp` and `V_id` at `f ∘ f⁻¹ = id`.
 
 This is the method's "laws already paid for": the smaller the law
 table, the smaller the obligation every representation must discharge.
@@ -56,8 +55,11 @@ table, the smaller the obligation every representation must discharge.
 namespace Ledger
 
 /-- A valuation functor on `T`: an additive measurement of morphisms.
-    The functor laws are the mathematical content of double-entry
-    bookkeeping (worksheet T13, T14, T16). -/
+    On a generated model satisfying `𝕋Laws`, the three laws propagate
+    balance from generators to every morphism
+    (`balanced_generators_balance` in `Ledger/Theorems.lean`). The
+    double-entry principle itself is a hypothesis on each generator,
+    not one of these laws. -/
 structure ValuationFunctor (T : 𝕋) where
   /-- The net flow measured for each morphism. -/
   V : ∀ {A B : Object}, T.Hom A B → ℝ

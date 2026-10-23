@@ -1,18 +1,17 @@
 import Ledger.Valuation
 
 /-!
-# Commodity price groupoid (P4 — separate groupoid with action)
+# Commodity price groupoid (P4, separate groupoid with action)
 
 Prices form a groupoid `𝓟` over commodities:
 
 - **Objects**: commodities (the global `Commodity` type).
-- **Morphisms**: price conversions — exchange rates.
-- **Composition**: chaining through the price graph (Ledger's
-  `find_price` shortest-path lookup, `src/commodity.cc:171-211`).
+- **Morphisms**: price conversions carrying exchange rates.
+- **Composition**: chaining conversions, multiplying their rates.
 - **Inverses**: reciprocal rates.
 
-Prices are NOT transactions: they have no debits and credits — they
-are scalar multipliers between measurement units. Hence a separate
+Prices are not transactions: they have no debits and credits, but are
+scalar multipliers between measurement units. Hence a separate
 groupoid acting on 𝕋 rather than more structure inside 𝕋 (D8).
 
 ## Phase 2 repairs (decision D15)
@@ -24,22 +23,25 @@ Three defects of the Phase 1 module, all masked by the vacuous build:
    *rates* is inherited from multiplication in ℝ; there is no
    morphism-level commutativity to state, because composition
    endpoints differ.
-2. `rate_inv` was a field with an apologetic side condition ("when
-   rate p ≠ 0"). Both facts are **theorems**: `rate_ne_zero` and
-   `rate_inv` below follow from `rate_comp`, `rate_id`, and the
-   groupoid laws. Solve, don't stipulate.
+2. `rate_inv` was a field with a side condition ("when rate p ≠ 0").
+   Both facts are **theorems**: `rate_ne_zero` and `rate_inv` below
+   follow from `rate_comp`, `rate_id`, and the groupoid laws.
 3. `PriceAction.revalue_preserves_valuation` quantified over
    *arbitrary* functions `V_c V_d`, making the structure uninhabited
    (instantiate `V_c := 0` and any nonzero `V_d`). The law now ties
    the action to one commodity-indexed family of valuation functors
-   (`CommodityValuation`), which is what `-V`/`-X` reports actually
-   consume.
+   (`CommodityValuation`). Under the value reading, each member
+   measures a flow in one numeraire. The action relates these
+   measurements; it does not specify the `-V` and `-X` reports of
+   C++ Ledger.
 
 ## Time
 
-The full theory indexes `𝓟` by time (`P` directives are dated). The
-present groupoid is time-independent; time-dependence arrives with
-derived operations (Phase 4), as a functor from the time poset.
+`TimedPrices.lean` models time as a family of fibers, one price
+groupoid and one sound action per instant, with deliberately no law
+across instants. The groupoid here is a single fiber. Neither the
+selection of dated observations nor price-path lookup is specified
+by this structure.
 -/
 
 namespace Ledger
@@ -107,8 +109,9 @@ end PriceGroupoid
     revaluing by `p : a → b` rescales the `b`-denominated measurement
     by `rate p` from the `a`-denominated one.
 
-    This is a specification, not a computation; it is what makes
-    `-V`/`-X` reports correct. -/
+    This is an abstract conversion law, not a computation or a
+    specification of the `-V` and `-X` reports of C++ Ledger. The
+    rates and the valuations they relate are parameters. -/
 structure PriceAction (P : PriceGroupoid) (T : 𝕋)
     (CV : CommodityValuation T) where
   /-- Revalue a morphism's postings from commodity `a` to `b`. The

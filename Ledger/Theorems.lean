@@ -217,10 +217,12 @@ section Prices
 
 /-- **Price soundness** (P1): revaluing a transaction through a
     conversion `p : a → b` scales its `b`-denominated measurement by
-    `rate p` from its `a`-denominated one — the correctness of `-V`
-    and `-X` reports. Re-exported from the action's soundness law;
-    see also `PriceAction.revalue_sound_comp` (chained conversions
-    multiply) and `PriceAction.revalue_roundtrip`. -/
+    `rate p` from its `a`-denominated one. Re-exported from the
+    action's soundness law; see also `PriceAction.revalue_sound_comp`
+    (chained conversions multiply) and `PriceAction.revalue_roundtrip`.
+    This is a law of the abstract action, not a specification of the
+    `-V` and `-X` reports of C++ Ledger: neither the valuations nor the
+    selection of dated prices and conversion paths is determined here. -/
 theorem price_soundness (P : PriceGroupoid) (T : 𝕋)
     (CV : CommodityValuation T) (act : PriceAction P T CV)
     {a b : Commodity} (p : P.Conversion a b)
