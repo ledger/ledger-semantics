@@ -149,32 +149,68 @@ end Driver
 
 end Ledger
 
-/-- Expand a (possibly glob) include pattern against `dir`:
-    `*`, `?`, and `[..]` in any path component. -/
+/-- Read one include-path component the way `mask_t::assign_glob`
+    (src/mask.cc) reads it, returning the anchored regex, the name the
+    component spells, and whether it has a wildcard or a set.  `?` and
+    `*` are wildcards; `[` opens a set that runs to the next `]` and is
+    an ordinary character when no `]` follows; a backslash makes the
+    next character literal, and a trailing backslash stands for itself;
+    every other character is literal.  The regex escapes the characters
+    `assign_glob` escapes and leaves a `]` bare, so a `]` that Boost
+    reads as closing a set closes it here as well.  `^` and `$` stand
+    in for `\A` and `\z`, which `compileRegex` lacks.  Boost takes a
+    `]` directly after `[` or `[^` as a member of the set, where
+    `compileRegex` would close an empty one, so that `]` is escaped.
+    Witnesses: regress/include-glob-escapes (escaped and unclosed
+    brackets), regress/include-glob-literals (`$` and `^` in names),
+    regress/coverage-mask-glob-escape (an escaped `_`). -/
+partial def globComponent (c : String) : String × String × Bool :=
+  let isMeta := fun (ch : Char) => "\\^$.|?*+()[{}".contains ch
+  let lit := fun (ch : Char) => if isMeta ch then ['\\', ch] else [ch]
+  -- the members of a set, up to the first `]` after its `[`
+  let rec members (acc : List Char) : List Char → Option (List Char × List Char)
+    | [] => none
+    | ']' :: rest => some (acc.reverse, rest)
+    | ch :: rest => members (ch :: acc) rest
+  let rec go (rx name : List Char) (wild : Bool) :
+      List Char → List Char × List Char × Bool
+    | [] => (rx, name, wild)
+    | '?' :: rest => go (rx ++ ['.']) name true rest
+    | '*' :: rest => go (rx ++ ['.', '*']) name true rest
+    | '[' :: rest =>
+        match members [] rest with
+        | none => go (rx ++ lit '[') (name ++ ['[']) wild rest
+        | some (ms, after) =>
+            let set := match ms with
+              | [] => ['[', '\\', ']']
+              | ['^'] => ['[', '^', '\\', ']']
+              | _ => '[' :: ms ++ [']']
+            go (rx ++ set) name true after
+    | '\\' :: ch :: rest => go (rx ++ lit ch) (name ++ [ch]) wild rest
+    | ch :: rest => go (rx ++ lit ch) (name ++ [ch]) wild rest
+  let (rx, name, wild) := go [] [] false c.toList
+  (String.ofList ('^' :: rx ++ ['$']), String.ofList name, wild)
+
+/-- Expand a (possibly glob) include pattern against `dir`, one path
+    component at a time, as `expand_glob_path`
+    (src/textual_directives.cc) does: a component with a wildcard or a
+    set is matched against the entries of the directory reached so far,
+    a component without one names a single entry, only directories are
+    descended into, and only regular files are included. -/
 partial def globPaths (dir : System.FilePath) (pat : String) :
     IO (List System.FilePath) := do
   let comps := pat.splitOn "/"
-  let isGlob := fun (c : String) =>
-    c.toList.any fun ch => ch == '*' || ch == '?' || ch == '['
   let rec walk (base : System.FilePath) : List String → IO (List System.FilePath)
     | [] => pure [base]
     | c :: rest => do
-        if !(isGlob c) then
-          walk (base / c) rest
+        let (rxSrc, name, wild) := globComponent c
+        if !wild then
+          walk (base / name) rest
         else
-          let rxSrc := String.join (c.toList.map fun ch =>
-            if ch == '*' then "[^/]*"
-            else if ch == '?' then "."
-            else if ch == '.' then "\\."
-            else if ch == '[' then "["
-            else if ch == ']' then "]"
-            else if ch == '+' || ch == '(' || ch == ')' || ch == '|'
-                 || ch == '^' || ch == '$' then String.ofList ['\\', ch]
-            else String.ofList [ch])
-          match Ledger.Parse.compileRegex ("^" ++ rxSrc ++ "$") with
+          match Ledger.Parse.compileRegex rxSrc with
           | .error _ => pure []
           | .ok rx => do
-              if !(← base.pathExists) then pure [] else
+              if !(← base.isDir) then pure [] else
               let entries ← base.readDir
               let names := (entries.map (·.fileName)).qsort (· < ·)
               let mut acc : List System.FilePath := []
@@ -183,11 +219,13 @@ partial def globPaths (dir : System.FilePath) (pat : String) :
                   acc := acc ++ (← walk (base / nm) rest)
               pure acc
   let res ← walk dir comps
-  res.filterM (·.pathExists)
+  res.filterM fun p => do
+    try pure ((← p.metadata).type == .file) catch _ => pure false
 
 /-- Splice `include` lines (resolved against `dir`), depth-limited;
     like `include_directive`, the file never includes itself, quotes
-    are stripped, and backslash escapes in the pattern are literal. -/
+    are stripped, and a backslash in the pattern makes the next
+    character literal (see `globComponent`). -/
 partial def splice (self : System.FilePath) (dir : System.FilePath)
     (text : String) (depth : Nat) : IO String := do
   if depth == 0 then
@@ -208,7 +246,6 @@ partial def splice (self : System.FilePath) (dir : System.FilePath)
               || (pat.startsWith "'" && pat.endsWith "'")) then
             String.ofList ((pat.drop 1).toString.toList.dropLast)
           else pat
-        let pat := String.ofList (pat.toList.filter (· != '\\'))
         let paths ← globPaths dir pat
         let paths := paths.filter fun p => p.toString != self.toString
         if paths.isEmpty then
