@@ -9,9 +9,9 @@ without damaging what it proves.
 
 This repository is a machine-checked semantics for double-entry
 accounting together with an executable oracle derived from it. The
-C++ Ledger project pins this repository twice, as a git submodule
-and as a Nix flake input, and replays its entire test suite through
-the oracle in continuous integration. A change here therefore gates
+C++ Ledger project pins this repository once, as a Nix flake input
+whose URL names the revision, and replays its entire test suite
+through the oracle in continuous integration. A change here therefore gates
 another project's CI. Treat every edit as a change to a published
 specification, because that is what it is.
 
@@ -117,9 +117,16 @@ different trees (the working hypothesis is case-insensitive
 filesystems merging case-colliding paths); refresh both, each from a
 machine of that kernel or from CI.
 
-The downstream side of the same discipline: when this repository's
-main moves, the C++ repository must bump its submodule and its
-flake.lock in one commit. Never let the two pins drift apart.
+The downstream side of the same discipline: the oracle must model
+exactly the C++ behaviour of the Ledger commit that pins it, so an
+oracle change lands together with its C++ half, and main follows
+Ledger's pin rather than leading it. Cut each change onto the
+revision Ledger's main pins now, never onto a stale local `main`;
+Ledger's pull request moves the revision in its flake.nix and runs
+`nix flake lock`; when that pull request merges, fast-forward main
+to the pinned commit. Never squash or rebase a pinned commit into
+main, which would change the revision Ledger names. Pin-moving pull
+requests therefore land one at a time.
 
 ## Traps that have already cost time
 

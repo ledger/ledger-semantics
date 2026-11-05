@@ -229,12 +229,13 @@ cache is present.
 
 This work was extracted from the C++ Ledger repository, where it
 was developed together with the bisimulation harness that consumes
-it. The development branch of that project references this
-repository as a git submodule and runs the comparison in its
-continuous integration and in its development builds. Release
-builds of the C++ program require no Lean toolchain, because
-without the submodule the test is not registered, and a registered
-test without a toolchain reports itself skipped.
+it. That project pins this repository once, as a Nix flake input
+whose URL names the revision, and runs the comparison in its
+continuous integration and, on request, in its development builds,
+which name a built oracle tree in `LEDGER_LEAN_DIR`. Release builds
+of the C++ program require no Lean toolchain, because without
+`LEDGER_LEAN_DIR` the test is not registered, and a registered test
+without a toolchain reports itself skipped.
 
 The balance semantics is complete against the C++ suite as of
 August 2026. Register rows and time-indexed valuation are specified
