@@ -55,7 +55,8 @@ structure PostSpec where
   kind : PostKind
   note : String := ""
   amount : Option Amount := none
-  costVal : Option Amount := none    -- @/@@ substitution (pass 1)
+  costVal : Option Amount := none    -- effective cost after gain/loss
+  swapCostVal : Option Amount := none -- original cost before a swap's base-currency rewrite
   lotVal : Option Amount := none     -- {P}/{=P} substitution (pass 2)
   assignTarget : Option Amount := none
   deriving Repr
@@ -393,15 +394,15 @@ private def takeBalanced (opn cls : Char) : List Char → Option (List Char × L
 
 /-- Consume the annotation/cost/assertion tail of an amount:
     `{lot} [date] (note) @ P / @@ T / = ASSERT` in any order. -/
-private partial def annotLoop (ctx : AmtCtx) (line : Nat) (a : Amount)
+private partial def annotLoop (ctx : AmtCtx) (line : Nat) (a : Amount) (amtDecs : Nat)
     (tail : String) (lot : Option (Amount × Bool × Nat)) (cost : Option Amount)
-    (teach : List (String × Nat) := []) (afterCost : Bool := false)
-    (costDecs : Nat := 0) :
+    (teach : List (String × Nat) := []) (costQty : Option (ℚ × Nat) := none)
+    (costDecs : Nat := 0) (costLot : Option (Amount × Nat) := none) :
     Except String (Option (Amount × Bool × Nat) × Option Amount ×
-      List (String × Nat) × Nat) := do
+      List (String × Nat) × Nat × Option (Amount × Nat)) := do
   let t := trimS tail
   if t.isEmpty || t == "." then
-    pure (lot, cost, teach, costDecs)
+    pure (lot, cost, teach, costDecs, costLot)
   else if t.startsWith "{" then
     -- `{{total}}` and `{per-unit}` lot prices, possibly `{=fixated}`;
     -- lots parse with PARSE_NO_MIGRATE — no precision teaching
@@ -417,28 +418,43 @@ private partial def annotLoop (ctx : AmtCtx) (line : Nat) (a : Amount)
     let fixated := innerS.startsWith "="
     let innerS := if fixated then trimS (innerS.drop 1).toString else innerS
     let pr ← parseAmount ctx line innerS
-    let lotAmt := if total && a.q != 0 then
-        Amount.mk pr.amount.comm (pr.amount.q / (if a.q < 0 then -a.q else a.q))
+    let qty := (costQty.map (·.1)).getD a.q
+    let lotAmt := if total && qty != 0 then
+        Amount.mk pr.amount.comm (pr.amount.q / (if qty < 0 then -qty else qty))
       else pr.amount
+    -- Total lot prices normalize at the annotated quantity's precision
+    -- plus the base currency's precision and six extension digits, on
+    -- either side of a swap (src/amount.cc, test/regress/3314_swap_total.test).
+    let qtyDecs := if costQty.isSome then costDecs else amtDecs
+    let priceDecs := if total then
+        qtyDecs + (ctx.precs.lookup pr.amount.comm).getD 0 + 6
+      else pr.decimals
     -- keep the FIRST lot: later braces belong to a cost amount's own
     -- annotation (feat-commodity_swap)
     -- a lot after a cost annotates the COST amount, not the posting
-    -- (regress/1217)
+    -- (regress/1217). Retain it separately for the common-base swap
+    -- gain in src/xact.cc phase 6 (regress/3314_lot_gains).
     let lot' :=
-      if afterCost then lot
+      if costQty.isSome then lot
       else match lot with
         | some l => some l
-        | none => some (lotAmt, fixated, pr.decimals)
-    annotLoop ctx line a (String.ofList rest) lot' cost teach afterCost costDecs
+        | none => some (lotAmt, fixated, priceDecs)
+    let costLot' := match costQty, costLot with
+      | some (_, d), none => some (lotAmt, priceDecs + d)
+      | _, _ => costLot
+    annotLoop ctx line a amtDecs (String.ofList rest) lot' cost teach costQty
+      costDecs costLot'
   else if t.startsWith "[" then
     match takeBalanced '[' ']' t.toList with
     | some (_, rest) =>
-        annotLoop ctx line a (String.ofList rest) lot cost teach afterCost costDecs
+        annotLoop ctx line a amtDecs (String.ofList rest) lot cost teach costQty
+          costDecs costLot
     | none => err line s!"unclosed lot date in '{t}'"
   else if t.startsWith "(" && !(t.startsWith "(@") then
     match takeBalanced '(' ')' t.toList with
     | some (_, rest) =>
-        annotLoop ctx line a (String.ofList rest) lot cost teach afterCost costDecs
+        annotLoop ctx line a amtDecs (String.ofList rest) lot cost teach costQty
+          costDecs costLot
     | none => err line s!"unclosed lot note in '{t}'"
   else if t.startsWith "(@@)" || t.startsWith "@@" then
     let off := if t.startsWith "(@@)" then 4 else 2
@@ -449,8 +465,8 @@ private partial def annotLoop (ctx : AmtCtx) (line : Nat) (a : Amount)
     let pr ← parseAmount ctx line rest0
     let mag := if pr.amount.q < 0 then -pr.amount.q else pr.amount.q
     let signed := if a.q < 0 then -mag else mag
-    annotLoop ctx line a pr.tail lot (some ⟨pr.amount.comm, signed⟩) teach true
-      (max costDecs pr.decimals)
+    annotLoop ctx line a amtDecs pr.tail lot (some ⟨pr.amount.comm, signed⟩) teach
+      (some (pr.amount.q, pr.decimals)) (max costDecs pr.decimals) costLot
   else if t.startsWith "(@)" || t.startsWith "@" then
     -- per-unit costs round at the cost literal's own precision,
     -- posting by posting (regress/1125); `@ =` fixates (1794); cost
@@ -461,16 +477,16 @@ private partial def annotLoop (ctx : AmtCtx) (line : Nat) (a : Amount)
     let rest0 := if rest0.startsWith "=" then trimS (rest0.drop 1).toString
       else rest0
     let pr ← parseAmount ctx line rest0
-    annotLoop ctx line a pr.tail lot
-      (some ⟨pr.amount.comm, pr.amount.q * a.q⟩) teach true
-      (max costDecs pr.decimals)
+    annotLoop ctx line a amtDecs pr.tail lot
+      (some ⟨pr.amount.comm, pr.amount.q * a.q⟩) teach
+      (some (pr.amount.q, pr.decimals + amtDecs)) (max costDecs pr.decimals) costLot
   else if t.startsWith "=" then
     -- assertion: the C++ side checks it; positive tests pass it, but
     -- the literal still teaches display precision (1699)
     let pr ← parseAmount ctx line (trimS (t.drop 1).toString)
     let teach := if pr.decimals <= 6 then
         (pr.amount.comm, pr.decimals) :: teach else teach
-    annotLoop ctx line a pr.tail lot cost teach afterCost costDecs
+    annotLoop ctx line a amtDecs pr.tail lot cost teach costQty costDecs costLot
   else
     err line s!"trailing junk after amount '{t}'"
 
@@ -479,19 +495,18 @@ private partial def annotLoop (ctx : AmtCtx) (line : Nat) (a : Amount)
 private def parseAmountField (ctx : AmtCtx) (line : Nat) (field : String) :
     Except String (Option Amount × Option Amount × Option Amount ×
       Option Amount × Option (String × Bool) × Nat × Bool ×
-      List (String × Nat) × Nat × Option Amount) := do
-  -- returns (amount, balancing, assignTarget, learnedStyle, decimals)
+      List (String × Nat) × Nat × Option Amount × Option Amount) := do
   let field := trimS field
   if field.isEmpty then
-    pure (none, none, none, none, none, 0, false, [], 0, none)
+    pure (none, none, none, none, none, 0, false, [], 0, none, none)
   else if field.startsWith "=" then
     -- balance assignment (amountless posting); lot annotations on the
     -- target are parsed and dropped (1603)
     let r ← parseAmount ctx line (trimS (field.drop 1).toString)
-    let _ ← annotLoop ctx line r.amount r.tail none none
+    let _ ← annotLoop ctx line r.amount r.decimals r.tail none none
     pure (none, none, none, some r.amount, r.learned, r.decimals, false,
           (if r.decimals <= 6 then [(r.amount.comm, r.decimals)] else []),
-          0, none)
+          0, none, none)
   else do
     let (preLot, field) ←
       if field.startsWith "{" then
@@ -506,8 +521,8 @@ private def parseAmountField (ctx : AmtCtx) (line : Nat) (field : String) :
       else pure (none, field)
     let r ← parseAmount ctx line field
     let a := r.amount
-    let (lot, cost, teach, costDecs) ←
-      annotLoop ctx line a r.tail (preLot.map fun (p, d) => (p, true, d)) none
+    let (lot, cost, teach, costDecs, costLot) ←
+      annotLoop ctx line a r.decimals r.tail (preLot.map fun (p, d) => (p, true, d)) none
     -- xact.cc phase 4/6: a fixated lot with no cost derives the cost
     -- from the annotation; a lot WITH a cost books the gain/loss
     -- (basis - cost) into the effective cost, so the posting balances
@@ -519,23 +534,36 @@ private def parseAmountField (ctx : AmtCtx) (line : Nat) (field : String) :
     let gainVal := match lot, cost with
       | some (p, _, _), some c =>
           if p.comm == c.comm then some (Amount.mk c.comm ((p.q * a.q) - c.q))
-          else none
+          else match costLot with
+            | some (cp, _) =>
+                if p.comm == cp.comm then
+                  some (Amount.mk p.comm ((p.q * a.q) - (cp.q * c.q)))
+                else none
+            | none => none
       | _, _ => none
-    let costVal := match lot, cost with
-      | some (p, _, _), some c =>
-          if p.comm == c.comm then some (Amount.mk c.comm (p.q * a.q))
-          else some c
+    -- A swap keeps its original cost in the balancing pool and adds
+    -- the common-base gain, then rewrites its effective cost to the
+    -- lot basis (src/xact.cc phase 6, test/regress/3314_lot_gains.test).
+    let costVal := match lot, gainVal with
+      | some (p, _, _), some _ => some (Amount.mk p.comm (p.q * a.q))
       | _, _ => cost
+    let swapCostVal := match cost, costVal with
+      | some c, some cv => if c.comm != cv.comm then some c else none
+      | _, _ => none
     -- absorbing a nonzero gain widens the cost to the decimals of the
     -- lot basis, and COST_PREC tagging reads the widened cost
     -- (xact.cc `*post->cost += gain_loss`, regress/1773)
     let costDecs := match lot, gainVal with
       | some (_, _, lotDecs), some g =>
-          if g.q != 0 then max costDecs (lotDecs + r.decimals) else costDecs
+          if swapCostVal.isSome then
+            -- The rewritten cost retains both products' precision,
+            -- even for a zero gain (src/xact.cc `to_cost + gain_loss`).
+            max (lotDecs + r.decimals) ((costLot.map (·.2)).getD 0)
+          else if g.q != 0 then max costDecs (lotDecs + r.decimals) else costDecs
       | _, _ => costDecs
     let lotVal := lot.map fun (p, _, _) => Amount.mk p.comm (p.q * a.q)
     pure (some a, costVal, lotVal, none, r.learned, r.decimals,
-          field.startsWith "(", teach, costDecs, gainVal)
+          field.startsWith "(", teach, costDecs, gainVal, swapCostVal)
 
 private def parsePosting (st : St) (line : Nat) (raw : String) :
     Except String (Option PostSpec × Option (String × Bool) ×
@@ -556,9 +584,9 @@ private def parsePosting (st : St) (line : Nat) (raw : String) :
     | none => pure (some { line, account, kind, note }, none, none, 0, false, [])
     | some f => do
         let (amount, costVal, lotVal, assignTarget, learned, decs, isExpr,
-             teach, costDecs, gainVal) ← parseAmountField st.amt line f
+             teach, costDecs, gainVal, swapCostVal) ← parseAmountField st.amt line f
         pure (some { line, account, kind, note, amount, costVal, lotVal,
-                     assignTarget, amtDecs := decs, costDecs, gainVal },
+                     assignTarget, amtDecs := decs, costDecs, gainVal, swapCostVal },
               learned, amount.map (·.comm), decs, isExpr, teach)
 
 /-! ## Transaction finalization -/
@@ -748,6 +776,8 @@ private def finalizeXact (st : St) (hline : Nat) (_header : String)
         let p := { p with
           amount := p.amount.map (canonAmt stv)
           costVal := p.costVal.map (canonAmt stv)
+          swapCostVal := p.swapCostVal.map (canonAmt stv)
+          gainVal := p.gainVal.map (canonAmt stv)
           lotVal := p.lotVal.map (canonAmt stv)
           assignTarget := p.assignTarget.map (canonAmt stv) }
         posts := p :: posts
@@ -819,16 +849,27 @@ private def finalizeXact (st : St) (hline : Nat) (_header : String)
   -- posting. Structural decisions use EXACT residuals; the
   -- display-precision tolerance is only the final acceptance test.
   let balancePool := fun (pool : List PostSpec) (allowBucket : Bool) => do
+    let addAmount := fun (acc : List (String × ℚ)) (v : Amount) =>
+      match acc.lookup v.comm with
+      | some _ => acc.map fun (c, s) => if c = v.comm then (c, s + v.q) else (c, s)
+      | none => (v.comm, v.q) :: acc
     let sumsWith := fun (useLot : Bool) =>
       pool.foldl (init := ([] : List (String × ℚ))) fun acc p =>
         match p.amount with
         | some a =>
             let v :=
               if useLot then (p.lotVal.getD (p.costVal.getD a))
-              else p.costVal.getD a
-            match acc.lookup v.comm with
-            | some _ => acc.map fun (c, s) => if c = v.comm then (c, s + v.q) else (c, s)
-            | none => (v.comm, v.q) :: acc
+              else p.swapCostVal.getD (p.costVal.getD a)
+            let acc := addAmount acc v
+            -- Preserve cancellation in the exchanged commodity and
+            -- book its gain in this pool (src/xact.cc phase 6,
+            -- test/regress/3314_lot_gains.test). The lot-value pass
+            -- already includes the gain in the substituted bases.
+            if !useLot && p.swapCostVal.isSome then
+              match p.gainVal with
+              | some g => addAmount acc g
+              | none => acc
+            else acc
         | none => acc
     let residualExact := (sumsWith false).filter fun (_, s) => s != 0
     let elided := pool.filter fun p => p.amount.isNone && p.assignTarget.isNone
@@ -1290,7 +1331,7 @@ private def finalizeAuto (st : St) (rawPosts : List (Nat × String)) :
               let r ← parseAmount st.amt ln f
               -- cost/lot annotations on template amounts parse and
               -- drop: extended posts flow at face value (2268)
-              let _ ← annotLoop st.amt ln r.amount r.tail none none
+              let _ ← annotLoop st.amt ln r.amount r.decimals r.tail none none
               posts := ⟨name, kind, some r.amount, 1, none⟩ :: posts
       pure { st with
         autos := st.autos ++ [⟨branches, posts.reverse, nm, true, noteTag⟩]
