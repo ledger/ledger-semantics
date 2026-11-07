@@ -78,12 +78,13 @@ abbrev roundAt := Parse.roundAt
 /-- Display a base-commodity total in the largest fitting equivalent
     unit (built-in time chain and `C` directives alike), rounded at
     the unit's learned precision, with a minimum of two places for a
-    converted unit and a default of zero for the base, through the C++
-    printing rule `stream_out_mpq` (src/amount.cc:2055 and 208-245 at
-    76b9dc2b2, `cppRoundAt`): a total exactly half-way between two
-    displayable values rounds as its binary expansion decides, so that
-    at precision 1 a total of `0.35` shows as `0.3` and one of `0.45`
-    as `0.5`. The minimum of two places departs from C++ for a converted
+    converted unit and a default of zero for the base, as main's oracle
+    rounds it: the exact decimal rounding of `roundAt`. C++ once formed
+    the quotient through `stream_out_mpq` (src/amount.cc:208-245 at
+    76b9dc2b2, `cppRoundAt`), whose binary route past 231 places ended
+    the thirds of regress/amount-print-high-precision in ...3319914273;
+    C++ now divides exactly (src/amount.cc at 5f9855cef) and so does
+    the row. The minimum of two places departs from C++ for a converted
     unit whose precision is lower: the minute has the one place that
     its built-in conversion `1.0m` gives it (session.cc:80 at 76b9dc2b2)
     unless an amount raises that precision (amount.cc:1847-1848).
@@ -109,12 +110,12 @@ def displayAmount (equivs : List (String × ℚ × String))
   match units.find? fun (_, f) => a ≥ f && f != 1 with
   | some (u, f) =>
       let p := max ((precisions.lookup u).getD 2) 2
-      (u, cppRoundAt p (q / f))
+      (u, roundAt p (q / f))
   | none =>
       if comm == "" then (comm, q)   -- bare amounts: full precision
       else
         let p := (precisions.lookup comm).getD 0
-        (comm, cppRoundAt p q)
+        (comm, roundAt p q)
 
 /-- The generator specification of an evaluated journal. -/
 def specFor (arr : Array (List (Account × ℚ))) : GenSpec where
