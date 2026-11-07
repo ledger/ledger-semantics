@@ -4558,6 +4558,22 @@ private def verifyExtended (st : St) (hline : Nat) (posts : List PostSpec)
         acc.map fun (c', s) => (c', if c' == c then s + q else s)
       else acc ++ [(c, q)]
   let virt := (bracket.candidates.head?.map (·.residual)).getD []
+  -- the per-unit cost rounding allowance, as `balancePool` states it:
+  -- C++ adds the exact adjustment of rounding each per-unit cost of a
+  -- real posting at its price's decimals before the balance test
+  -- (xact.cc:908-929), which the engine models as half a unit in the
+  -- last place of every cost in the commodity written with decimals,
+  -- the matched and the generated postings both (regress/3314 and
+  -- regress/1125, whose per-group case test/regress/3314_rounding_auto
+  -- reaches this check)
+  let costTol := fun (posts : List PostSpec) (c : String) =>
+    posts.foldl (init := (0 : ℚ)) fun acc p =>
+      match p.costVal with
+      | some cv =>
+          if cv.comm == c && p.costDecs > 0 then
+            acc + 1 / (2 * ((10 ^ p.costDecs : ℕ) : ℚ))
+          else acc
+      | none => acc
   -- under `o`, the remainder of the first check that fails, if one does;
   -- the widening reads the costs of the postings generated so far
   let failure := fun (o : PoolCandidate) => Id.run do
@@ -4569,8 +4585,10 @@ private def verifyExtended (st : St) (hline : Nat) (posts : List PostSpec)
       if mb.isEmpty then continue
       ws := ws ++ mb.filterMap (weight o)
       let r := (merge (o.residual ++ virt ++ ws)).filter fun (_, s) => s != 0
+      let tol := fun (c : String) => costTol posts c + costTol gens c
       unless r.all (fun (c, s) => if c == "" then s == 0
-          else roundsToZeroAt (zeroTestPrec st (posts ++ gens) c) s) do
+          else absQ s ≤ tol c
+            || roundsToZeroAt (zeroTestPrec st (posts ++ gens) c) s) do
         return some r
     return none
   let failures := (real.candidates ++ real.swapped).map failure
