@@ -41,6 +41,18 @@ namespace ValuationFunctor
 
 variable {T : 𝕋}
 
+/-- Valuation functors are determined by their measurement: the three
+    laws are propositions, so two functors with the same `V` are equal.
+    This is what lets a statement about reports be an equality of
+    functors rather than a family of pointwise equations. -/
+theorem ext_V {W₁ W₂ : ValuationFunctor T}
+    (h : ∀ {A B : Object} (f : T.Hom A B), W₁.V f = W₂.V f) : W₁ = W₂ := by
+  obtain ⟨V₁, _, _, _⟩ := W₁
+  obtain ⟨V₂, _, _, _⟩ := W₂
+  have hV : @V₁ = @V₂ := funext fun A => funext fun B => funext fun f => h f
+  subst hV
+  rfl
+
 /-- Pointwise negation (e.g. flip a measurement's sign convention). -/
 def neg (W : ValuationFunctor T) : ValuationFunctor T where
   V f := -W.V f
@@ -143,10 +155,12 @@ structure ClosesBooks (Wrev Wexp Weq : ValuationFunctor T)
   balanced : Wrev.V c + Wexp.V c + Weq.V c = 0
 
 /-- **Closing transfers exactly the net income into equity**: after
-    the closing entry, the equity measurement has grown by precisely
-    revenue + expense (net income, sign convention debit-positive).
-    Forced by the functor laws — there is no other amount a lawful
-    closing could transfer. -/
+    the closing entry, the equity measurement has changed by exactly
+    revenue + expense, both measured debit-positive. Revenue carries
+    credit balances, so for a profitable period that sum is negative
+    and equity, read credit-positive, grows by the net income.
+    The `ClosesBooks` conditions and the functor laws force this
+    amount. -/
 theorem closing_transfers_net_income
     {Wrev Wexp Weq : ValuationFunctor T} {A B C : Object}
     {f : T.Hom A B} {c : T.Hom B C}

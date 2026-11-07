@@ -17,26 +17,75 @@ specification, because that is what it is.
 
 ## The two layers, and the rule between them
 
-The specification layer defines meaning and proves laws:
+The specification layer defines meaning and proves laws. Each line
+below names a module and the `Ledger` modules it imports directly;
+the list records those imports, so an edit that adds or removes an
+import edits this list in the same commit:
 
-    Basic → Accounts → Groupoid → Labels, Hierarchy, Valuation
-          → Derivation, Prices → Theorems → Derived, Free, Trivial
-          → TimedPrices, and Free → Pacioli
+    Basic
+    Accounts     ← Basic
+    Groupoid     ← Accounts
+    Labels       ← Groupoid
+    Hierarchy    ← Groupoid
+    Valuation    ← Groupoid
+    Derivation   ← Valuation
+    Prices       ← Valuation
+    Theorems     ← Derivation, Hierarchy, Prices, Valuation
+    Derived      ← Theorems
+    Free         ← Theorems
+    Trivial      ← Labels, Theorems
+    TimedPrices  ← Derived
+    Pacioli      ← Free
 
 The executable layer reads journals and computes balances:
 
-    Basic → Parse → Journal, and Pacioli → Oracle → Register, Driver
+    Parse        ← Basic
+    Journal      ← Parse
+    Gen          ← Basic
+    Oracle       ← Pacioli
+    Register     ← Labels, Oracle
+    Driver       ← Journal, Oracle, Register
 
-`Driver` is the only module that joins the two sides. The
-specification layer never imports the executable layer, and that
-direction must be preserved; it was verified by import scan and any
-change that reverses an edge is wrong regardless of whether it
-builds. `Journal.lean` is the largest file in the repository by
-design: it records the observed conventions of the C++
-implementation, while the theory above it stays small. Know which
-layer you are editing. A change to `Groupoid` or `Theorems` is a
-change to the mathematics and needs a proof. A change to `Parse` or
-`Journal` is a claim about C++ behavior and needs a witness.
+Specification leaves extend the theory without entering the oracle.
+The index `Ledger.lean` imports every module listed here except `Gen`,
+which defines its own `main`. No executable module (`Parse`,
+`Journal`, `Gen`, `Oracle`, `Register`, `Driver`) imports a leaf, and
+the oracle's run path is the import closure of `Driver`:
+
+    TwoSides     ← Pacioli
+    TAccount     ← Pacioli
+    Decoding     ← Derived
+    PriceVector  ← Pacioli, TimedPrices
+    HoldingGain  ← PriceVector
+    Lots         ← PriceVector
+    Conversion   ← PriceVector
+    BasisGain    ← Conversion, Lots
+    Closing      ← Conversion
+
+Join modules connect the executable layer to a leaf for the sake of a
+proof:
+
+    DriverTwoSides ← Driver, TwoSides
+    GrossLedger    ← Register, TAccount
+    Market         ← Oracle, PriceVector
+
+A join module contains only definitions and theorems used for proofs,
+is imported only by `Ledger.lean`, and is never on the run path, so
+the interpreted oracle never loads a leaf.
+
+Apart from the index `Ledger.lean`, `Driver` is the only module
+that joins the two chains of the executable layer, the
+journal-reading chain of `Parse` and `Journal` and the evaluating
+chain that begins at `Oracle`. The specification layer never
+imports the executable layer, and that direction must be preserved;
+it was verified by import scan and any change that reverses an edge
+is wrong regardless of whether it builds. `Journal.lean` is the
+largest file in the repository by design: it records the observed
+conventions of the C++ implementation, while the theory above it
+stays small. Know which layer you are editing. A change to `Groupoid`
+or `Theorems` is a change to the mathematics and needs a proof. A
+change to `Parse` or `Journal` is a claim about C++ behavior and needs
+a witness.
 
 ## Non-negotiables
 
@@ -86,12 +135,50 @@ Output: `== PATH` opens each file's section; rows are
 `COMMODITY|AMOUNT|ACCOUNT`, sorted, amounts in canonical decimals;
 `%% dc COMM` declares a learned decimal-comma style (`*` names the
 null commodity); `!! ERROR reason` reports a rejected file and
-nothing else. Flags before a path apply to that file alone:
+nothing else. A rejection for transaction imbalance has a reason
+beginning `line N: unbalanced transaction`, prefixed by
+`periodic transaction: ` for a `~` template; N is the entry's header
+line number in the include-spliced text. That stem is part of the
+protocol. Other rejections name their cause freely.
+Flags before a path apply to that file alone:
 `--decimal-comma`, `--recursive-aliases`, `--now DATE`,
-`--input-date-format FORMAT`. This protocol is a compatibility
-surface. The C++ harness and any third-party comparator parse it, so
-changing it is a breaking change to be made deliberately and
-announced, never as a side effect.
+`--input-date-format FORMAT`, `--gross`, and `--exchange COMM`. The
+last two are opt-in output flags. `--gross` adds after the net rows
+sorted `>> dr ROW` and `>> cr ROW` lines, which give as positive
+magnitudes the gross debit and credit totals of each account, summed
+posting by posting, or, in place of those lines, the single line
+`?? gross lot-annotated-completion` when the oracle finds a
+completion that C++ may split by lot annotation, so that the totals
+of the completed account, or the way they show, can depart from those
+the oracle computes. The test behind that line refuses some files in
+excess and misses others, as the docstring of
+`Journal.Result.lotFanout` records. `--exchange COMM` adds after the
+net and gross lines sorted `>> value ROW` lines, which give the
+holdings of each account valued in `COMM` at the prices in effect at
+midnight of the `--now` date, each commodity priced through the only
+chain of recorded prices that links it to `COMM`, or, in place of
+those lines, the single line `?? exchange REASON`, with the commodity
+concerned after the reason where there is one, when the oracle cannot
+value the file as C++ does. The reason is the first that applies of
+`no-terminus`, `price-expr`, `unread-price`, `exchange-order`,
+`value-expression`, `posting-date`, `fixated-lot`, `equivalence`,
+`commodity-alias`, `price-precision`, `null-commodity`, `percent`,
+`time-unit`, `no-price-path`, `alternative-price-path`,
+`zero-inverse-price` and `rounds-to-zero`, each explained beside its
+branch of `exchangeRows` in `Ledger/Driver.lean`. No reason covers the
+known departures that the value lines inherit from the net totals, the
+price table and the learned display precisions, other than the
+precision that a price directive grants, which `price-precision`
+refuses, nor four further shapes. The docstring of `exchangeRows` says
+where these are recorded; those records are not an exhaustive account
+of differences from C++. A `??` line is never a rejection,
+and without these flags the output is byte-identical to the output
+described above. This protocol is a compatibility surface. The C++
+harness and any third-party comparator parse it, so changing it is a
+breaking change to be made deliberately and announced, never as a
+side effect. An extension is admissible only when it is opt-in and
+leaves the default output byte-identical, and it is announced here
+and in the README in the commit that introduces it.
 
 ## The pins, and how to move them
 
@@ -166,9 +253,14 @@ cover. Divergences are the product. One that exposes your defect you
 fix; one that exposes an unrecorded convention belongs here as a
 pull request adding the rule with its witness.
 
-The oracle compares balances. Register rows, market valuation, and
-lot matching are specified in the theory and not yet bisimulated, so
-do not claim coverage of them on the strength of this oracle.
+The oracle compares balances. Register rows, valuation at fixed
+prices, price-vector valuation, holding gains at dated prices, and
+lot refinement and basis gain are specified in the theory and are not
+bisimulated. The opt-in `--gross` and `--exchange COMM` outputs compute
+gross totals and valuation in one commodity for a comparator to check;
+the C++ harness does not yet compare them. Lot matching is not specified
+at all, and the oracle's flows do not distinguish lots. Do not claim
+coverage of any of these on the strength of this oracle.
 
 ## Style for prose and commits
 

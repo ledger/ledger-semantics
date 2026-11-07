@@ -7,33 +7,38 @@ import Ledger.Derived
 
 ## 𝓟(t) (decision: fibers, no cross-time structure)
 
-The handoff's design note: in the full theory 𝓟 is indexed by time
-(`P` directives are dated; `find_price` looks up the latest
-observation ≤ t). Model: a **family of fibers** — at each instant a
-price groupoid and a sound action. Deliberately *no* cross-time law:
-rates float freely between instants (a constraint would be headroom
-lost; the domain has none — yesterday's rate does not bound today's).
-Cross-time structure enters only with the observation-list
-*representation* (latest-≤-t lookup), which arrives with `P`-directive
-parsing (ledger-oyb follow-on) — ordering on `Time` is needed there,
-not here.
+`TimedPrices` is a family of fibers: at each instant a price groupoid
+and a sound action. There is deliberately no cross-time law. No
+ordering on `Time` is needed here; choosing an observation at or
+before a report date is a separate concern, not specified by this
+structure.
 
 ## The constant-rate model (PriceAction is nontrivially inhabited)
 
 `Trivial.lean` inhabits `PriceAction` with every rate 1. The model
-here has **arbitrary nonzero rates** and captures exactly what `-V`
-reports do: revaluation happens at *reporting* time — the transaction
-is untouched (`revalue := id`) and the *measurement* changes. Fix a
-base functional `W` and a price for each commodity; measure commodity
-`c` by `(1 / price c) • W`; convert `a → b` at rate
-`price a / price b`. Soundness is field arithmetic. A journal-side
-revaluation (rewriting `@`-cost generators) is a different, later
-model — it needs generators closed under rescaling and lands with
-cost-syntax parsing.
+here admits any nowhere-zero price function, with conversion rates
+given by its ratios. Fix a base functional `W` and a price for each
+commodity; measure commodity `c` by `(1 / price c) • W`; convert
+`a → b` at rate `price a / price b`. The transaction is untouched
+(`revalue := id`), and soundness is field arithmetic.
+`PriceAction.constModel` therefore witnesses a price action with
+rates other than 1. Valuation at fixed prices is compositional:
+`ValuationFunctor.finsetSum` in `Ledger/Valuation.lean` and
+`ValuationFunctor.smul` in `Ledger/Derived.lean` preserve the functor
+laws, as does `GenSpec.priceValuation` in `Ledger/PriceVector.lean`.
 
-Composing the two: `timedConstRates` — per-instant price functions
-give per-fiber constant-rate actions, i.e. time-varying rates with
-sound reporting at every instant.
+This is not a specification of the `-V` and `-X` reports of C++
+Ledger. In `timedConstRates`, one functional `W` serves every instant,
+and `priceAt t b` times the `b`-measurement is always `W.V f`
+(`timedConstRates_value_const`), whatever the prices are. With a
+numeraire held at price 1, every morphism has the same measurement at
+every instant (`timedConstRates_no_holding_gain` in
+`Ledger/HoldingGain.lean`). Thus that model varies the unit of
+measurement but cannot express a holding gain when the numeraire's
+price is fixed. The model whose values can move is `timedPriceVector`
+in `Ledger/HoldingGain.lean`: each fiber is `PriceAction.constModel`
+over `GenSpec.priceValuation` at that instant's price vector, rather
+than over one functional fixed for all instants.
 -/
 
 namespace Ledger
@@ -72,11 +77,14 @@ end PriceGroupoid
 
 namespace PriceAction
 
-/-- The reporting-time revaluation model: transactions are untouched;
+/-- A conversion model at fixed prices: transactions are untouched;
     commodity `c` is measured by `(1 / price c) • W`. Sound for the
-    constant-rate groupoid — and the rates are arbitrary nonzero
-    reals, so the `PriceAction` axioms have a nontrivial model
-    (the inhabitation witness ledger-oyb asked for). -/
+    constant-rate groupoid of any nowhere-zero price function, with
+    rates given by its ratios. This witnesses that the `PriceAction`
+    axioms admit rates other than 1, not that the model specifies C++
+    market reports. Keeping `W` fixed across instants, as
+    `timedConstRates` does, cannot express holding gains when the
+    numeraire's price is fixed; see the module docstring. -/
 noncomputable def constModel (T : 𝕋) (W : ValuationFunctor T)
     (price : Commodity → ℝ) (hne : ∀ c, price c ≠ 0) :
     PriceAction (PriceGroupoid.constRates price hne) T
@@ -93,13 +101,28 @@ noncomputable def constModel (T : 𝕋) (W : ValuationFunctor T)
 
 end PriceAction
 
-/-- Time-varying rates with sound per-instant reporting: each fiber
-    is the constant-rate model at that instant's prices. -/
+/-- Time-varying rates with a sound action at each instant: each fiber
+    is the constant-rate model at that instant's prices, with the same
+    base functional `W` throughout. -/
 noncomputable def timedConstRates (Time : Type) (T : 𝕋) (W : ValuationFunctor T)
     (priceAt : Time → Commodity → ℝ)
     (hne : ∀ t c, priceAt t c ≠ 0) : TimedPrices Time T where
   P t := PriceGroupoid.constRates (priceAt t) (hne t)
   CV t := fun c => (1 / priceAt t c) • W
   act t := PriceAction.constModel T W (priceAt t) (hne t)
+
+/-- Value in a fixed numeraire does not move in the constant-rate
+    model: at every instant, the price of `b` times the
+    `b`-measurement of a transaction is its measurement under the base
+    functional `W`, whatever the prices are. -/
+theorem timedConstRates_value_const (Time : Type) (T : 𝕋)
+    (W : ValuationFunctor T) (priceAt : Time → Commodity → ℝ)
+    (hne : ∀ t c, priceAt t c ≠ 0) (t : Time) (b : Commodity)
+    {A B : Object} (f : T.Hom A B) :
+    priceAt t b * ((timedConstRates Time T W priceAt hne).CV t b).V f
+      = W.V f := by
+  have hb := hne t b
+  show priceAt t b * ((1 / priceAt t b) * W.V f) = W.V f
+  field_simp
 
 end Ledger

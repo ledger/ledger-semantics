@@ -43,38 +43,112 @@ sequencing given by composition. The symmetry isomorphisms make
 provable the familiar fact that the order of accounts carries no
 information.
 
-Money enters through a valuation, a functor from this category into
-commutative groups that assigns to each generator the flow of
-quantities the transaction causes, and that is required to respect
-composition, tensor, and addition. The reporting function `netFlow`,
-which every balance report computes, is then an additive
-homomorphism out of the free model. Seen this way, the Pacioli
-invariant that debits equal credits is a theorem about the shape of
-morphisms, since every morphism has equal measure on its two ends.
-The theorem `pacioli_equation` in `Ledger/Theorems.lean` establishes
-the invariant for the abstract category, and `free_flow_balanced` in
-`Ledger/Pacioli.lean` carries it down to the computed flows.
+Money enters through valuations. A valuation is an additive real
+measurement of morphisms, and there are many of them: one for each
+account, each commodity, or each budget scenario. Every valuation
+respects composition, tensor, and addition, in the sense that the
+measurement of a composite, of a tensor product, or of an aggregate
+is the sum of the measurements of its parts. The reporting function
+`netFlow`, which computes the oracle's net balances, is then an
+additive homomorphism out of the free model.
 
-The theory also contains a negative result, one that explains a
-design constraint visible in every mature accounting program. The
-valuation algebra cannot support the further laws that folklore
-expects of it. The absorption law by itself forces every valuation
-to zero, an argument that `zero_absorption_degenerates` in
-`Ledger/Pacioli.lean` records and that refutes the bilinearity law
-separately as well, so the three laws named above are the minimal
-consistent basis. It follows that pricing must live outside the
-compositional core, as a lookup performed at reporting time, because
-a compositional pricing algebra with the expected laws does not
-exist.
+The double-entry principle is not a law of this structure but a
+hypothesis on each entry: the postings of every transaction sum to
+zero in each commodity. The principle is preserved because zero
+added to zero is zero. The master theorem
+`balanced_generators_balance` in `Ledger/Theorems.lean` shows that
+every morphism built from balanced entries is itself balanced,
+`trial_balance` states the resulting equality of debits and credits
+for a finite family of account measurements whose sum vanishes on
+each entry, and `balance_sheet_equation` rearranges the balance
+hypothesis on three account classes as assets equal to liabilities
+plus equity. For the flows the oracle computes, `free_double_entry`
+and `free_trial_balance` in `Ledger/Pacioli.lean` give the same
+conclusion in every commodity. Not every entry the oracle reads
+satisfies the hypothesis, as the section on what an implementation
+must preserve explains, and these theorems say nothing about the
+entries that do not. Nor does a trial balance that sums to zero
+show that each entry is correct: it shows that the entries balance
+in total, and offsetting errors cancel.
+
+The oracle also records the two sides of each entry. Each
+generator's domain is the multiset of the accounts it credits and
+its codomain the multiset of the accounts it debits, and for a
+generator that balances in every commodity, the net debits to its
+codomain equal the net credits to its domain, commodity by
+commodity (`specFor_coherent` and `flowsFin_two_ends` in
+`Ledger/DriverTwoSides.lean`, applying `two_ends` in
+`Ledger/TwoSides.lean`). These are the positive and negative parts
+of the net flow at each account, not posting-wise gross totals;
+endpoint multiplicities count postings, not amounts. David Ellerman
+argues that this two-sidedness is what is double in double-entry
+bookkeeping ("On Double-Entry Bookkeeping: The Mathematical
+Treatment", Accounting Education 23:5, 2014, p. 487). That an entry
+touches two or more accounts is not what is double: every nonzero
+zero-row of the signed carrier touches two accounts of one
+commodity (`zeroRow_two_accounts` in `Ledger/Pacioli.lean`), and a
+single-sided system of signed numbers shares the property. The
+two-ends reading holds for generators and not for morphisms in
+general, since a composite can carry flow at its intermediate
+accounts. No nonzero valuation measures every morphism as the
+difference between a measure of its codomain and a measure of its
+domain (`endpoint_measure_degenerates` in `Ledger/Valuation.lean`),
+and a measure of objects that is equal at the two ends of every
+morphism and zero on the empty object is zero everywhere
+(`conserved_measure_zero`), because the zero morphism exists
+between any two objects.
+
+The theory also contains a negative result, which explains why the
+compositional core omits certain compatibility laws. Hom-set
+addition aggregates transactions with the same endpoints and
+respects valuations, but the additional laws considered here would
+trivialize them. Each of the laws that folklore expects to relate
+it to the other operations forces every valuation to zero:
+absorption of zero by composition (`zero_absorption_degenerates`),
+distribution of composition over addition on either side
+(`left_distrib_degenerates` and `right_distrib_degenerates`), and
+additivity of tensor in its first argument
+(`tensor_additive_degenerates`), all in `Ledger/Pacioli.lean`.
+Because the free model satisfies the remaining laws and carries
+valuations that are not zero, none of these laws follows from the
+laws that remain, and `comp_not_zero_absorbing`,
+`comp_not_left_additive`, and `tensor_not_additive` exhibit the
+failure in the free model directly. The three valuation laws are
+the basis from which `V_id`, `V_zero`, and `V_inv` are derived in
+`Ledger/Valuation.lean`.
+
+None of this rules out compositional pricing. Valuation at fixed
+prices is itself a lawful valuation: a price-weighted sum of
+per-commodity measurements, built from `ValuationFunctor.finsetSum`
+and scalar multiplication (`priceValuation` in
+`Ledger/PriceVector.lean` gives the free-model form), satisfies all
+three laws, and `PriceAction.constModel` in
+`Ledger/TimedPrices.lean` is a model of the price action at rates
+formed from arbitrary nonzero commodity prices. What no transaction
+causes is the passage of the report date. In
+`Ledger/HoldingGain.lean`, `holding_gain_functor` expresses the
+change in value between two report dates as valuation at the
+difference of the price vectors relative to the chosen numeraire,
+assuming nonzero prices. The theorem
+`timedConstRates_no_holding_gain` shows that the older model cannot
+express this change when the numeraire is held at price 1. A report
+that values holdings at the prices of a later date therefore
+performs a lookup at reporting time rather than an operation on the
+journal. Ellerman describes the fixed-price case, valuing each
+vector of property quantities by a single price vector (2014, pp.
+497-498); the treatment of dated prices and revaluation is this
+repository's own.
 
 From the abstract meaning a representation tower descends in proved
-steps. The category maps first to a free model built as a quotient
-of formal morphisms, and the free model maps in turn to the Pacioli
-group of finitely supported functions from accounts to rational
-quantities, which is the level at which the oracle computes. Each
-step is a homomorphism, each commuting square is checked by Lean,
-and the proofs depend on no axioms beyond propositional
-extensionality, choice, and quotient soundness.
+steps. The abstract structure is represented by a free model built
+as a quotient of formal morphisms, and the free model maps in turn
+to finitely supported functions from accounts to rational
+quantities, the carrier `PacioliGroup`. The oracle computes this
+denotation with plain functions, account by account, as
+`netFlow_eq_flowAux` proves. Each step is a homomorphism, each
+commuting square is checked by Lean, and the proofs depend on no
+axioms beyond propositional extensionality, choice, and quotient
+soundness.
 
 These claims are stated in the standard vocabulary rather than in a
 private one. For every lawful model, `Ledger/Groupoid.lean`
@@ -99,18 +173,186 @@ consists of `Parse`, `Journal`, `Oracle`, `Register`, and `Driver`,
 together with `Gen`, a seeded generator of property-test journals
 that never authors expected results.
 
+A set of leaf modules extends the specification. `TwoSides` reads
+generator endpoints as the two sides of an entry and shows where
+composition breaks sign coherence. `TAccount` builds Ellerman's pair
+construction of the group of differences, with the debit and credit
+isomorphisms onto the signed carrier in which the oracle computes.
+`Decoding` presents balances by balance side and account class, and
+shows that the choice of side governs presentation rather than truth.
+`PriceVector` values flows by a fixed price vector, and `HoldingGain`
+lets that vector change between instants, which is where holding gains
+arise. `Lots` refines commodities by lot and states which market
+valuations the oracle's lot-blind flows can support, `Conversion`
+completes cost-balanced entries with the equity leg that Ledger's cost
+syntax leaves implicit, `BasisGain` relates market value, basis, and
+that leg, and `Closing` closes temporary accounts into equity.
+
+Three join modules connect these leaves to the executable layer for
+proofs only: `DriverTwoSides` proves the oracle's generators coherent
+with their ends, `GrossLedger` identifies gross totals with
+T-accounts, and `Market` proves that executable valuation agrees with
+the price-vector valuation. The index `Ledger.lean` imports every
+module except `Gen`, which defines its own `main`. No executable
+module imports a leaf or a join module, so neither enters the
+oracle's run path, the import closure of `Driver`.
+
+## The relation to Ellerman's algebra
+
+David Ellerman gives the algebra of double-entry bookkeeping as a
+group of differences ("The Mathematics of Double Entry
+Bookkeeping", Mathematics Magazine 58:4, 1985, 226-233). Its
+elements are T-accounts `[d // c]`, pairs of an unsigned debit and
+an unsigned credit, added side by side and equal when their
+cross-sums agree; he calls it the Pacioli group. He extends it to
+vectors of incommensurable property types, collapsed to a single
+value only by a price vector ("Double-Entry Multidimensional
+Accounting", Omega 14:1, 1986, 13-22), and the article cited above
+presents both (2014). This repository computes in the signed,
+single-sided image of that construction under his debit isomorphism
+`[d // c] ↦ d - c`. The carrier `PacioliGroup` is the free vector
+space over the rationals on pairs of an account name and a
+commodity, the rational and finitely supported analogue of his
+vector group, and it keeps only the signed difference of each
+T-account. Ellerman faults treatments that pass back and forth
+across the debit isomorphism without saying so, because doing so
+confuses the single-sided and double-sided systems (2014, n. 14),
+and the carrier is described here as his debit image for that
+reason. He allows a program to store signed numbers internally
+under either of his two isomorphisms (2014, p. 488). The
+debit-positive choice here is inherited from the journal syntax, in
+which C++ Ledger adds an amount to the account a posting names, and
+it is fixed by the output protocol; under the credit isomorphism
+every signed net row would change sign. The group of T-accounts
+itself is built in `Ledger/TAccount.lean`: `toP_eq_toP_iff` is
+Ellerman's equality by cross-sums, and `accountDebitIso` identifies
+the rational, finitely supported group over accounts with the
+carrier. His valuation of a vector of quantities by a price vector
+is `priceDot` in `Ledger/PriceVector.lean`.
+
+The correspondence with the tower is close. Ellerman calls the
+encoding of each transaction as a zero-term, a T-account equal to
+zero, the double-entry principle; here it is the hypothesis `hgen`
+of `balanced_generators_balance`, which asks each generator to
+balance. Posting a zero-term preserves a ledger's balance because
+zero added to zero is zero (2014, p. 489), and that argument is the
+proof of `balanced_generators_balance`. His two sides of an entry
+are the domain and codomain of the oracle's generators, as
+described above. His scheme "Beginning Ledger + Journal = Ending
+Ledger" (2014, p. 496) appears without a separate beginning ledger:
+opening balances can be entered as an ordinary balanced
+transaction, and the journal term is built up from the identity on
+the empty object (`journalTerm` in `Ledger/Driver.lean`). That is
+faithful because a beginning ledger is itself a zero-account (2014,
+p. 489). `balance_sheet_equation` gives his balance-sheet equation
+when its three classes cover the accounts without overlap, with
+revenue and expense included as temporary equity accounts, and the
+flow is the whole journal up to the report date. Liabilities and
+equity are read through the credit isomorphism. Decoding by balance
+side, with each account assigned to one side, is `Side.decode` in
+`Ledger/Decoding.lean`, and `decoded_iff_trial` shows that the side
+chosen for an account changes the presentation of the equation and
+not its truth. His reversal of a T-account corresponds to
+`flow_inv` and `reversal_correctness`. His worked ledgers (2014,
+pp. 489 and 496-498) are transcribed by hand as kernel-checked
+goldens in the namespace `Ledger.Ellerman` in `Ledger/Oracle.lean`;
+these check the evaluator and the transcribed arithmetic, not the
+parser.
+
+Two differences remain, and both are deliberate. The oracle's
+generators need not be zero-terms, since Ledger balances an
+exchange at cost and reports the postings' own quantities, where
+Ellerman routes the reverse composition through equity (2014, p.
+497). And where his algebra has a single operation, addition, the
+free model keeps composition, tensor, and aggregation distinct.
+Register reports observe the unreduced terms rather than only their
+net flows. The negative results above exclude absorption and
+distributive laws that would collapse every valuation; composition,
+tensor and aggregation all become addition in the carrier.
+
+Not all of Ellerman's apparatus is adopted by the executable
+oracle. The default output has no debit and credit columns: the
+protocol fixes it as signed rows, while the opt-in `--gross` flag
+adds posting-wise debit and credit totals, as described below. The
+oracle assigns no debit-balance or credit-balance labels to
+accounts, since C++ accounts do not carry them, and it does not
+complete exchanges with an equity leg, which would add postings
+that C++ does not infer. Nor is addition the model's only
+operation, which would erase the distinctions just described.
+Ellerman observes that the Pacioli group is only the algebra in
+which the double-entry method calculates, not the method itself,
+and that the virtues of the double-sided presentation are human
+rather than mathematical (2014, p. 488). This repository formalizes
+the algebra and the laws that follow from it, and leaves the
+presentation to the implementations it measures.
+
 ## What an implementation must preserve
 
 A Ledger implementation reads plain-text journals and reports on
-them, and the theory fixes what any such program must preserve.
-Value is conserved, so that a transaction either balances exactly
-within each commodity or names the one posting that absorbs the
-remainder. Arithmetic is exact, with quantities kept as rational
-numbers and rounding performed only at display, after all
-composition, so that approximation is applied once and never
-compounded. The order of accounts within a transaction carries no
-meaning, and reports are functions of the journal's denotation, so
-that two journals with the same denotation report the same balances.
+them, and the theory fixes what any such program must preserve. The
+first obligation is balance, and it is weaker than conservation of
+each commodity. For postings subject to balancing, the check tests
+weights: a posting weighs its cost if it has one, including a
+rounded lot gain where required, and otherwise its own amount. A
+remaining imbalance can be settled by conversion at the rate that
+C++ infers for a two-commodity implicit exchange, or by lot-price
+valuation on a second pass. The weights must sum to zero in each
+commodity within the recorded tolerances, or leave a remainder that
+an elided posting, or, in a transaction of a single posting, the
+default account named by a `bucket` directive, absorbs. The passes
+and their departures from C++ are recorded in
+`Ledger/Journal.lean`. Reported balances, by contrast, are sums of
+the postings' own quantities. The oracle targets the check that C++
+runs without `--permissive`: it rejects the conflicting balance
+assignment of `test/regress/2005.test`, which C++ accepts under
+`--permissive` by revising the assigned amount
+(`src/xact.cc:932-953`).
+
+The per-commodity totals of a report over all accounts, before
+display rounding, therefore vanish when every transaction balances
+in its own quantities, and in general they equal the sum of the
+residuals that the individual transactions leave in their own
+quantities. Such residuals arise from the conversions that cost and
+lot-price balancing admit, the conversions that C++ infers for a
+two-commodity implicit exchange, the amounts of paren-virtual
+postings, which are exempt from balancing whether written or
+appended by an automated transaction, timeclock entries, which are
+added without a balance check, and remainders accepted within
+tolerance. Residuals can cancel between transactions, so a zero
+total does not show that no conversion took place.
+`netFlow_trial_balance` in `Ledger/Oracle.lean` and
+`netFlow_commodity_sum` in `Ledger/Register.lean` state the two
+halves of this contract for the oracle's computed flows.
+
+An unfiltered C++ `equity` report keeps nonvirtual and virtual
+posting subtotals separate even within the same account. It computes
+its `Equity:Opening Balances` offset as the negation of the sum of
+the nonvirtual subtotals and the virtual subtotals marked for
+balancing (`src/filters.cc:1673-1688` and
+`src/filters.cc:1960-1961`). Nonvirtual timeclock postings contribute
+despite their exemption from transaction balancing. The C++ suite
+pins nonzero commodity totals and equity offsets:
+`test/regress/1784.test` expects a total of 28 ABCDEF and -280.00 EUR
+from a lot purchase followed by a split, and
+`test/baseline/cmd-equity.test` expects `equity` to post -4 AAA and
+3.80 GBP against totals of 4 AAA and -3.80 GBP. Ellerman's vector
+journal records an exchange differently: it balances in each
+property type because an equity account carries the reverse
+composition (2014, p. 497), a leg that Ledger's cost syntax leaves
+implicit.
+
+In the compositional model, arithmetic is exact, with quantities
+kept as rational numbers and rounding performed only at display,
+after all composition, so that approximation is applied once and
+never compounded. In the executable layer, display rounding and the
+rounded test for a zero remainder follow C++ at an exact decimal
+tie, through the binary expansion of `stream_out_mpq`
+(`src/amount.cc:208-245`) rather than by a decimal rule. The order
+of accounts within a transaction carries no meaning in the model,
+and net balances are functions of the journal's denotation. Two
+journals with the same denotation therefore have the same net
+balances before display; their presentation still depends on the
+precision and style learned from the journal.
 
 Alongside this theory, the executable layer records the observed
 conventions of the C++ implementation, rule by rule, with each rule
@@ -146,10 +388,97 @@ in canonical decimal form and the rows sorted. A line of the form
 decimal-comma style, with `%% dc *` naming the null commodity, so
 that a comparator can normalize the other side's output. A rejected
 file prints `!! ERROR` with a reason and nothing else, which keeps
-failure visible. Flags given before a file path apply to that file
-alone, and four are recognized: `--decimal-comma`,
-`--recursive-aliases`, `--now DATE`, and
-`--input-date-format FORMAT`.
+failure visible. A rejection for transaction imbalance has a reason
+beginning `line N: unbalanced transaction`, prefixed by
+`periodic transaction: ` when the failing entry is a `~` template.
+Here N is the entry's header line number in the include-spliced text.
+That stem is part of the protocol, so that a comparator can check
+rejections for imbalance as well as balances; other rejections name
+their cause freely. Flags given before a file path apply to that file
+alone, and six are recognized: `--decimal-comma`,
+`--recursive-aliases`, `--now DATE`, `--input-date-format FORMAT`,
+and the opt-in output flags `--gross` and `--exchange COMM`, described
+below.
+
+An output flag is opt-in. A file given without one prints exactly the
+output described above, byte for byte, so that a comparator that does
+not pass it needs no change. `--gross` adds, after the net rows,
+sorted lines of the forms `>> dr COMMODITY|AMOUNT|ACCOUNT` and
+`>> cr COMMODITY|AMOUNT|ACCOUNT`, which give as positive magnitudes
+the gross debit and credit totals of each account. The totals are
+summed posting by posting, as the columns of the C++ program's `--dc`
+option are, and each is displayed as a net row is. Before display, an
+account's debit total less its credit total is its net flow, which its
+net row shows (`gross_foot` in `Ledger/Register.lean`). The totals are
+worth comparing because an error in resolving the postings can leave
+every net row unchanged, as a balance assignment read as a plain
+amount does when a later assignment to the same account absorbs the
+difference. Such an error is hidden from the net rows exactly when it
+cancels in every account it touches, and the gross totals of those
+accounts still move unless it also cancels within their debits and
+within their credits, which is the blind spot of the gross comparison
+itself. C++ can complete an elided posting with several postings of
+one commodity that its lot annotations keep apart, where the oracle
+completes it with a single posting of that commodity or with none,
+and the columns that C++ shows for the completed account can then
+depart from the oracle's gross lines in two ways. The postings of C++
+can differ in sign, and both totals of the account then exceed the
+oracle's. Where the oracle's single posting carries the precision of
+a cost, which C++ can show for a lone posting but drops from the sum
+of several in one column, a column that both sides total alike can
+also show differently. A file in which the oracle finds such a
+completion prints the single line `?? gross lot-annotated-completion`
+in place of the gross lines. The test that decides this refuses some
+files in excess and misses others, and the docstring of
+`Journal.Result.lotFanout` in `Ledger/Journal.lean` records both
+conditions and the known cases, each with a journal. Such a file is
+not rejected: its net rows still print, and a `??` line never stands
+in for `!! ERROR`.
+
+`--exchange COMM` adds, after the net rows and any gross lines, sorted
+lines of the form `>> value COMM|AMOUNT|ACCOUNT`, one for each account
+whose holdings have a nonzero value in `COMM` at the prices in effect
+at the report date, which is midnight at the start of the `--now`
+date, as the C++ program's `-X` option values them. A commodity other
+than `COMM` is priced through the only chain of recorded prices that
+links it to `COMM`, at the product of the prices along the chain, and
+each value is displayed in `COMM` as a net row is. The value of an
+account is the sum of `netValueAt` in `Ledger/Oracle.lean` over the
+account names that the report-time rewrites merge into it, and
+`netValueAt_eq_valueHom` in `Ledger/Market.lean` proves `netValueAt`
+equal to the value of an account name's property vector at the price
+vector, Ellerman's valuation of property at prices (p. 498), over a
+list of accounts without duplicates that holds every account with a
+nonzero flow, as the driver's list does. Where the oracle cannot value
+a file as the C++ program does, the single line `?? exchange REASON`
+takes the place of the value lines, with the commodity concerned after
+the reason where there is one. The reason is the first that applies of
+`no-terminus`, `price-expr`, `unread-price`, `exchange-order`,
+`value-expression`, `posting-date`, `fixated-lot`, `equivalence`,
+`commodity-alias`, `price-precision`, `null-commodity`, `percent`,
+`time-unit`, `no-price-path`, `alternative-price-path`,
+`zero-inverse-price` and `rounds-to-zero`, and the comment beside each
+branch of `exchangeRows` in `Ledger/Driver.lean` gives the rule of the
+C++ program that forces it, or states that it marks a limitation of
+the oracle. No reason covers the known departures that the value lines
+inherit from the net totals, from the dated price table and from the
+display precisions that the oracle learns, other than the precision
+that a price directive grants, which `price-precision` refuses. The
+comments beside the rules of the oracle record witnessed departures,
+including shapes that the C++ program rejects and the oracle accepts,
+as the provenance section explains. They are not an exhaustive account
+of differences from C++. No reason covers four further
+shapes either: a journal line that sets another report option or a
+session option that takes effect only once the C++ program has read
+the journal; a price read in a style other than the C++ program's; an
+assignment in an expression that the C++ program evaluates as it reads
+the journal; and such an expression that values a commodity at the
+report date, which leaves in the C++ program's cache of prices a price
+that a later price on its chain does not always clear. For these the
+value lines can depart from the C++ program, and the docstring of
+`exchangeRows` says where each is recorded. Such a file is not
+rejected: its net rows still print, and a `??` line never stands in
+for `!! ERROR`.
 
 The driver runs under the Lean interpreter, and the build
 deliberately produces no native executable, so that what executes
@@ -182,10 +511,10 @@ Every non-comparison is made visible. A file the oracle cannot yet
 read counts as a named skip and never as a pass, and the C++ harness
 exits with code 77 in that case so that its test runner reports the
 run as skipped. The goal is zero skips outside the inherently
-non-comparable bins, and the C++ suite has reached that goal. Of its
-4364 test files, 3796 are compared with zero divergence, 489 expect
-errors, 77 contain no journal, and 2 embed Python in the journal
-itself.
+non-comparable bins, and the C++ suite has reached that goal. At C++
+revision 76b9dc2b2, of its 4364 test files, 3796 are compared with
+zero divergence, 489 expect errors, 77 contain no journal, and 2
+embed Python in the journal itself.
 
 The comparator is also proved able to fail. Every run replays a
 fixture in which one side carries a known planted defect, and the
@@ -195,9 +524,10 @@ never been observed to fail provides no evidence when it passes.
 Finally, each result records what it compared, naming the source
 revisions of both sides, the binary, and the flags, and it states
 what the comparison does not cover. This oracle compares balances.
-It does not yet compare register report rows, market valuation, or
-lot matching, and a passing result is meaningful only together with
-a plain statement of such limits.
+It can also print gross debit and credit totals and valuation in one
+commodity for a comparator to check, but it does not compare register
+report rows, unrealized gains, or lot matching, and a passing result
+is meaningful only together with a plain statement of such limits.
 
 The divergences that a comparison surfaces are its value. Each one
 either exposes a defect in the implementation under test or exposes
@@ -237,9 +567,19 @@ of the C++ program require no Lean toolchain, because without
 `LEDGER_LEAN_DIR` the test is not registered, and a registered test
 without a toolchain reports itself skipped.
 
-The balance semantics is complete against the C++ suite as of
-August 2026. Register rows and time-indexed valuation are specified
-in the theory and remain to be bisimulated, by the same procedure.
+The balance semantics agrees with every comparable file of the C++
+suite at revision 76b9dc2b2. Known shapes that it accepts although C++
+rejects them are recorded beside their rules in comments marked
+`fail-open` or `fails open` in `Ledger/Journal.lean` and
+`Ledger/Parse.lean`. These include the docstrings of `impliedExchange`
+and `zeroTestPrec`, and the comments at the automated-transaction
+check. The command `git grep -n -E 'fail-open|fails open' -- Ledger`
+lists those comments together with other departures, including wrong
+rows and refusals that miss a case. Agreement with this corpus is not
+completeness for the journal language. Register rows, valuation at
+fixed and at dated prices, lot refinement and basis gain are specified
+in the theory and remain to be bisimulated by the same procedure;
+lot matching is not specified.
 
 ## License
 

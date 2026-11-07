@@ -4,17 +4,29 @@ import Ledger.Basic
 /-!
 # Property-sweep journal generator (acceptance card 1, rung 2)
 
-Emits random **balanced** journals in the stage-1 `.dat` subset, for
-the differential sweep to replay through both the C++ ledger and the
-Lean oracle. Determinism is part of the comparison tuple: the seed and
-the generator's identity pin the corpus — regenerate, never hand-edit.
-The generator never authors expectations (single-oracle doctrine): the
-oracle side of the sweep computes the expected balances live.
+Emits random journals in the stage-1 `.dat` subset, for the
+differential sweep to replay through both the C++ ledger and the Lean
+oracle. Every entry balances in its real postings: in each commodity,
+as written or once its elided posting is completed; at its stated cost,
+when it has one; and, in the exchange shape, only at the rate that C++
+infers from its two postings in different commodities (Phase 3 of
+`finalize`, src/xact.cc:374-473 at 76b9dc2b2), which the oracle
+reproduces for this shape (`impliedExchange` in Journal). Determinism
+is part of the comparison tuple: the seed and the generator's identity
+pin the corpus, which is regenerated and never edited by hand. The
+shape roll has had ten outcomes instead of eight since the reversal-pair
+and exchange shapes were added, which changes the shape of about four
+draws in five, so every seed yields a different corpus than it did
+before, and a corpus generated earlier cannot be reproduced from its
+seed by this revision. The generator never authors expectations
+(single-oracle doctrine): the oracle side of the sweep computes the
+expected balances live.
 
 Entry shapes exercised, decided by the seeded PRNG:
-  - 2–4 postings; prefix (`$`, `€`) and suffix (`GEN`) commodities;
-  - `$-12.34`, `$ -12.34`, and `-12.34 GEN` amount spellings; comma
-    grouping on large amounts; tab and double-space separators;
+  - two to five written postings per entry; prefix (`$`, `€`) and
+    suffix (`GEN`) commodities;
+  - `$-12.34`, `$ -12.34`, `-$12.34` and `-12.34 GEN` amount
+    spellings, with comma grouping on large amounts;
   - explicit closing postings (single-commodity entries) and elided
     postings (possibly completing several commodities at once);
   - per-unit costs, `N GOODS @ PRICE`, with two-decimal prices, an
@@ -27,23 +39,42 @@ Entry shapes exercised, decided by the seeded PRNG:
     multiplier postings (a virtual one, or a real pair that cancels),
     placed at a seeded position so some matching entries precede the
     rule and some follow it;
-  - posting status flags and trailing notes (label noise the flows
-    must ignore).
+  - reversal pairs, `[x // y] + [y // x] = [0 // 0]` in the notation of
+    Ellerman (2014), p. 486: an explicit single-commodity entry among
+    the accounts `Assets:Rev0` to `Assets:Rev3`, which no other shape
+    touches, followed on the same day by its reversal, so that each of
+    those accounts nets to exactly zero;
+  - two-commodity exchanges: two postings in different commodities, of
+    opposite signs, with no cost, lot or elided posting, each keeping
+    its own amount; such an entry is the value collapse, under an
+    inferred price, of an exchange such as Ellerman's transaction 2b
+    (pp. 497-498), not Ledger's spelling of that transaction;
+  - a note line under the payee (label noise the flows must ignore).
 
 Exactness is part of the contract, not decoration. Every construct is
 chosen so the reported balances land exactly on the commodity's
 two-decimal display precision: unit counts are integers, prices carry
 two decimals, and the postings a multiplier can match carry whole
-currency units. A value that fell exactly halfway between two
-displayable cents would be resolved by C++'s MPFR round-to-nearest on
-a binary approximation and by the oracle's exact half-away-from-zero
-rule, and those two rules disagree; the generator does not manufacture
-such ties, because a sweep corpus is meant to grow *construct*
-coverage, not to smuggle in a known display-rounding gap.
+currency units. The rate that C++ infers for an exchange need not be
+exact at any precision, but no balance reports it. Every total is
+therefore a whole number of cents or of units, so the generated
+journals reach the driver's suppression of a total that is exactly
+zero, through the reversal accounts, and never its suppression of a
+nonzero total that shows as zero (`balancesOf` and `displayRow` in
+Driver). A value that fell exactly halfway between two displayable
+cents would be decided by the binary approximation through which C++
+prints an amount (`stream_out_mpq`, src/amount.cc:208-245), which the
+oracle reproduces in `Parse.cppRoundAt`; the generator still does not
+manufacture such ties, because a sweep corpus is meant to grow
+*construct* coverage, and a tie exercises the rounding of the display
+rather than any construct of the journal.
 
 The generator never authors expectations, only journals.
 
-Run: `lake env lean --run Ledger/Gen.lean SEED XACTS OUTFILE`
+Run: `lake env lean --run Ledger/Gen.lean SEED DRAWS OUTFILE`, where
+DRAWS counts the draws of the shape roll; a reversal pair is one draw
+and two transactions, so a corpus holds one transaction more than its
+draws for each reversal pair in it.
 -/
 
 namespace Ledger
@@ -88,6 +119,12 @@ def lotAccounts : List String :=
     whole currency units emitted by the auto-target shape. -/
 def autoAccounts : List String :=
   (List.range 4).map fun i => s!"Expenses:Auto{i}"
+
+/-- Accounts that only reversal pairs touch. Kept out of `accountPool`
+    and unmatched by the automated rules, so that each of them nets to
+    exactly zero over the journal. -/
+def revAccounts : List String :=
+  (List.range 4).map fun i => s!"Assets:Rev{i}"
 
 /-- Multipliers whose product with a whole currency unit is exact at
     two decimals. -/
@@ -142,10 +179,14 @@ structure Posting where
   account : String
   amountStr : Option String
 
-def emitXact (idx : Nat) (ps : List Posting) (note : Bool) : String :=
+/-- The text of one transaction, dated by the draw index `idx`, with
+    the payee `payee`, a note line when `note` holds, and the postings
+    `ps`. -/
+def emitXact (idx : Nat) (ps : List Posting) (note : Bool)
+    (payee : String := s!"Generated {idx}") : String :=
   let day := idx % 28 + 1
   let month := idx / 28 % 12 + 1
-  let header := s!"2026/{month}/{day} Generated {idx}"
+  let header := s!"2026/{month}/{day} {payee}"
   let lines := ps.map fun p =>
     match p.amountStr with
     | some a => s!"    {p.account}    {a}"
@@ -231,23 +272,91 @@ def genAutoTargetXact (idx : Nat) (note : Bool) (r : Rng) : String × Rng :=
       amountStr := some (spellAmount s2 money prefixSym (-amt)) }
   (emitXact idx [p1, p2] note, r)
 
-/-- Generate one transaction; returns its text.
+/-- A reversal pair, `[x // y] + [y // x] = [0 // 0]` in the notation of
+    Ellerman (2014), p. 486: an explicit entry of two or three postings
+    in the commodity `comm` among the accounts `Assets:Rev0` to
+    `Assets:Rev3`, its last posting closing it, and, on the same day,
+    its reversal, which negates every amount and takes the payee that
+    `Label.ofReversal` gives a reversal. Each of those accounts nets to
+    exactly zero over the pair. -/
+def genReversalPair (idx : Nat) (comm : String) (prefixSym : Bool)
+    (note : Bool) (r : Rng) : String × Rng :=
+  let (k, r) := r.below 2
+  -- the account, cents and spelling style of each posting, the closing
+  -- posting last
+  let rec build (n : Nat) (sum : Int) (acc : List (String × Int × Nat))
+      (r : Rng) : List (String × Int × Nat) × Rng :=
+    match n with
+    | 0 =>
+        let (a, r) := r.pick revAccounts
+        (((a, -sum, 1) :: acc).reverse, r)
+    | m + 1 =>
+        let (a, r) := r.pick revAccounts
+        let (c, r) := r.cents
+        let (style, r) := r.below 6
+        build m (sum + c) ((a, c, style) :: acc) r
+  let (ps, r) := build (k + 1) 0 [] r
+  let side := fun (sgn : Int) => ps.map fun (a, c, style) =>
+    ({ account := a
+       amountStr := some (spellAmount style comm prefixSym (sgn * c)) } : Posting)
+  (emitXact idx (side 1) note ++ "\n"
+    ++ emitXact idx (side (-1)) false (payee := s!"Reversal of Generated {idx}"), r)
 
-    Eight shapes, weighted by the `below 8` roll: 0/2/6 explicit
-    single-commodity, 1/7 the original one-or-two-commodity elision,
-    and one roll each for the cost, three-commodity-elision, and
-    auto-target shapes. The commodity roll happens before the dispatch
-    because the shapes that pick their own commodities still consume
-    it: the draw sequence is what makes a seed reproducible, so it
-    stays fixed for every shape. -/
+/-- A two-posting exchange: amounts of opposite signs in two different
+    commodities of `commodities`, whole cents each, with no cost, lot or
+    elided posting. C++ balances it at the rate that it infers from the
+    two amounts (Phase 3 of `finalize`, src/xact.cc:374-473 at
+    76b9dc2b2), the oracle accepts it as C++ does (`impliedExchange` in
+    Journal), and each posting keeps its own amount. -/
+def genExchangeXact (idx : Nat) (note : Bool) (r : Rng) : String × Rng :=
+  let (i1, r) := r.below commodities.length
+  let (d, r) := r.below (commodities.length - 1)
+  -- a commodity other than the first
+  let i2 := (i1 + d + 1) % commodities.length
+  let (c1, p1) := commodities[i1 % commodities.length]!
+  let (c2, p2) := commodities[i2]!
+  let (a1, r) := r.below accountPool.length
+  let (a2, r) := r.below accountPool.length
+  let (m1, r) := r.below 999999
+  let (m2, r) := r.below 999999
+  let (sgn, r) := r.below 2
+  let (s1, r) := r.below 6
+  let (s2, r) := r.below 6
+  let v1 : Int := Int.ofNat (m1 + 1)
+  let v2 : Int := Int.ofNat (m2 + 1)
+  let (q1, q2) := if sgn == 0 then (v1, -v2) else (-v1, v2)
+  let ps : List Posting :=
+    [{ account := accountPool[a1 % accountPool.length]!
+       amountStr := some (spellAmount s1 c1 p1 q1) },
+     { account := accountPool[a2 % accountPool.length]!
+       amountStr := some (spellAmount s2 c2 p2 q2) }]
+  (emitXact idx ps note, r)
+
+/-- Generate the transaction of one draw, or the two of a reversal
+    pair; returns their text.
+
+    The ten outcomes of the `below 10` roll select the shape: 0/2/6
+    explicit single-commodity, 1/7 the original one-or-two-commodity
+    elision, and one outcome each for the cost (3),
+    three-commodity-elision (4) and auto-target (5) shapes, for a
+    reversal pair through the accounts `Assets:Rev0` to `Assets:Rev3`
+    (8), and for a two-commodity implicit exchange (9). The roll had
+    eight outcomes before shapes 8 and 9 were added; widening it changed
+    the shapes that a seed draws, and with them the corpus it yields.
+    The commodity roll happens before the dispatch because the shapes
+    that pick their own commodities still consume it: the draw sequence
+    is what makes a seed reproducible, so it stays fixed for every
+    shape. -/
 def genXact (idx : Nat) (r : Rng) : String × Rng :=
-  let (shape, r) := r.below 8
+  let (shape, r) := r.below 10
   let (commIdx, r) := r.below commodities.length
   let (comm, prefixSym) := commodities[commIdx % commodities.length]!
   let (note, r) := r.below 4
   if shape == 3 then genCostXact idx (note == 0) r
   else if shape == 4 then genMixedElisionXact idx (note == 0) r
   else if shape == 5 then genAutoTargetXact idx (note == 0) r
+  else if shape == 8 then genReversalPair idx comm prefixSym (note == 0) r
+  else if shape == 9 then genExchangeXact idx (note == 0) r
   else
   let elide := shape % 2
   if elide == 0 then
@@ -329,7 +438,7 @@ def genRules (n : Nat) (r : Rng) : List Rule × Rng :=
 
 def genJournal (seed : Nat) (n : Nat) : String :=
   let header :=
-    s!"; generated by lean/Ledger/Gen.lean — seed {seed}, {n} xacts\n" ++
+    s!"; generated by lean/Ledger/Gen.lean, seed {seed}, {n} draws\n" ++
     "; regenerate, never hand-edit (comparison-tuple discipline)\n\n"
   let (rules, r0) := genRules n ⟨UInt64.ofNat seed⟩
   let rec go (i : Nat) (r : Rng) (acc : List String) : List String :=
@@ -352,7 +461,7 @@ def main (args : List String) : IO Unit := do
       let seed := seedS.toNat!
       let n := nS.toNat!
       IO.FS.writeFile out (Ledger.Gen.genJournal seed n)
-      IO.println s!"wrote {out} (seed {seed}, {n} xacts)"
+      IO.println s!"wrote {out} (seed {seed}, {n} draws)"
   | _ =>
-      IO.eprintln "usage: lake env lean --run Ledger/Gen.lean SEED XACTS OUTFILE"
+      IO.eprintln "usage: lake env lean --run Ledger/Gen.lean SEED DRAWS OUTFILE"
       throw (IO.userError "bad args")
