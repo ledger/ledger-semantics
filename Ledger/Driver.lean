@@ -801,41 +801,68 @@ def expandHome (p : String) : IO (Option String) := do
       return some (home ++ (rest.drop 1).toString)
   | none => return none
 
-end Ledger.Driver
+/-- Read one include-path component the way `mask_t::assign_glob`
+    (src/mask.cc) reads it, returning the anchored regex, the name the
+    component spells, and whether it has a wildcard or a set.  `?` and
+    `*` are wildcards; `[` opens a set that runs to the next `]` and is
+    an ordinary character when no `]` follows; a backslash makes the
+    next character literal, and a trailing backslash stands for itself;
+    every other character is literal.  The regex escapes the characters
+    `assign_glob` escapes and leaves a `]` bare, so a `]` that Boost
+    reads as closing a set closes it here as well.  `^` and `$` stand
+    in for `\A` and `\z`, which `compileRegex` lacks.  Boost takes a
+    `]` directly after `[` or `[^` as a member of the set, where
+    `compileRegex` would close an empty one, so that `]` is escaped.
+    Witnesses: regress/include-glob-escapes (escaped and unclosed
+    brackets), regress/include-glob-literals (`$` and `^` in names),
+    regress/coverage-mask-glob-escape (an escaped `_`). -/
+partial def globComponent (c : String) : String × String × Bool :=
+  let isMeta := fun (ch : Char) => "\\^$.|?*+()[{}".contains ch
+  let lit := fun (ch : Char) => if isMeta ch then ['\\', ch] else [ch]
+  -- the members of a set, up to the first `]` after its `[`
+  let rec members (acc : List Char) : List Char → Option (List Char × List Char)
+    | [] => none
+    | ']' :: rest => some (acc.reverse, rest)
+    | ch :: rest => members (ch :: acc) rest
+  let rec go (rx name : List Char) (wild : Bool) :
+      List Char → List Char × List Char × Bool
+    | [] => (rx, name, wild)
+    | '?' :: rest => go (rx ++ ['.']) name true rest
+    | '*' :: rest => go (rx ++ ['.', '*']) name true rest
+    | '[' :: rest =>
+        match members [] rest with
+        | none => go (rx ++ lit '[') (name ++ ['[']) wild rest
+        | some (ms, after) =>
+            let set := match ms with
+              | [] => ['[', '\\', ']']
+              | ['^'] => ['[', '^', '\\', ']']
+              | _ => '[' :: ms ++ [']']
+            go (rx ++ set) name true after
+    | '\\' :: ch :: rest => go (rx ++ lit ch) (name ++ [ch]) wild rest
+    | ch :: rest => go (rx ++ lit ch) (name ++ [ch]) wild rest
+  let (rx, name, wild) := go [] [] false c.toList
+  (String.ofList ('^' :: rx ++ ['$']), String.ofList name, wild)
 
 /-- Resolve an include pattern as C++ `include_directive` does
-    (textual_directives.cc:365-392). A pattern that begins with `/` is
+    (textual_directives.cc:365-392): a pattern that begins with `/` is
     taken as written, one that begins with `~` is expanded by
     `expandHome`, and any other is joined to `dir`, the directory of
-    the including file. The path is normalized (`normalComps`) and
-    matched from the root one component at a time against the entries
-    of each directory, as `expand_glob_path` does
-    (textual_directives.cc:270-305), and case-sensitively, so that a
-    name that differs only in case does not match on a
-    case-insensitive filesystem either (regress/1660). Only a
-    directory continues the walk, and only a regular file is a final
-    match (textual_directives.cc:298-302).
+    the including file. The path is then expanded one path component
+    at a time, as `expand_glob_path` (src/textual_directives.cc) does:
+    a component with a wildcard or a set is matched against the entries
+    of the directory reached so far, a component without one names a
+    single entry, only directories are descended into, and only regular
+    files are included. The match is case-sensitive, so that a name
+    that differs only in case does not match on a case-insensitive
+    filesystem either (regress/1660).
 
-    The matching of a single component departs from C++ in four known
-    ways, which this function keeps. C++ compiles every component,
-    glob or not, with `mask_t::assign_glob` (textual_directives.cc:280,
-    mask.cc:379-423), which leaves `^` and `$` as anchors of the
-    regular expression, takes a backslash as escaping the character
-    after it, and copies a bracket expression into the regular
-    expression as written, through its closing `]` (mask.cc:390-395).
-    Here a component without `*`, `?` or `[` must equal an entry
-    exactly; `^` and `$` in a glob component match themselves; `splice`
-    has already dropped every backslash; and every character inside a
-    bracket is translated as it is outside one, so that `[^a]` is a
-    class of `^` and `a` rather than a negated class, and `x[*].dat`
-    does not match a file named `x*.dat`, nor `x[?].dat` one named
-    `x?.dat`. C++
-    also takes a pattern that begins with a backslash as written,
-    against the working directory of the process
-    (textual_directives.cc:370), where here it is joined to `dir`. For
-    a name that holds `^` or `$`, a pattern that holds a backslash, or
-    a bracket expression that holds `^`, `*` or `?`, the oracle and C++
-    can therefore read different files. -/
+    A component that holds no wildcard and no set must equal an entry
+    exactly. One departure remains: `splice` has already dropped every
+    backslash in the pattern, where C++ takes a backslash as making the
+    next character literal (see `globComponent`), and C++ takes a
+    pattern that begins with a backslash as written, against the
+    working directory of the process (textual_directives.cc:370), where
+    here it is joined to `dir`. -/
 partial def globPaths (dir : System.FilePath) (pat : String) :
     IO (List System.FilePath) := do
   let full? ←
@@ -843,17 +870,7 @@ partial def globPaths (dir : System.FilePath) (pat : String) :
     else if pat.startsWith "~" then Ledger.Driver.expandHome pat
     else pure (some (dir.toString ++ "/" ++ pat))
   let some full := full? | return []
-  let isGlob := fun (c : String) =>
-    c.toList.any fun ch => ch == '*' || ch == '?' || ch == '['
-  let globRx := fun (c : String) => String.join (c.toList.map fun ch =>
-    if ch == '*' then "[^/]*"
-    else if ch == '?' then "."
-    else if ch == '.' then "\\."
-    else if ch == '[' then "["
-    else if ch == ']' then "]"
-    else if ch == '+' || ch == '(' || ch == ')' || ch == '|'
-         || ch == '^' || ch == '$' then String.ofList ['\\', ch]
-    else String.ofList [ch])
+  let comps := full.splitOn "/"
   let isFile := fun (p : System.FilePath) => do
     match ← p.metadata.toBaseIO with
     | .ok m => pure (m.type == .file)
@@ -865,9 +882,10 @@ partial def globPaths (dir : System.FilePath) (pat : String) :
         let baseP : System.FilePath := ⟨if base.isEmpty then "/" else base⟩
         if !(← baseP.isDir) then return []
         let names := (← baseP.readDir).map (·.fileName)
+        let (rxSrc, name, wild) := Ledger.Driver.globComponent c
         let matched : Array String :=
-          if !(isGlob c) then (if names.contains c then #[c] else #[])
-          else match Ledger.Parse.compileRegex ("^" ++ globRx c ++ "$") with
+          if !wild then (if names.contains name then #[name] else #[])
+          else match Ledger.Parse.compileRegex rxSrc with
             | .error _ => #[]
             | .ok rx =>
                 (names.filter (Ledger.Parse.regexSearch rx ·)).qsort (· < ·)
@@ -879,7 +897,7 @@ partial def globPaths (dir : System.FilePath) (pat : String) :
           else if ← System.FilePath.isDir ⟨p⟩ then
             acc := acc ++ (← walk p rest)
         pure acc
-  walk "" (Ledger.Driver.normalComps (full.splitOn "/"))
+  walk "" comps
 
 /-- Splice the `include` lines of `text`, the contents of the file
     `self` in the directory `dir`, which `parents` files include;
@@ -895,8 +913,7 @@ partial def globPaths (dir : System.FilePath) (pat : String) :
     `closesCommentBlock`). A leading byte order mark is dropped as C++
     drops it from the first line of every file (textual.cc:191-195).
     Balanced quotes around the argument are stripped
-    (textual_directives.cc:353-359), and backslashes in it are dropped,
-    which departs from C++ (see `globPaths`); `globPaths` resolves it,
+    (textual_directives.cc:353-359); `globPaths` resolves it,
     and a match equal to `self` is skipped, as `include_directive`
     skips the including file (textual_directives.cc:395-399). An
     include with no argument, or with no other match, is left for the
@@ -961,8 +978,6 @@ partial def splice (self : System.FilePath) (dir : System.FilePath)
   -- file leaves open closes where that file ends
   if inComment && parents > 0 then out := out.push "end comment"
   return (String.intercalate "\n" out.toList, spliced)
-
-namespace Ledger.Driver
 
 /-- The text of the file `arg` with its includes spliced, and whether a
     file was spliced into it. -/

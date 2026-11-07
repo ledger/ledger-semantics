@@ -183,6 +183,24 @@ def splitField (s : String) : String × Option String :=
 
 def trimS (s : String) : String := s.trimAscii.toString
 
+/-- The account that an `account` line names: the text up to the first
+    `;` that follows a hard separator (a tab, or two or more spaces),
+    which begins a comment, as a note begins after a transaction's
+    payee. A `;` after a single space, or after none, is part of the
+    name, as it is in a posting (C++ `split_inline_note` in utils.h,
+    called by `account_directive_body`; regress/3320). -/
+def headerAccount (s : String) : String :=
+  let rec go (spaces : Nat) (tab : Bool) : List Char → List Char
+    | [] => []
+    | ';' :: rest =>
+        if tab || spaces ≥ 2 then [] else ';' :: go 0 false rest
+    | ' ' :: rest => ' ' :: go (spaces + 1) tab rest
+    | '\t' :: rest => '\t' :: go spaces true rest
+    | c :: rest => c :: go 0 false rest
+  -- the scan starts at the name, as C++ skips the blanks before it
+  let cs := s.toList.dropWhile fun c => c == ' ' || c == '\t'
+  trimS (String.ofList (go 0 false cs))
+
 /-! ## Numbers under commodity styles -/
 
 private def digitsVal (cs : List Char) : ℕ :=
@@ -349,6 +367,41 @@ def unquote (s : String) : Option String :=
       else none
   | _ => none
 
+/-- The commodity that a `commodity` header names: a quoted symbol up
+    to its closing quote, or else the leading run of characters up to
+    whitespace or a `;`, which begins a comment. As in an amount, a
+    backslash puts the character after it into the run, so `A\;B` names
+    `A;B`, and the rest of the line is ignored (C++
+    `commodity_t::parse_symbol(char*&)`, regress/3313). -/
+def headerSymbol (s : String) : String :=
+  match s.toList with
+  | '"' :: rest => String.ofList (rest.takeWhile (· != '"'))
+  | cs =>
+      let rec go : List Char → List Char
+        | [] => []
+        | '\\' :: c :: rest => c :: go rest
+        | c :: rest =>
+            if c == ' ' || c == '\t' || c == ';' then [] else c :: go rest
+      String.ofList (go cs)
+
+/-- Cut the comment from the argument of a commodity block's `alias`
+    line. It begins at the first `;` that is neither inside a quoted
+    symbol nor escaped with a backslash, the only places that a
+    commodity symbol can hold one (C++ `strip_commodity_comment` in
+    textual_directives.cc, regress/3313_2). -/
+def stripCommodityComment (s : String) : String :=
+  let rec go (quoted : Bool) : List Char → List Char
+    | [] => []
+    | '"' :: rest => '"' :: go (!quoted) rest
+    | ';' :: rest => if quoted then ';' :: go quoted rest else []
+    | '\\' :: rest =>
+        if quoted then '\\' :: go quoted rest
+        else match rest with
+          | c :: rest' => '\\' :: c :: go quoted rest'
+          | [] => ['\\']
+    | c :: rest => c :: go quoted rest
+  String.ofList (go false s.toList)
+
 /-- Time-unit commodities canonicalize to seconds. -/
 def timeFactor (s : String) : Option ℚ :=
   if s == "s" then some 1
@@ -365,6 +418,46 @@ def resolveCommodity (line : Nat) (raw : String) : Except String String := do
   | none =>
       if validCommodity raw then pure raw
       else err line s!"malformed commodity '{raw}'"
+
+/-- Does an amount have to quote this symbol? The C++ table, not this
+    reader's `validCommodity`: commodity.cc `invalid_chars`, the
+    characters that end a bare symbol there. -/
+def symbolNeedsQuotes (s : String) : Bool :=
+  s.toList.any fun c =>
+    c.isDigit || c == ' ' || c == '\t' || c == '\n' || c == '\r'
+      || c.toNat == 127 || "!&()*+,-./:;<=>?@[]^{|}~".toList.contains c
+
+/-- Would a bare symbol and a number that meet at characters `a` and
+    `b` run together? Only when both are characters `parse_quantity`
+    reads as part of a number (amount.cc). -/
+def runsTogether (a b : Char) : Bool :=
+  let inNumber (c : Char) : Bool :=
+    c.isDigit || c == '.' || c == ',' || c == '\''
+  inNumber a && inNumber b
+
+/-- A `format` sample may spell its block's symbol bare, as the
+    `commodity` header does, though an amount must quote it:
+    `commodity N1` with `format 1,000.00 N1` (regress/3312;
+    textual_directives.cc `quote_bare_symbol`). The bare symbol is
+    quoted at either end of the sample, unless the sample quotes
+    already or the symbol runs into the number (`N11,000.00`), where
+    nothing marks where it ends. -/
+def quoteBareSymbol (sample sym : String) : String :=
+  if !symbolNeedsQuotes sym || sample.contains '"' then sample else
+  let s := sample.toList
+  let y := sym.toList
+  let n := y.length
+  let quoted := "\"" ++ sym ++ "\""
+  let touches (a b : Option Char) : Bool :=
+    match a, b with
+    | some a, some b => runsTogether a b
+    | _, _ => false
+  if s.take n == y && !touches y.getLast? (s.drop n).head? then
+    quoted ++ String.ofList (s.drop n)
+  else if s.length > n && s.drop (s.length - n) == y
+      && !touches (s.take (s.length - n)).getLast? y.head? then
+    String.ofList (s.take (s.length - n)) ++ quoted
+  else sample
 
 /-! ## Amounts -/
 

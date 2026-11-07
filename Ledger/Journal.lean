@@ -154,7 +154,8 @@ structure PostSpec where
   kind : PostKind
   note : String := ""
   amount : Option Amount := none
-  costVal : Option Amount := none    -- @/@@ substitution (pass 1)
+  costVal : Option Amount := none    -- effective cost after gain/loss
+  swapCostVal : Option Amount := none -- original cost before a swap's base-currency rewrite
   lotVal : Option Amount := none     -- {P}/{=P} substitution (pass 2)
   /-- the lot price per unit of the amount's own lot, one written
       before any cost or balance assertion: `{P}`, or `{{T}}` divided
@@ -1358,16 +1359,14 @@ private def valueExprNames (st : St) (c : String) : List String :=
   [c, (resolveEquiv st.equivs c).2].eraseDups
 
 /-- The symbol that C++ reads from the text `s` that follows the word of
-    a `commodity` directive (textual_directives.cc:808-813), as the
-    `parse_symbol` that takes a line reads it (commodity.cc:438-455): the
-    text between a leading double quote and the next one, or else the
-    text before the first blank or tab (`next_element`, utils.h:623-640),
-    so that `commodity N2` names `N2` and `commodity AAPL ; note` names
-    `AAPL`. -/
+    a `commodity` directive (textual_directives.cc:808-813), as
+    `Ledger.Parse.headerSymbol` reads a line's first token: the text
+    between a leading double quote and the next one, or else the run
+    before the first blank or tab, where a `;` ends the token and a
+    backslash puts the next character into it (regress/3313), so that
+    `commodity N2` names `N2` and `commodity AAPL ; note` names `AAPL`. -/
 private def commodityDirectiveSymbol (s : String) : String :=
-  match s.toList with
-  | '"' :: cs => String.ofList (cs.takeWhile (· != '"'))
-  | cs => String.ofList (cs.takeWhile fun c => c != ' ' && c != '\t')
+  Ledger.Parse.headerSymbol s
 
 /-- `st` with each commodity of `cs` that `St.valueExprComms` does not
     hold yet added to it, the null commodity left out: C++ gives no
@@ -4726,6 +4725,8 @@ private def finalizeXact (st : St) (hline : Nat) (_header : String)
         let p := { p with
           amount := p.amount.map (canonAmt stv)
           costVal := p.costVal.map (canonAmt stv)
+          swapCostVal := p.swapCostVal.map (canonAmt stv)
+          gainVal := p.gainVal.map (canonAmt stv)
           lotVal := p.lotVal.map (canonAmt stv)
           lotUnit := p.lotUnit.map fun lu =>
             let c := canonAmt stv lu
@@ -5730,8 +5731,11 @@ private def compileConj (st : St) (n : Nat) (conj : List String) :
       | .ok rx => spec := { spec with commentRx := some rx }
       | .error e => err n e
     else if term.startsWith "commodity ==" then
+      -- the commodity's symbol, or that symbol in the double quotes a
+      -- journal writes around one that needs them (regress/3241;
+      -- value.cc: find_named_commodity)
       let r := unquoteAny (trimS (term.drop "commodity ==".length).toString)
-      spec := { spec with commodityEq := some r }
+      spec := { spec with commodityEq := some ((unquote r).getD r) }
     else if term.startsWith "account =~" then
       let r := unslash (trimS (term.drop "account =~".length).toString)
       match compileRegex r with
@@ -8091,7 +8095,10 @@ def run (input0 : String) (dcDefault : Bool := false)
           if !tagLine && arg.isEmpty && kw != "default" then
             err n s!"account directive '{kw}' requires an argument"
           if kw == "account" then
-            let nm := (unquote arg).getD arg
+            -- the nested name ends before a hard-separated `;` comment,
+            -- as a top-level one does (regress/3320)
+            let nm := Ledger.Parse.headerAccount arg
+            let nm := (unquote nm).getD nm
             -- a nested block registers its name under the enclosing
             -- account, which the nested dispatch passes as the parent
             -- (textual_directives.cc:651-655, regress/877), unless an
@@ -8164,7 +8171,9 @@ def run (input0 : String) (dcDefault : Bool := false)
             -- `1,500 E` as 1500 EUR, where it is read as 1.5 here
             -- (wrong rows), and accepts a later `5.25 E`, which is
             -- rejected here as ambiguous (fail-closed)
-            let al := trimS (body.drop "alias ".length).toString
+            -- a `;` outside quotes begins a comment (regress/3313_2)
+            let al := trimS (Ledger.Parse.stripCommodityComment
+              (body.drop "alias ".length).toString)
             let al := (unquote al).getD al
             -- a point already recorded on the alias name or on the block's
             -- commodity: where C++ retires a commodity here, the table then
@@ -8177,8 +8186,10 @@ def run (input0 : String) (dcDefault : Bool := false)
             continue
           else if body.startsWith "format " then
             -- the format subdirective DECLARES the display precision
-            -- and locks it against migration (opt-round, 1795, 628)
-            let sample := trimS (body.drop "format ".length).toString
+            -- and locks it against migration (opt-round, 1795, 628);
+            -- it may spell the block's symbol bare (3312)
+            let sample :=
+              Ledger.Parse.quoteBareSymbol (trimS (body.drop "format ".length).toString) comm
             match (parseAmount st.amt n sample) with
             | .ok r =>
                 st := lockPrecision st
@@ -8378,8 +8389,9 @@ def run (input0 : String) (dcDefault : Bool := false)
           || t.startsWith "b " then
         continue  -- historical timelog compatibility: ignored
       else if t.startsWith "@account " || t.startsWith "!account " then
-        -- named as `account` names it, below
-        let nm := trimS (t.drop "@account ".length).toString
+        -- named as `account` names it, below; the name ends before a
+        -- hard-separated `;` comment (regress/3320_3)
+        let nm := Ledger.Parse.headerAccount (t.drop "@account ".length).toString
         let nm := resolveAccount st ((unquote nm).getD nm)
         st := { st with pending := .acctBlock [(0, nm)] }
       else if t.startsWith "@commodity " || t.startsWith "!commodity " then
@@ -8397,10 +8409,14 @@ def run (input0 : String) (dcDefault : Bool := false)
         -- its `alias`, `payee` and `default` subdirectives name the
         -- resolved account: under `apply account Top`, `account Suspense`
         -- with `default` makes `Top:Suspense` the bucket
-        let nm := trimS (t.drop "account ".length).toString
+        -- the name ends before a `;` that follows a hard separator,
+        -- which begins a comment (regress/3320, regress/3320_3)
+        let nm := Ledger.Parse.headerAccount (t.drop "account ".length).toString
         let nm := resolveAccount st ((unquote nm).getD nm)
         st := { st with pending := .acctBlock [(0, nm)] }
       else if t.startsWith "commodity " || t.startsWith "commodity\t" then
+        -- the symbol is the first token, and a `;` ends a bare one
+        -- (regress/3313)
         let nm := trimS (t.drop "commodity ".length).toString
         let sym := commodityDirectiveSymbol nm
         -- while C++ checks commodities it registers the directive's
