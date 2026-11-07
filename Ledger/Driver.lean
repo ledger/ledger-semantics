@@ -857,12 +857,10 @@ partial def globComponent (c : String) : String × String × Bool :=
     filesystem either (regress/1660).
 
     A component that holds no wildcard and no set must equal an entry
-    exactly. One departure remains: `splice` has already dropped every
-    backslash in the pattern, where C++ takes a backslash as making the
-    next character literal (see `globComponent`), and C++ takes a
-    pattern that begins with a backslash as written, against the
-    working directory of the process (textual_directives.cc:370), where
-    here it is joined to `dir`. -/
+    exactly. One departure remains: C++ takes a pattern that begins
+    with a backslash as written, against the working directory of the
+    process (textual_directives.cc:370), where here it is joined to
+    `dir`. -/
 partial def globPaths (dir : System.FilePath) (pat : String) :
     IO (List System.FilePath) := do
   let full? ←
@@ -897,7 +895,7 @@ partial def globPaths (dir : System.FilePath) (pat : String) :
           else if ← System.FilePath.isDir ⟨p⟩ then
             acc := acc ++ (← walk p rest)
         pure acc
-  walk "" comps
+  walk "" (Ledger.Driver.normalComps comps)
 
 /-- Splice the `include` lines of `text`, the contents of the file
     `self` in the directory `dir`, which `parents` files include;
@@ -913,7 +911,9 @@ partial def globPaths (dir : System.FilePath) (pat : String) :
     `closesCommentBlock`). A leading byte order mark is dropped as C++
     drops it from the first line of every file (textual.cc:191-195).
     Balanced quotes around the argument are stripped
-    (textual_directives.cc:353-359); `globPaths` resolves it,
+    (textual_directives.cc:353-359), and a backslash in the pattern
+    makes the next character literal, which `globComponent` takes as it
+    reads one (textual_directives.cc:370); `globPaths` resolves it,
     and a match equal to `self` is skipped, as `include_directive`
     skips the including file (textual_directives.cc:395-399). An
     include with no argument, or with no other match, is left for the
@@ -959,7 +959,6 @@ partial def splice (self : System.FilePath) (dir : System.FilePath)
           || (arg.startsWith "'" && arg.endsWith "'")) then
         String.ofList ((arg.drop 1).toString.toList.dropLast)
       else arg
-    let pat := String.ofList (pat.toList.filter (· != '\\'))
     let paths ← globPaths dir pat
     let paths := paths.filter fun p => p.toString != self.toString
     if paths.isEmpty then
